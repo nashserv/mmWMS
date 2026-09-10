@@ -8,16 +8,18 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from psycopg import Cursor
 
 from . import repositories as repo
 from .config import auto_onboard_unknown_cabinet, tenant_id
 from .db import Database
-from .domain import (Envelope, EnvelopeError, PartnerRole, PartnerShare, UnbilledReason)
+from .domain import (Envelope, EnvelopeError, PartnerRole, PartnerShare, Service,
+                     UnbilledReason)
 from .metrics import (ACCRUALS, ACCRUED_AMOUNT, CABINETS_NEEDING_ONBOARDING,
                       SHIFT_OUTPUT_REJECTED, UNBILLED, WORKER_PROCESSED)
 from .money import charge as compute_charge
@@ -26,6 +28,10 @@ from .money import pick_tier, split_markup
 # События физического действия, из которых считается выработка смены (файл 04).
 # Операция названа так, как её понимает начальник склада, а не как называется
 # событие: в витрине стоит «упаковка», а не «wms.packing.completed.v1».
+# Пространство имён для вычислимых event_id суточного хранения: одно и то же
+# для кабинета и дня, поэтому повторный прогон не начисляет второй раз.
+STORAGE_NAMESPACE = uuid.UUID("6d6d7800-0000-4000-8000-000073746f72")
+
 SHIFT_OPERATIONS = {
     "wms.item.scanned.v1": "скан у стойки",
     "wms.packing.completed.v1": "упаковка",
@@ -122,26 +128,41 @@ class BillingService:
             return self._unbilled(cursor, envelope, UnbilledReason.TARIFF_NOT_APPROVED,
                                   f"версия тарифа {version['id']} не утверждена")
 
+        return self._charge(
+            cursor, cabinet=cabinet, service=service, quantity=quantity,
+            occurred_on=envelope.occurred_on, version=version, event_id=envelope.event_id,
+            event_type=envelope.type, tenant=envelope.tenant_id or tenant_id(),
+            correlation_id=envelope.correlation_id,
+            allocation_key=self._allocation_key(envelope))
+
+    def _charge(self, cursor: Cursor, *, cabinet: dict[str, Any], service: str,
+                quantity: Decimal, occurred_on: date, version: dict[str, Any],
+                event_id: str, event_type: str, tenant: str,
+                correlation_id: str | None, allocation_key: str | None) -> dict[str, Any]:
+        """Считает и записывает начисление. Одно место на все источники.
+
+        Событие шины и суточное начисление за хранение приходят разными путями,
+        но цена, наценка и раскладка комиссии у них обязаны считаться одним
+        кодом: две реализации однажды разойдутся, и разойдутся в счёте.
+        """
         tier = pick_tier(repo.tiers(cursor, str(version["id"])), quantity)
         owner_partner, shares = repo.partner_chain(
-            cursor, str(cabinet["id"]), service, envelope.occurred_on)
+            cursor, str(cabinet["id"]), service, occurred_on)
         shares = self._fallback_to_tariff_fee(shares, owner_partner, version)
 
         charge = compute_charge(quantity, tier, shares)
         accrual = repo.insert_accrual(
-            cursor, event_id=envelope.event_id, event_type=envelope.type,
-            tenant_id=envelope.tenant_id or tenant_id(),
-            correlation_id=envelope.correlation_id, cabinet=cabinet, service=service,
+            cursor, event_id=event_id, event_type=event_type, tenant_id=tenant,
+            correlation_id=correlation_id, cabinet=cabinet, service=service,
             tariff_version_id=str(version["id"]), charge=charge, partner_id=owner_partner,
-            occurred_on=envelope.occurred_on,
-            allocation_key=self._allocation_key(envelope))
+            occurred_on=occurred_on, allocation_key=allocation_key)
         repo.insert_commissions(cursor, str(accrual["id"]),
                                 split_markup(quantity, shares, charge.partner_amount))
 
-        repo.emit(cursor, "billing.accrual.created.v1", envelope.tenant_id or tenant_id(), {
+        repo.emit(cursor, "billing.accrual.created.v1", tenant, {
             "accrual_id": str(accrual["id"]),
-            "source_event_id": envelope.event_id,
-            "source_event_type": envelope.type,
+            "source_event_id": event_id,
+            "source_event_type": event_type,
             "seller_external_id": cabinet["seller_external_id"],
             "service": service,
             "quantity": str(charge.quantity),
@@ -149,11 +170,11 @@ class BillingService:
             "partner_amount": str(charge.partner_amount),
             "net_amount": str(charge.net_amount),
             "period": accrual["period"],
-        }, envelope.correlation_id)
+        }, correlation_id)
 
         ACCRUALS.labels(service=service).inc()
         ACCRUED_AMOUNT.labels(service=service).inc(float(charge.amount))
-        return {"outcome": "accrued", "event_id": envelope.event_id,
+        return {"outcome": "accrued", "event_id": event_id,
                 "accrual_id": str(accrual["id"]), "service": service,
                 "amount": str(charge.amount), "partner_amount": str(charge.partner_amount),
                 "net_amount": str(charge.net_amount)}
@@ -278,6 +299,78 @@ class BillingService:
                     operation=operation, cabinet_id=None, quantity=quantity)
         except Exception:
             SHIFT_OUTPUT_REJECTED.labels(event_type=envelope.type).inc()
+
+
+    # ------------------------------------------------------- хранение (крон)
+
+    STORAGE_SERVICE = Service.STORAGE.value
+
+    def accrue_storage(self, day: date, places: Callable[[str], int],
+                       *, tenant: str | None = None) -> list[dict[str, Any]]:
+        """Начисляет хранение за сутки по всем кабинетам.
+
+        Хранение — самый предсказуемый доход фулфилмента, и сегодня оно не
+        тарифицируется вовсе (раздел 3.4, файл 04). Единица — коробко-место ×
+        сутки (файл 04), поэтому количество берётся у склада: сколько коробок
+        клиента стояло в этот день.
+
+        `places` — функция «кабинет → коробко-мест». Вызов в склад делает
+        воркер, снаружи транзакции (инвариант 2); сюда приходит уже число.
+
+        Идемпотентность — по вычислимому `event_id`: uuid5 от кабинета и даты.
+        Повторный прогон за те же сутки не начисляет второй раз, а значит,
+        воркер можно гонять хоть каждый час и догонять пропущенные дни.
+        """
+        results: list[dict[str, Any]] = []
+        with self.db.cursor() as cursor:
+            cursor.execute("SELECT * FROM cabinet WHERE active ORDER BY seller_external_id")
+            cabinets = [dict(row) for row in cursor.fetchall()]
+
+        for cabinet in cabinets:
+            try:
+                quantity = Decimal(places(str(cabinet["seller_external_id"])))
+            except Exception as failure:  # noqa: BLE001 — один кабинет не валит остальные
+                results.append({"outcome": "unbilled", "reason": "NO_QUANTITY",
+                                "seller": cabinet["seller_external_id"], "detail": str(failure)})
+                UNBILLED.labels(reason=UnbilledReason.NO_QUANTITY.value).inc()
+                continue
+            if quantity <= 0:
+                # Клиент, у которого в этот день не стояло ни одной коробки,
+                # за хранение не платит. Это не ошибка и в unbilled не идёт.
+                continue
+            # Кабинет в исходе обязателен: воркер пишет в лог «начислено кому»,
+            # а не «начислено N штук» — по второму разбирать нечего.
+            results.append({**self._accrue_storage_day(cabinet, quantity, day,
+                                                       tenant or tenant_id()),
+                            "seller": cabinet["seller_external_id"]})
+        WORKER_PROCESSED.labels(worker="storage").inc(len(results))
+        return results
+
+    def _accrue_storage_day(self, cabinet: dict[str, Any], quantity: Decimal, day: date,
+                            tenant: str) -> dict[str, Any]:
+        event_id = str(uuid.uuid5(STORAGE_NAMESPACE, f"{cabinet['id']}:{day.isoformat()}"))
+        with self.db.transaction() as cursor:
+            cursor.execute("SELECT 1 FROM billing_accrual WHERE event_id = %s", (event_id,))
+            if cursor.fetchone():
+                return {"outcome": "duplicate", "event_id": event_id,
+                        "seller": cabinet["seller_external_id"]}
+            version = repo.tariff_version(cursor, str(cabinet["id"]), self.STORAGE_SERVICE, day)
+            if version is None or not version["approved"]:
+                reason = (UnbilledReason.NO_TARIFF if version is None
+                          else UnbilledReason.TARIFF_NOT_APPROVED)
+                repo.record_unbilled(
+                    cursor, event_id, "billing.storage.day.v1", reason.value,
+                    f"хранение за {day} по кабинету {cabinet['seller_external_id']}",
+                    {"seller_external_id": cabinet["seller_external_id"],
+                     "places": str(quantity), "day": day.isoformat()}, tenant, None)
+                UNBILLED.labels(reason=reason.value).inc()
+                return {"outcome": "unbilled", "reason": reason.value,
+                        "seller": cabinet["seller_external_id"]}
+            return self._charge(
+                cursor, cabinet=cabinet, service=self.STORAGE_SERVICE, quantity=quantity,
+                occurred_on=day, version=version, event_id=event_id,
+                event_type="billing.storage.day.v1", tenant=tenant, correlation_id=None,
+                allocation_key=f"storage:{day.isoformat()}")
 
     # ---------------------------------------------------------------- отчёты
 

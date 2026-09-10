@@ -225,13 +225,21 @@ def main() -> None:
         for code, service, name, unit, _price, _stub in TARIFFS))
     add("ON CONFLICT (code) DO NOTHING;")
     add("")
+    add("-- partner_fee — ставка последней надежды для кабинета, которому слой")
+    add("-- наценки ещё не завели (так наценка жила в биллинге as-is, раздел 2.10).")
+    add("-- У хранения она ноль, и это решение, а не забывчивость: мастер говорит")
+    add("-- «15 ₽ с операции», а коробко-место × сутки — не операция. Оставить здесь")
+    add("-- 15 значило бы протащить наценку на хранение через запасной путь, ровно")
+    add("-- мимо решения не ставить её до ответа владельца.")
     add("INSERT INTO billing_tariff_version (id, tariff_id, effective_from, approved,")
     add("                                    approved_by, approved_at, partner_fee) VALUES")
     add(",\n".join(
         f"    ({quote(stable('version', code))}, {quote(stable('tariff', code))}, "
-        f"DATE '2026-01-01', true, 'стенд: заглушка вместо подписи владельца', now(), 15.00)"
-        for code, *_ in TARIFFS))
-    add("ON CONFLICT (id) DO NOTHING;")
+        f"DATE '2026-01-01', true, 'стенд: заглушка вместо подписи владельца', now(), "
+        f"{'15.00' if service in MARKUP_SERVICES else '0.00'})"
+        for code, service, *_ in TARIFFS))
+    add("-- Ставку обновляем: повторный сид — обновление стенда, а не откат решения.")
+    add("ON CONFLICT (id) DO UPDATE SET partner_fee = EXCLUDED.partner_fee;")
     add("")
     add("-- Одна ступень «и далее»: объёмных скидок владелец не называл.")
     add("INSERT INTO billing_tariff_tier (id, version_id, up_to, unit_price, minimum) VALUES")

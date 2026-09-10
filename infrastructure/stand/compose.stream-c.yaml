@@ -141,6 +141,31 @@ services:
       retries: 12
     ports: ["127.0.0.1:8082:8080"]
 
+  # Хранение по суткам и вынос собственных событий на шину. Хранение приходит
+  # не событием, а кроном: единица — коробко-место × сутки (файл 04), и товар
+  # лежит независимо от того, заказали его или нет.
+  billing-worker:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-seed: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+      rabbitmq-init: {condition: service_completed_successfully}
+    environment:
+      <<: *billing-env
+      METRICS_PORT: "8081"
+      # На стенде считаем чаще суток, чтобы не ждать ночи ради проверки.
+      # Повтор безвреден: event_id вычислим из кабинета и дня.
+      BILLING_STORAGE_INTERVAL_SECONDS: ${BILLING_STORAGE_INTERVAL_SECONDS:-900}
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/metrics', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    ports: ["127.0.0.1:8087:8081"]
+
   # Инвариант 14: молчащий воркер считается сломанным. Поэтому у консьюмера
   # свой /metrics — он обязан уметь доказать, что работает, а не просто быть Up.
   billing-inbox-consumer:
