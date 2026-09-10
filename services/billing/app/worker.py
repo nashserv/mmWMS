@@ -1,0 +1,184 @@
+"""billing-worker: хранение по суткам и публикация собственных событий.
+
+Две работы, которых у биллинга не было и без которых он неполон.
+
+**Хранение.** Единица — коробко-место × сутки (файл 04), значит начисление
+приходит не событием, а кроном. Сегодня хранение не тарифицируется вовсе, хотя
+это самый предсказуемый доход фулфилмента: товар лежит независимо от того,
+заказали его или нет.
+
+**Outbox.** Начисление и событие о нём пишутся одной транзакцией, но событие
+кто-то должен вынести на шину. Без этого `billing_outbox` растёт молча — ровно
+как `integration_outbox` на проде: 136 210 записей без ретеншена (раздел 3.6).
+
+Инвариант 14: молчащий воркер считается сломанным, поэтому у обеих работ свой
+счётчик и свой /metrics.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+from datetime import date, timedelta
+from typing import Any
+
+import httpx
+from prometheus_client import start_http_server
+
+from .config import app_environment, database_url, events_exchange, tenant_id
+from .db import Database
+from .metrics import WORKER_PROCESSED
+from .service import BillingService
+
+log = logging.getLogger("billing.worker")
+
+# Догоняем несколько суток назад, а не только вчера: воркер, простоявший
+# выходные, обязан досчитать хранение сам, а не оставить дыру в счёте.
+STORAGE_BACKFILL_DAYS = int(os.getenv("BILLING_STORAGE_BACKFILL_DAYS", "3"))
+STORAGE_INTERVAL = float(os.getenv("BILLING_STORAGE_INTERVAL_SECONDS", "3600"))
+OUTBOX_INTERVAL = float(os.getenv("BILLING_OUTBOX_INTERVAL_SECONDS", "5"))
+OUTBOX_BATCH = int(os.getenv("BILLING_OUTBOX_BATCH", "100"))
+
+
+def box_places(seller_external_id: str) -> int:
+    """Сколько коробко-мест занимает клиент — по данным склада.
+
+    Вызов в `wms` идёт снаружи транзакции (инвариант 2). Коробка — фактическая
+    единица адресации склада (раздел 2.9), поэтому считаем коробки, а не штуки:
+    место занимает коробка, а не то, сколько в неё положили.
+    """
+    base = os.getenv("WMS_BASE_URL", "http://wms:8080").rstrip("/")
+    path = os.getenv("WMS_API_PATH", "/api/mmx/wms/v1")
+    response = httpx.post(f"{base}{path}/storage/lookup", timeout=15.0, json={
+        "jsonrpc": "2.0", "method": "call", "id": 1,
+        "params": {"seller_external_id": seller_external_id}})
+    response.raise_for_status()
+    placements = (response.json().get("result") or {}).get("placements") or []
+    return len({str(row.get("box_barcode")) for row in placements if row.get("box_barcode")})
+
+
+class StorageLoop:
+    def __init__(self, service: BillingService, stopping: threading.Event) -> None:
+        self._service = service
+        self._stopping = stopping
+
+    def run(self) -> None:
+        while True:
+            try:
+                self.once()
+            except Exception as failure:  # noqa: BLE001 — воркер обязан пережить склад
+                log.warning("начисление хранения не прошло: %s", failure)
+            if self._stopping.wait(STORAGE_INTERVAL):
+                return
+
+    def once(self) -> None:
+        today = date.today()
+        for offset in range(1, STORAGE_BACKFILL_DAYS + 1):
+            day = today - timedelta(days=offset)
+            results = self._service.accrue_storage(day, box_places, tenant=tenant_id())
+            accrued = [row for row in results if row["outcome"] == "accrued"]
+            if accrued:
+                log.info("хранение за %s: начислено кабинетам %d", day, len(accrued))
+
+
+class OutboxLoop:
+    """Выносит события биллинга на шину. Опубликованное помечается, не удаляется."""
+
+    def __init__(self, database: Database, url: str, stopping: threading.Event) -> None:
+        self._db = database
+        self._url = url
+        self._stopping = stopping
+        self._connection: Any = None
+
+    def run(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                published = self.once()
+            except Exception as failure:  # noqa: BLE001
+                log.warning("публикация outbox не прошла: %s", failure)
+                self._connection = None
+                published = 0
+            if published == 0:
+                self._stopping.wait(OUTBOX_INTERVAL)
+
+    def once(self) -> int:
+        import pika
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM billing_outbox WHERE published_at IS NULL "
+                " ORDER BY id LIMIT %s", (OUTBOX_BATCH,))
+            rows = [dict(row) for row in cursor.fetchall()]
+        if not rows:
+            return 0
+
+        if self._connection is None or self._connection.is_closed:
+            self._connection = pika.BlockingConnection(pika.URLParameters(self._url))
+        channel = self._connection.channel()
+        channel.exchange_declare(exchange=events_exchange(), exchange_type="topic", durable=True)
+
+        published = 0
+        for row in rows:
+            body = {
+                "event_id": str(row["event_id"]), "tenant_id": row["tenant_id"],
+                "type": row["type"], "occurred_at": row["occurred_at"].isoformat(),
+                "payload": row["payload"], "correlation_id": row["correlation_id"],
+            }
+            try:
+                channel.basic_publish(
+                    exchange=events_exchange(), routing_key=row["type"],
+                    body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    properties=pika.BasicProperties(content_type="application/json",
+                                                    delivery_mode=2))
+            except Exception as failure:  # noqa: BLE001
+                with self._db.transaction() as cursor:
+                    cursor.execute(
+                        "UPDATE billing_outbox SET attempts = attempts + 1, last_error = %s "
+                        " WHERE id = %s", (str(failure)[:500], row["id"]))
+                raise
+            with self._db.transaction() as cursor:
+                cursor.execute("UPDATE billing_outbox SET published_at = now() WHERE id = %s",
+                               (row["id"],))
+            published += 1
+        WORKER_PROCESSED.labels(worker="outbox").inc(published)
+        return published
+
+
+def main() -> int:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    app_environment()
+    database = Database(database_url())
+    service = BillingService(database)
+    stopping = threading.Event()
+
+    start_http_server(int(os.getenv("METRICS_PORT", "8081")))
+    WORKER_PROCESSED.labels(worker="storage").inc(0)
+    WORKER_PROCESSED.labels(worker="outbox").inc(0)
+
+    signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+    signal.signal(signal.SIGINT, lambda *_: stopping.set())
+
+    threads = [threading.Thread(target=StorageLoop(service, stopping).run, daemon=True)]
+    rabbit = os.getenv("RABBITMQ_URL", "")
+    if rabbit:
+        threads.append(threading.Thread(target=OutboxLoop(database, rabbit, stopping).run,
+                                        daemon=True))
+    else:
+        log.warning("RABBITMQ_URL не задан: события биллинга останутся в outbox")
+    for thread in threads:
+        thread.start()
+
+    started = time.monotonic()
+    while not stopping.wait(1.0):
+        pass
+    log.info("остановлен после %.0f с работы", time.monotonic() - started)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

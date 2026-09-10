@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MM-Express — админка</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>MM-Express · админка</h1>
+    <div class="who">
+      <label>токен
+        <input id="token" placeholder="stand:&lt;uuid пользователя&gt;" autocomplete="off">
+      </label>
+      <span id="whoami" class="muted">не представлен</span>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="overview" class="active">Обзор</button>
+    <button data-tab="onboarding">Онбординг</button>
+    <button data-tab="partners">Партнёры</button>
+    <button data-tab="tariffs">Тарифы</button>
+    <button data-tab="accruals">Начисления</button>
+    <button data-tab="audit">Журнал</button>
+  </nav>
+
+  <main>
+    <section id="overview" class="tab active">
+      <h2>Что требует внимания</h2>
+      <p class="hint">Три числа, которых сегодня нет ни у кого. Именно их
+        отсутствие позволяет 6374 заданиям превращаться в 145 начислений
+        незамеченно.</p>
+      <div class="cards">
+        <article><h3>Заведены мимо процесса</h3><div id="need-onboarding" class="big">—</div>
+          <p class="muted">кабинет приехал событием, а не онбордингом</p></article>
+        <article><h3>Не доехало до счёта</h3><div id="unbilled-total" class="big">—</div>
+          <p class="muted">операций склада без начисления</p></article>
+        <article><h3>Убыточных кабинетов</h3><div id="loss-making" class="big">—</div>
+          <p class="muted">маржа ниже нуля за период</p></article>
+      </div>
+      <h3>Кому не выставлено и почему</h3>
+      <div id="unbilled"></div>
+      <h3>Маржа по кабинетам — худшие сверху</h3>
+      <div id="margin"></div>
+    </section>
+
+    <section id="onboarding" class="tab">
+      <h2>Завести клиента</h2>
+      <p class="hint">Договор → тариф → партнёр → кабинет WB → владелец в складе →
+        начальный остаток. Одним нажатием, без единого запроса в базу руками.</p>
+      <form id="onboard-form">
+        <div class="grid">
+          <label>Ключ продавца<input name="seller_external_id" required
+            placeholder="stand-seller-023"></label>
+          <label>Наименование<input name="name" required placeholder="ИП Иванов"></label>
+          <label>ИНН<input name="inn" placeholder="9990000023"></label>
+          <label>Договор<input name="contract_reference" required placeholder="ДГ-2026-023"></label>
+          <label>Партнёр<select name="partner_id" id="onboard-partner"></select></label>
+          <label>Дата с<input name="from_date" type="date"></label>
+          <label>Кабинет WB<input name="wb_account_external_id" placeholder="stand-wb-023"></label>
+          <label>Ссылка на секрет
+            <input name="secret_ref" placeholder="vault://mmx/wb/stand-023">
+            <small>Токен сюда не вводится никогда — только ссылка на него.</small>
+          </label>
+        </div>
+        <label class="wide">Начальный остаток от владельца компании
+          <textarea name="opening_stock" rows="4"
+            placeholder="штрихкод;количество;ячейка&#10;4600000000017;10;FR-01-01"></textarea>
+          <small>По строке на товар. Инвентаризацию не проектируем — остаток даёт владелец.</small>
+        </label>
+        <button type="submit">Завести</button>
+      </form>
+      <div id="onboard-result"></div>
+    </section>
+
+    <section id="partners" class="tab">
+      <h2>Партнёры и дерево менеджеров</h2>
+      <p class="hint">Наценка — свойство партнёра, а не цены. Клиент платит
+        тариф MM-Express плюс наценку того, кто его привёл.</p>
+      <div id="partner-tree"></div>
+      <h3>Поставить наценку</h3>
+      <form id="markup-form" class="grid">
+        <label>Партнёр<select name="partner_id" id="markup-partner"></select></label>
+        <label>Услуга<select name="service" id="markup-service"></select></label>
+        <label>Наценка, ₽<input name="markup" type="number" step="0.01" min="0" value="15"></label>
+        <label>Действует с<input name="from_date" type="date"></label>
+        <button type="submit">Поставить</button>
+      </form>
+      <div id="markup-result"></div>
+    </section>
+
+    <section id="tariffs" class="tab">
+      <h2>Тарифы на услуги</h2>
+      <p class="hint">Неутверждённая версия не тарифицирует: цена, приехавшая в
+        счёт клиенту без чьей-либо подписи, — это спор с клиентом.</p>
+      <div id="tariff-list"></div>
+    </section>
+
+    <section id="accruals" class="tab">
+      <h2>Начисления</h2>
+      <p class="hint">Клиент платит 45 ₽: 30 — MM-Express, 15 — партнёр.
+        Расшифровка показывает обе половины, а не итог.</p>
+      <form id="accrual-filter" class="grid">
+        <label>Период<input name="period" placeholder="2026-09"></label>
+        <button type="submit">Показать</button>
+      </form>
+      <div id="accrual-list"></div>
+    </section>
+
+    <section id="audit" class="tab">
+      <h2>Журнал действий</h2>
+      <p class="hint">Кто, когда и что сделал. Вторая половина правила «ни
+        одного ручного запроса в базу»: если процесс идёт через админку, он
+        обязан быть записан.</p>
+      <div id="audit-list"></div>
+    </section>
+  </main>
+
+  <div id="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

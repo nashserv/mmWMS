@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MM-Express — личный кабинет</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>MM-Express · личный кабинет</h1>
+    <div class="who">
+      <label>токен
+        <input id="token" placeholder="stand:&lt;uuid пользователя&gt;" autocomplete="off">
+      </label>
+      <span id="whoami" class="muted">не представлен</span>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="stock" class="active">Остаток</button>
+    <button data-tab="charges">Начисления</button>
+    <button data-tab="exports">Выгрузки</button>
+  </nav>
+
+  <main>
+    <section id="stock" class="tab active">
+      <h2>Товар на складе</h2>
+      <p class="hint">Число берётся из складского учёта при каждом показе.
+        Это тот же остаток, который видит сборщик, — не копия кабинета
+        Wildberries, которая живёт своей жизнью.</p>
+      <div class="cards">
+        <article><h3>Свободно</h3><div id="total-available" class="big">—</div>
+          <p class="muted">можно продавать</p></article>
+        <article><h3>В резерве</h3><div id="total-reserved" class="big">—</div>
+          <p class="muted">под собранные заказы</p></article>
+        <article><h3>Всего на полке</h3><div id="total-good" class="big">—</div>
+          <p class="muted">физически у нас</p></article>
+      </div>
+      <h3>По товарам</h3>
+      <div id="stock-table"></div>
+      <h3>Где лежит</h3>
+      <p class="hint">Коробка — фактическая единица адресации склада. Комментарий
+        обязателен: через месяц на складе стоят сотни одинаковых коробок.</p>
+      <div id="placements"></div>
+    </section>
+
+    <section id="charges" class="tab">
+      <h2>Начисления за период</h2>
+      <p class="hint" id="explanation"></p>
+      <form id="period-form" class="grid">
+        <label>Период<input name="period" placeholder="2026-09"></label>
+        <button type="submit">Показать</button>
+      </form>
+      <div class="cards">
+        <article><h3>К оплате</h3><div id="total-amount" class="big">—</div>
+          <p class="muted">всего за период</p></article>
+        <article><h3>MM-Express</h3><div id="total-net" class="big">—</div>
+          <p class="muted">фулфилмент</p></article>
+        <article><h3>Партнёру</h3><div id="total-partner" class="big">—</div>
+          <p class="muted">наценка того, кто ведёт кабинет</p></article>
+      </div>
+      <p><a id="download-act" class="action" href="#">Выгрузить акт за период</a></p>
+      <div id="charge-table"></div>
+    </section>
+
+    <section id="exports" class="tab">
+      <h2>Выгрузки</h2>
+      <p class="hint">Акт за период выгружается здесь же, без обращения к
+        бухгалтеру.</p>
+      <div id="export-list"></div>
+    </section>
+  </main>
+
+  <div id="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

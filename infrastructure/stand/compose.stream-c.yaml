@@ -1,0 +1,261 @@
+# Наложение потока C: деньги и кабинеты.
+#
+# Отдельным файлом, а не правкой compose.yaml, по двум причинам.
+# Первая — правило 9.5.1: compose.yaml принадлежит потоку 0, чужие файлы не
+# редактируются. Вторая практическая: потоки A и B добавляют свои сервисы
+# одновременно, и три агента, дописывающие один файл, гарантированно получают
+# конфликт при мерже.
+#
+# README стенда (раздел «Сервисы платформы») описывает порядок подключения:
+# скопировать сервис в services/, направить WMS_ADAPTER на mock wms. Здесь это
+# и сделано — WMS_BASE_URL смотрит на http://wms:8080, контракт
+# /api/mmx/wms/v1/* сохранён потоком 0 ровно ради этого.
+#
+# Запуск:
+#   cd infrastructure/stand
+#   docker compose -f compose.yaml -f compose.stream-c.yaml up -d
+#
+# Когда интегратор сольёт потоки в main, содержимое этого файла переезжает в
+# compose.yaml одним движением — заявкой в поток 0.
+
+name: mmx-stand
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-billing-env: &billing-env
+  APP_ENV: development
+  DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+  MMX_EVENTS_EXCHANGE: mmx.events
+  MMX_TENANT_ID: mm-express
+  # Контракт wms (приложение B). До готовности потока A на этом адресе стоит
+  # mock потока 0 — правило 9.5.4, никто никого не ждёт.
+  WMS_BASE_URL: http://wms:8080
+  # Кабинет, приехавший событием, а не онбордингом, тарифицируется и помечается
+  # needs_onboarding (см. app/service.py). Выключить — значит терять выручку молча.
+  BILLING_AUTO_ONBOARD: "true"
+  # Кто спрашивает — отвечает identity. Токены биллинг не разбирает: механику
+  # JWT/JWKS поток C не трогает (файл 04).
+  IDENTITY_URL: http://identity:8080
+  TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+
+services:
+
+  # ---------------------------------------------------------------- identity
+  # Только роли: механику JWT/JWKS поток C не трогает. Боевой identity живёт на
+  # платформе, его исходников в репозитории нет — миграция дополняющая, а
+  # проверка токена делегируется ему, как только он появится (IDENTITY_UPSTREAM_URL).
+  identity-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/identity/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  identity-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      identity-migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ../../services/identity/seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "identity",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stand-roles.sql"]
+
+  identity:
+    build:
+      context: ../../services/identity
+    <<: *restart
+    depends_on:
+      identity-seed: {condition: service_completed_successfully}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+      # Пусто — на стенде боевого identity нет, и стендовые токены stand:<uuid>
+      # разрешены только потому, что APP_ENV локальный. В защищённой среде
+      # сервис откажет всем, пока адрес не задан.
+      IDENTITY_UPSTREAM_URL: ${IDENTITY_UPSTREAM_URL:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8084:8080"]
+
+  # --------------------------------------------------------------- миграции
+  billing-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      # Скрипт потока 0 переиспользуется как есть: существующие миграции не
+      # переписываются, применение идёт по журналу (правило 9.5).
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/billing/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Сид стенда: партнёры, кабинеты и тарифы поверх тех же продавцов, что уже
+  # посеяны в базе wms (reference/stand-seed). Идемпотентен — ON CONFLICT DO
+  # NOTHING, повторный запуск ничего не меняет.
+  billing-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      billing-migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ../../services/billing/seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "billing",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stand-billing.sql"]
+
+  # ---------------------------------------------------------------- сервисы
+  billing:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-seed: {condition: service_completed_successfully}
+      identity: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    environment:
+      <<: *billing-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8082:8080"]
+
+  # Хранение по суткам и вынос собственных событий на шину. Хранение приходит
+  # не событием, а кроном: единица — коробко-место × сутки (файл 04), и товар
+  # лежит независимо от того, заказали его или нет.
+  billing-worker:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-seed: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+      rabbitmq-init: {condition: service_completed_successfully}
+    environment:
+      <<: *billing-env
+      METRICS_PORT: "8081"
+      # На стенде считаем чаще суток, чтобы не ждать ночи ради проверки.
+      # Повтор безвреден: event_id вычислим из кабинета и дня.
+      BILLING_STORAGE_INTERVAL_SECONDS: ${BILLING_STORAGE_INTERVAL_SECONDS:-900}
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/metrics', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    ports: ["127.0.0.1:8087:8081"]
+
+  # Инвариант 14: молчащий воркер считается сломанным. Поэтому у консьюмера
+  # свой /metrics — он обязан уметь доказать, что работает, а не просто быть Up.
+  billing-inbox-consumer:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+      rabbitmq-init: {condition: service_completed_successfully}
+    environment:
+      <<: *billing-env
+      METRICS_PORT: "8081"
+    command: ["python", "-m", "app.consumer"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/metrics', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    ports: ["127.0.0.1:8083:8081"]
+
+  # ------------------------------------------------------------------ админка
+  internal-admin-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/internal-admin/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  internal-admin:
+    build:
+      context: ../../services/internal-admin
+    <<: *restart
+    depends_on:
+      internal-admin-migrate: {condition: service_completed_successfully}
+      billing: {condition: service_healthy}
+      identity: {condition: service_healthy}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      BILLING_URL: http://billing:8080
+      IDENTITY_URL: http://identity:8080
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8085:8080"]
+
+  # -------------------------------------------------------------- ЛК клиента
+  portal-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/portal/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Зеркала остатка у портала нет: он спрашивает склад при каждом показе.
+  # Именно зеркало кабинета WB и даёт сегодня 3528 единиц при остатке 92.
+  portal:
+    build:
+      context: ../../services/portal
+    <<: *restart
+    depends_on:
+      portal-migrate: {condition: service_completed_successfully}
+      billing: {condition: service_healthy}
+      identity: {condition: service_healthy}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      BILLING_URL: http://billing:8080
+      IDENTITY_URL: http://identity:8080
+      WMS_BASE_URL: http://wms:8080
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8086:8080"]
