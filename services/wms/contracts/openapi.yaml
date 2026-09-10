@@ -1,0 +1,3768 @@
+openapi: 3.1.0
+
+# Контракт сервиса wms. Поток 0, заморожен: правки только через поток 0
+# с одновременным обновлением потоков A, B, C (правило 9.5.2 мастер-контекста).
+#
+# 29 маршрутов ниже — ПЕРЕНОС существующего контракта mmx_wms_bridge на новый
+# сервис, а не новое проектирование. Под них уже написаны клиенты
+# (fbs-operator-workstation, product-catalog, wb-returns): менять пути и формы
+# нельзя, даже если они кажутся неудачными. Источник — приложения B и C мастера.
+# Шесть маршрутов, помеченных тегом «new», спроектированы здесь впервые
+# (разделы 6.6, 6.7 мастера).
+#
+# Стиль — JSON-RPC поверх POST: у Odoo-моста все маршруты были такими, и клиенты
+# отправляют конверт {"jsonrpc":"2.0","method":"call","params":{...},"id":1}.
+# Поэтому здесь нет ни GET, ни REST-семантики кодов ответа: транспортный статус
+# 200, а исход операции лежит в result (или в error).
+
+info:
+  title: MM-Express WMS — контракт сервиса wms
+  version: 1.0.0
+  summary: JSON-RPC контракт склада для рабочего места, каталога и возвратов.
+  description: |
+    Складской сервис `wms` фулфилмент-оператора MM-Express (FBS Wildberries).
+
+    **Транспорт.** Все маршруты — `POST`, тело — конверт JSON-RPC 2.0:
+
+    ```json
+    {"jsonrpc": "2.0", "method": "call", "params": {...}, "id": 1}
+    ```
+
+    Успешный ответ — HTTP 200 с полем `result`; сбой уровня протокола или
+    неожиданная ошибка — HTTP 200 с полем `error`. Прикладной отказ операции
+    (нет маппинга, нет остатка) возвращается **в `result`** с полем
+    `error_code` — так работают существующие клиенты, ломать нельзя.
+
+    **Идемпотентность (инвариант 5).** Каждая команда, меняющая состояние,
+    несёт внешний ключ: `idempotency_key`, `wb_order_id`, `reference` или
+    `return_event_id`. Повтор с тем же ключом обязан вернуть тот же ответ и не
+    создать второго движения. Ключ обязателен на уровне схемы — сервер не имеет
+    права принять команду без него.
+
+    **Изоляция владельца (инвариант 6).** Ответы команд по товару содержат
+    `owner_external_id`. Клиент сверяет его со своим представлением о владельце
+    и отвергает ответ при несовпадении: перепутанный владелец — это отгрузка
+    чужой вещи.
+
+    **Секреты (инвариант 15).** Токены Wildberries и любые секреты не появляются
+    ни в одном ответе этого API. В `/wb/accounts` отдаётся `secret_ref` —
+    ссылка на секрет в провайдере — и статус проверки, но никогда значение.
+  contact:
+    name: Поток 0 — контракты и стенд
+  license:
+    name: Proprietary — MM-Express
+
+servers:
+  - url: /api/mmx/wms/v1
+    description: Базовый путь контракта (совпадает с путём Odoo-моста as-is).
+
+# Пользователи приходят с JWT от identity, сервисы — с сервисным токеном.
+# Заголовок один и тот же, поэтому схема одна; различает роль сам issuer.
+security:
+  - bearerAuth: []
+
+tags:
+  - name: health
+    description: Проба живости.
+  - name: catalog
+    description: Продавцы, товары, маппинг и остатки для product-catalog.
+  - name: warehouse
+    description: Складские документы и остаток по складу.
+  - name: tasks
+    description: Сборочные задания Wildberries — резерв, подбор, упаковка, отмена.
+  - name: labels
+    description: Этикетки. Стикер лежит локально до нажатия «печать» (инвариант 9).
+  - name: receiving
+    description: Приёмка, размещение, инвентаризация.
+  - name: storage
+    description: Коробки и адреса хранения.
+  - name: shipping
+    description: Поставки и передача в доставку.
+  - name: returns
+    description: Возвраты — принять и решить.
+  - name: wb
+    description: Кабинеты Wildberries. Отдельная роль, значения токенов не отдаются.
+  - name: new
+    description: |
+      Маршруты, спроектированные в версиях 1.1–1.2 мастера. У них, в отличие от
+      остальных, нет готовых клиентов — форма фиксируется здесь.
+
+paths:
+
+  # --- Служебное ---------------------------------------------------------
+
+  /health:
+    post:
+      operationId: wmsHealth
+      tags: [health]
+      summary: Проба живости сервиса.
+      description: |
+        Не требует авторизации: проба ходит из compose healthcheck и из Blackbox,
+        у которых токена нет.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/EmptyParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/HealthResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Каталог -----------------------------------------------------------
+
+  /sellers:
+    post:
+      operationId: sellersUpsert
+      tags: [catalog]
+      summary: Завести или обновить владельца товара.
+      description: |
+        Идемпотентен по `seller_external_id` — это и есть внешний ключ команды
+        (инвариант 5), отдельный `idempotency_key` не нужен. Повторный вызов с
+        тем же внешним идентификатором возвращает того же владельца.
+
+        Тем же маршрутом пользуется онбординг клиента из потока C.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/SellerUpsertParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/SellerResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /catalog/products:
+    post:
+      operationId: catalogProducts
+      tags: [catalog]
+      summary: Список товаров владельца.
+      description: |
+        Чтение. Форма фильтра перенесена из моста как есть; поля товара — из
+        раздела 7 мастера (`sku`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/CatalogProductsParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/CatalogProductsResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /catalog/products/ensure:
+    post:
+      operationId: catalogProductsEnsure
+      tags: [catalog]
+      summary: Гарантировать наличие товара и маппинга.
+      description: |
+        Идемпотентен по паре `(seller_external_id, barcode)` — ровно тот ключ,
+        под которым в схеме стоит `UNIQUE (owner_id, barcode)`.
+
+        Помнить правило раздела 3.2 мастера: у Wildberries поле называется
+        `sku`, но приходит в нём **штрихкод**. Штрихкод определяет вещь на
+        полке, артикул — только модель, поэтому уникальность по штрихкоду.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/CatalogProductEnsureParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/CatalogProductEnsureResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /catalog/stocks:
+    post:
+      operationId: catalogStocks
+      tags: [catalog]
+      summary: Остаток по одному товару владельца.
+      description: |
+        Возвращает те же строки, что и `/catalog/stocks/bulk`, но по одному
+        штрихкоду. Значение `available` считается по формуле инварианта 7:
+        `good − reserved − buffer(sku)` — всегда занижаем, чтобы не продать
+        то, чего на полке нет.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/CatalogStocksParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/StocksResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /catalog/stocks/bulk:
+    post:
+      operationId: catalogStocksBulk
+      tags: [catalog]
+      summary: Остатки владельца пачкой (приложение C мастера).
+      description: |
+        Форма зафиксирована приложением C дословно: запрос
+        `{"seller_external_id"}`, ответ `{"stocks": [{"barcode", "available"}]}`.
+
+        **Правило отбраковки (приложение C).** Строки без штрихкода или с
+        нецелым либо отрицательным `available` отбрасываются — их не должно
+        быть в ответе вовсе. Отбрасывает сервер, а не клиент: то же правило
+        стоит в существующем каталоге, и расхождение здесь означало бы
+        публикацию мусорного остатка в Wildberries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/CatalogStocksBulkParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/StocksResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Склад -------------------------------------------------------------
+
+  /warehouse/documents:
+    post:
+      operationId: warehouseDocuments
+      tags: [warehouse]
+      summary: Складской документ (в том числе начальный остаток).
+      description: |
+        Перенос `mmx.wms.warehouse.document`. Через этот маршрут заезжает в том
+        числе начальный остаток при переключении клиента: движения пишутся с
+        `doc_type = 'opening'` (решение владельца 11, шаг 3 миграции).
+
+        Идемпотентность — по `reference` (инвариант 5): повторная загрузка того
+        же документа не должна удвоить остаток.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/WarehouseDocumentParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/WarehouseDocumentResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /warehouse/stock:
+    post:
+      operationId: warehouseStock
+      tags: [warehouse]
+      summary: Остаток по складу в разрезе ячеек и коробок.
+      description: |
+        Чтение проекции `stock_balance`. Отличие от `/catalog/stocks`: там —
+        одно число «сколько можно продать», здесь — где именно лежит и в каком
+        состоянии. Портал показывает клиенту именно это (поток C).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/WarehouseStockParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/WarehouseStockResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Задания -----------------------------------------------------------
+
+  /reservations:
+    post:
+      operationId: reservationsCreate
+      tags: [tasks]
+      summary: Создать задание и резерв (приложение C мастера).
+      description: |
+        Главная команда контракта. Задание и резерв рождаются **одной
+        транзакцией** (инвариант 1): либо в базе есть и то и другое, либо
+        ничего. Ни одного HTTP-вызова внутри транзакции (инвариант 2) —
+        поставка и стикер запрашиваются в WB уже после коммита.
+
+        **Правило приёмки ответа (приложение C).** Клиент считает резерв
+        принятым **только** при `status == "reserved"`. Любое другое значение —
+        отказ, причина в `error_code`.
+
+        **Отказ по маппингу** (раздел 3.2): резерв не создаётся, задание уходит
+        в `manual_review` с кодом, а не превращается в остаток (инвариант 6).
+
+        **Нет остатка по учёту.** Если у владельца включён `allow_ledger_short`,
+        резерв всё равно создаётся, движение пишется с `reason = 'ledger_short'`,
+        в той же транзакции появляется `discrepancy(kind='ledger_short')` и
+        событие `wms.stock.shortfall.v1` (раздел 6.5). Смена не встаёт, но
+        расхождение перестаёт быть невидимым. Если клапан выключен — отказ с
+        `INSUFFICIENT_STOCK`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ReservationParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ReservationResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/pull:
+    post:
+      operationId: tasksPull
+      tags: [tasks, new]
+      summary: Рабочее место забирает свои задания напрямую, без шины.
+      description: |
+        Маршрут, ради которого переписан путь заказа. Событие — уведомление, а
+        не способ доставки (раздел 6.1): задание доступно здесь сразу после
+        коммита в базу (инвариант 8), даже если RabbitMQ выключен целиком.
+        Это пункт 14 полного прогона.
+
+        **Выдача (раздел 7, «Выдача заданий сборщикам»).** При `claim: true`
+        сервер берёт задания `FOR UPDATE SKIP LOCKED` в порядке `deadline` —
+        срока Wildberries, не времени создания — и ставит лизинг
+        `claim_expires_at = now() + lease_seconds`. Задание не может уйти
+        двоим; если сборщик пропал, лизинг истекает и задание возвращается в
+        общую очередь.
+
+        При `claim: false` это чистое чтение для экрана: ничего не занимает,
+        ничего не меняет.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/TasksPullParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/TasksPullResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/{taskId}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      operationId: taskGet
+      tags: [tasks]
+      summary: Прочитать задание.
+      description: |
+        Чтение задания целиком. Используется в том числе для восстановления
+        после потери ответа на `/tasks/{taskId}/scan`: клиент перечитывает
+        задание и принимает его, если оно уже `picked` с тем же штрихкодом
+        (правило приложения C).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/EmptyParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/TaskProjection'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/{taskId}/scan:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      operationId: taskScan
+      tags: [tasks]
+      summary: Скан товара у стойки (приложение C мастера).
+      description: |
+        Форма зафиксирована приложением C: запрос `{"barcode"}`, ответ
+        `{"status": "picked", "owner_external_id", ...}`.
+
+        **Правило приёмки ответа (приложение C).** Клиент принимает скан
+        только если `owner_external_id` совпал с ожидаемым владельцем и
+        `status == "picked"`. При потере ответа — перечитать задание через
+        `/tasks/{taskId}` и принять, если оно уже `picked` с тем же штрихкодом.
+        Повторный скан того же штрихкода по тому же заданию идемпотентен и
+        второго движения не создаёт (инвариант 5).
+
+        Скан чужого штрихкода отклоняется (пункт 9 полного прогона): это
+        главный рубеж качества процесса, единственное место, где реально
+        проверяется, что в коробке лежит то, что должно.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/TaskScanParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/TaskScanResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/{taskId}/pack:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      operationId: taskPack
+      tags: [tasks]
+      summary: Упаковка задания.
+      description: |
+        Переводит задание в `packed`. Идемпотентен по `idempotency_key`
+        (инвариант 5): повтор возвращает то же состояние, не удваивая ни
+        движение, ни начисление (`order.packed.v1` тарифицируется, поток C).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/TaskPackParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/TaskCommandResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/{taskId}/label:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      operationId: taskLabel
+      tags: [tasks, labels]
+      summary: Отдать этикетку задания (приложение C мастера).
+      description: |
+        Форма ответа зафиксирована приложением C дословно.
+
+        **Стикер отдаётся из локального хранилища.** Запрос к Wildberries в
+        момент упаковки запрещён (инвариант 9): стикер тянется заранее, сразу
+        после резерва, пачкой до 100 штук. Именно здесь лежала разница между
+        2–10 с и 300 мс от нажатия до движения головки принтера.
+
+        **Проверки, которые делает клиент (приложение C):**
+        `order_id` обязан совпасть с заданием; `checksum` — sha256 от `payload`,
+        сверяется через `hmac.compare_digest`, а не оператором `==`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/EmptyParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/LabelResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/{taskId}/return-to-shelf:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      operationId: taskReturnToShelf
+      tags: [tasks]
+      summary: Вернуть товар на полку.
+      description: |
+        Снимает резерв и возвращает количество в состояние `good`. Адрес
+        возврата указывается явно: без него товар «возвращается» в никуда и
+        остаток снова начинает врать.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/TaskReturnToShelfParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/TaskCommandResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/{taskId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      operationId: taskCancel
+      tags: [tasks]
+      summary: Отменить задание (приложение C мастера).
+      description: |
+        Форма запроса зафиксирована приложением C: `{"cancellation_event_id",
+        "handed_over"}`. Внешний ключ идемпотентности — `cancellation_event_id`.
+
+        **Отмена после выдачи стикера** (пункт 13 полного прогона): резерв
+        снимается, товар возвращается в `good`, локальный стикер помечается
+        недействительным (`wb_label.invalidated_at`), заказ освобождается из
+        поставки WB (`release_from_supply`) — уже вне транзакции.
+
+        **`cancel_reason` заполняется сервером.** Инвариант 11 требует
+        непустую причину на уровне схемы, но замороженная форма запроса поля
+        причины не несёт: сервер выводит её из статуса Wildberries и флага
+        `handed_over`. Добавление поля в запрос — изменение контракта и идёт
+        через поток 0.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/TaskCancelParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/TaskCancelResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /tasks/{taskId}/return:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      operationId: taskReturn
+      tags: [tasks, returns]
+      summary: Оформить возврат по заданию (приложение C мастера).
+      description: |
+        Форма зафиксирована приложением C: `{"return_event_id",
+        "seller_external_id", "reason"}` → `{"return_id"}`.
+        `return_event_id` — внешний ключ идемпотентности (инвариант 5), в схеме
+        ему соответствует `wms_return.return_event_id UNIQUE`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/TaskReturnParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/TaskReturnResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Печать ------------------------------------------------------------
+
+  /labels/{task_id}/print:
+    parameters:
+      - $ref: '#/components/parameters/TaskIdSnake'
+    post:
+      operationId: labelPrint
+      tags: [labels, new]
+      summary: Отдать локальный ZPL агенту печати станции.
+      description: |
+        Путь с подчёркиванием в параметре (`task_id`, не `taskId`) — так он
+        назван в приложении B мастера; расхождение со старыми маршрутами
+        сохранено намеренно, чтобы не разойтись с документом.
+
+        Маршрут только достаёт готовый стикер и фиксирует факт печати. Ни
+        одного вызова в Wildberries (инвариант 9) — иначе теряется весь смысл
+        предзагрузки. Дальше поток B: push агенту по постоянному соединению →
+        `WritePrinter` с типом `RAW` мимо графического драйвера.
+
+        Бюджет: от вызова до записи в устройство менее 50 мс, до движения
+        головки — менее 300 мс.
+
+        `reprint: true` — повторная печать (событие `label.reprinted.v1` вместо
+        `label.printed.v1`); при повторе `reason` обязателен, иначе счётчик
+        перепечаток бесполезен для разбора.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/LabelPrintParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/LabelPrintResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Приёмка и инвентаризация ------------------------------------------
+
+  /receipts:
+    post:
+      operationId: receiptCreate
+      tags: [receiving]
+      summary: Приёмка (приложение C мастера).
+      description: |
+        Форма зафиксирована приложением C: `{"seller_external_id",
+        "warehouse_code": "RUM", "reference", "lines": [...], "seller_name",
+        "seller_inn"}`.
+
+        **Владельца, которого склад видит впервые, заводит сам** — по
+        `seller_name` и `seller_inn`. Поэтому эти два поля есть в форме
+        приёмки: товар физически приехал, останавливать разгрузку из-за
+        отсутствующей карточки нельзя.
+
+        Идемпотентность — по `reference` (инвариант 5): повторно отправленная
+        приёмка не должна принять товар дважды.
+
+        Баланс двигается **по факту, а не по ожиданию**: расхождение
+        оформляется `discrepancy` с типом (пункт 3 полного прогона).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ReceiptParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ReceiptResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /receipts/screen:
+    post:
+      operationId: receiptsScreen
+      tags: [receiving, new]
+      summary: Данные экрана приёмки.
+      description: |
+        Одним вызовом отдаёт всё, что нужно экрану приёмщика: незакрытые
+        приёмки, строки с ожидаемым и фактическим количеством, уже
+        оформленные расхождения. Экран пяти приёмщиков не должен собирать это
+        из пяти запросов — на разгрузке каждый лишний круг стоит времени.
+
+        Только чтение: ничего не занимает и не меняет.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ReceiptsScreenParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ReceiptsScreenResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /putaway/screen:
+    post:
+      operationId: putawayScreen
+      tags: [receiving, new]
+      summary: Данные экрана размещения.
+      description: |
+        Что принято, но ещё не разложено по коробкам и ячейкам. Для каждой
+        позиции — подсказка адресов: свободная ёмкость и `route_order`, чтобы
+        товар одного владельца не расползался по складу и обход сборщика
+        оставался коротким.
+
+        Подсказка не обязательна к исполнению: приёмщик волен положить куда
+        удобно, факт фиксируется в `/boxes`. Только чтение.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/PutawayScreenParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/PutawayScreenResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /inventory/sheet:
+    post:
+      operationId: inventorySheet
+      tags: [receiving]
+      summary: Лист инвентаризации.
+      description: |
+        Готовит строки для пересчёта: что и где система считает лежащим.
+        Ожидаемое количество отдаётся отдельным полем, чтобы приложение могло
+        его скрыть — считающий не должен видеть цифру до ввода факта.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/InventorySheetParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/InventorySheetResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /inventory/count:
+    post:
+      operationId: inventoryCount
+      tags: [receiving]
+      summary: Инвентаризация (приложение C мастера).
+      description: |
+        Форма зафиксирована приложением C: `{"seller_external_id",
+        "warehouse_code", "reference", "scope": "partial"|"full", "lines": [...]}`.
+
+        Излишки приходуются, недостачи списываются, каждое изменение — движение
+        `stock_move` с `doc_type = 'count'` (инвариант 3: баланс не правится
+        напрямую никогда). Идемпотентность — по `reference`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/InventoryCountParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/InventoryCountResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Коробки и адреса --------------------------------------------------
+
+  /boxes:
+    post:
+      operationId: boxCreate
+      tags: [storage]
+      summary: Создать или обновить коробку.
+      description: |
+        Коробка — фактическая единица адресации склада (раздел 2.9): один товар
+        на коробку, коробка стоит в ячейке.
+
+        **`comment` обязателен** — требование склада, а не формальность: «через
+        месяц стоят сотни одинаковых коробок», и без пометки найти нужную
+        нельзя. Пустая строка не считается комментарием.
+
+        **`quantity = 0` означает «не считали», а не «пусто»** — различать по
+        флагу `counted`. Идемпотентность — по `barcode`, он уникален.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/BoxUpsertParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/BoxResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /boxes/list:
+    post:
+      operationId: boxList
+      tags: [storage]
+      summary: Список коробок.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/BoxListParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/BoxListResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /boxes/remove:
+    post:
+      operationId: boxRemove
+      tags: [storage]
+      summary: Убрать коробку со склада.
+      description: |
+        Переводит коробку в `removed`. Коробка не удаляется: по её штрихкоду
+        потом разбирают, куда делся товар.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/BoxRemoveParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/BoxResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /storage/lookup:
+    post:
+      operationId: storageLookup
+      tags: [storage]
+      summary: Найти, где лежит товар.
+      description: |
+        Отвечает на вопрос сборщика «куда идти»: адреса и коробки, в которых
+        лежит штрихкод. Сортировка по `route_order` — по маршруту обхода, а не
+        по количеству.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/StorageLookupParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/StorageLookupResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /storage/count:
+    post:
+      operationId: storageCount
+      tags: [storage]
+      summary: Сколько товара лежит на складе.
+      description: |
+        Свёртка `stock_balance` до одного числа по владельцу и штрихкоду, с
+        разбивкой по состояниям товара. Это то самое число, которое сейчас
+        расходится: портал показывает 3528 при реальных 92.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/StorageCountParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/StorageCountResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Отгрузка ----------------------------------------------------------
+
+  /shipments:
+    post:
+      operationId: shipmentCreate
+      tags: [shipping]
+      summary: Создать или обновить поставку.
+      description: |
+        Поставка Wildberries — одна поставка на один кабинет (приложение D).
+        Передача поставки (`deliver`) требует валидации `metaDetails` — это
+        обязательно с релизов WB 2026-03/04.
+
+        `HANDED_TO_WB` ставится только подтверждением человека; статус WB
+        `complete` доказательством приёмки не является (раздел 2.12).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ShipmentParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ShipmentResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /shipments/picked:
+    post:
+      operationId: shipmentsPicked
+      tags: [shipping]
+      summary: Собранные задания, готовые к поставке.
+      description: |
+        Чтение: что уже собрано и упаковано, но ещё не уехало. Экран
+        логиста и вход в формирование поставки.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ShipmentsPickedParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ShipmentsPickedResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Возвраты ----------------------------------------------------------
+
+  /returns/{returnId}/receive:
+    parameters:
+      - $ref: '#/components/parameters/ReturnId'
+    post:
+      operationId: returnReceive
+      tags: [returns]
+      summary: Принять возврат физически.
+      description: |
+        Идемпотентность — по `return_event_id` (инвариант 5). Товар до решения
+        лежит в состоянии `quarantine`: до осмотра неизвестно, годен он к
+        перепродаже или нет, и попасть в доступный остаток он не должен.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ReturnReceiveParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ReturnResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /returns/{returnId}/decision:
+    parameters:
+      - $ref: '#/components/parameters/ReturnId'
+    post:
+      operationId: returnDecision
+      tags: [returns]
+      summary: Решение по возврату.
+      description: |
+        `resellable` — товар возвращается в `good` и снова публикуется в WB;
+        `defective` — уходит в `defect` и в доступный остаток не попадает.
+        Решение порождает начисление (поток C), поэтому идемпотентность
+        обязательна: второе решение по тому же возврату — второй счёт клиенту.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ReturnDecisionParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ReturnResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /returns/receipt:
+    post:
+      operationId: returnsReceipt
+      tags: [returns]
+      summary: Приёмка партии возвратов.
+      description: |
+        Пачечный вариант `/returns/{returnId}/receive` — возвраты приезжают
+        коробкой, а не по одному. Идемпотентность — по `reference` на партию;
+        внутри партии каждая строка дополнительно защищена своим
+        `return_event_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/ReturnsReceiptParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/ReturnsReceiptResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  # --- Кабинеты Wildberries ----------------------------------------------
+
+  /wb/accounts:
+    post:
+      operationId: wbAccounts
+      tags: [wb, new]
+      summary: Список и заведение кабинетов Wildberries.
+      description: |
+        Отдельная роль: `wms` становится держателем токенов WB, и управление
+        кабинетами не должно быть доступно тому, кто просто собирает заказы
+        (раздел 12).
+
+        Два действия под одним путём, потому что маршрутов в контракте ровно
+        два и добавить третий нельзя: `op = "list"` — чтение,
+        `op = "upsert"` — заведение или изменение кабинета. Идемпотентность
+        `upsert` — по `external_id`.
+
+        **Токен не передаётся и не отдаётся.** На вход принимается только
+        `secret_ref` — ссылка на секрет в провайдере; значение кладёт туда
+        онбординг потока C, минуя этот API. В ответе значения токена нет ни в
+        каком виде (инвариант 15), и добавлять его нельзя: живой токен на
+        стенде отправит настоящие команды в кабинет клиента.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/WbAccountsParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/WbAccountsResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /wb/accounts/{id}/verify:
+    parameters:
+      - $ref: '#/components/parameters/WbAccountId'
+    post:
+      operationId: wbAccountVerify
+      tags: [wb, new]
+      summary: Проверить кабинет Wildberries.
+      description: |
+        Ходит в WB с токеном из провайдера и отвечает на вопросы, из-за
+        которых кабинет молча перестаёт работать: жив ли токен, какие у него
+        категории доступа (`Маркетплейс` обязательна), когда истекает, не
+        упёрлись ли в лимит 300 запросов в минуту, задан ли склад WB.
+
+        В `shadow`-режиме проверка тоже разрешена: она использует только
+        чтение и ни одной записи в кабинет не делает.
+
+        Результат — набор именованных проверок, а не одно «ок»: «что-то не
+        так» на онбординге бесполезно.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/WbAccountVerifyParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/WbAccountVerifyResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Пользователи — JWT от `identity` (JWKS, issuer `mmx-identity`).
+        Межсервисные вызовы — сервисный токен в том же заголовке.
+        Управление кабинетами WB требует отдельной роли (раздел 12).
+
+  parameters:
+
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      description: Идентификатор задания в `wms`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+
+    # Отдельный параметр, потому что у нового маршрута печати имя в
+    # snake_case — так он записан в приложении B мастера.
+    TaskIdSnake:
+      name: task_id
+      in: path
+      required: true
+      description: Идентификатор задания в `wms`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+
+    ReturnId:
+      name: returnId
+      in: path
+      required: true
+      description: Идентификатор возврата в `wms`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+
+    WbAccountId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор кабинета Wildberries в `wms` (`wb_account.id`).
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+
+    TransportError:
+      description: |
+        Ошибка транспортного уровня — сеть, авторизация, недоступность сервиса.
+        Прикладной отказ операции сюда не попадает: он возвращается с кодом 200
+        в поле `result` (или `error`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/TransportErrorBody'
+
+  schemas:
+
+    # === Конверт JSON-RPC ===============================================
+
+    JsonRpcRequest:
+      type: object
+      description: |
+        Конверт запроса. Форма унаследована от Odoo-моста и одинакова у всех
+        маршрутов; конкретный маршрут сужает только `params`.
+      required: [jsonrpc, method, params, id]
+      additionalProperties: false
+      properties:
+        jsonrpc:
+          const: '2.0'
+        method:
+          const: call
+        params:
+          type: object
+        id:
+          $ref: '#/components/schemas/JsonRpcId'
+      examples:
+        - jsonrpc: '2.0'
+          method: call
+          params: {}
+          id: 1
+
+    JsonRpcResponse:
+      type: object
+      description: |
+        Конверт ответа. Ровно одно из полей `result` / `error` присутствует.
+      required: [jsonrpc, id]
+      additionalProperties: false
+      properties:
+        jsonrpc:
+          const: '2.0'
+        id:
+          $ref: '#/components/schemas/JsonRpcId'
+        result: {}
+        error:
+          $ref: '#/components/schemas/JsonRpcError'
+
+    JsonRpcId:
+      description: Идентификатор вызова, возвращается клиенту без изменений.
+      oneOf:
+        - type: string
+        - type: integer
+        - type: 'null'
+
+    JsonRpcError:
+      type: object
+      description: |
+        Ошибка уровня протокола или необработанный сбой. Прикладные отказы
+        описанных доменов сюда не кладутся — у них есть `error_code` в `result`.
+      required: [code, message]
+      properties:
+        code:
+          type: integer
+          description: Числовой код JSON-RPC (−32600 и далее).
+        message:
+          type: string
+        data:
+          type: object
+          properties:
+            error_code:
+              $ref: '#/components/schemas/ErrorCode'
+            correlation_id:
+              type: string
+          additionalProperties: true
+
+    TransportErrorBody:
+      type: object
+      description: Тело ошибки транспортного уровня.
+      required: [message]
+      properties:
+        message:
+          type: string
+        correlation_id:
+          type: string
+      additionalProperties: true
+
+    EmptyParams:
+      type: object
+      description: |
+        Параметров нет: всё, что нужно вызову, лежит в пути. Пустой объект всё
+        равно передаётся — конверт JSON-RPC требует поле `params`.
+      additionalProperties: false
+
+    # === Коды ошибок =====================================================
+
+    ErrorCode:
+      type: string
+      description: |
+        Коды отказа резерва (приложение C мастера). Список **закрыт**: на эти
+        значения завязаны существующие клиенты, добавление или переименование —
+        изменение контракта через поток 0.
+
+        Этот же перечень используется как `manual_review_code` у задания
+        (раздел 3.2): немаппленный товар не становится остатком, он становится
+        заданием в `manual_review` с конкретной причиной.
+
+        Домены, отказ которых мастер-контекстом не описан, кода не выдумывают —
+        они возвращают `error` JSON-RPC с человекочитаемым `message`.
+      enum:
+        - SELLER_MAPPING_MISSING
+        - PRODUCT_MAPPING_MISSING
+        - AMBIGUOUS_PRODUCT_MAPPING
+        - WAREHOUSE_UNKNOWN
+        - INSUFFICIENT_STOCK
+        - SERIALIZATION_RETRY
+
+    # === Общие типы домена ==============================================
+
+    SellerExternalId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: Внешний идентификатор владельца товара (`owner.seller_external_id`).
+
+    OwnerExternalId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: |
+        Владелец товара в ответе. Клиент сверяет его со своим представлением и
+        отвергает ответ при несовпадении (инвариант 6).
+
+    Barcode:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: |
+        Штрихкод товара. У Wildberries штрихкод приходит в поле `sku`
+        (раздел 3.2): именно он определяет вещь на полке, артикул — только
+        модель.
+
+    WarehouseCode:
+      type: string
+      minLength: 1
+      maxLength: 32
+      default: RUM
+      description: Код склада. Склад один — `RUM`, Москва (раздел 4).
+
+    CellAddress:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: Адрес ячейки (`cell.address`).
+
+    BoxBarcode:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: Штрихкод коробки (`box.barcode`), уникален по складу.
+
+    IdempotencyKey:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: |
+        Внешний ключ команды (инвариант 5). Повтор с тем же ключом обязан
+        вернуть тот же ответ и не создать второго движения.
+
+    Reference:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: |
+        Внешний номер документа. Он же ключ идемпотентности: в схеме ему
+        соответствует `UNIQUE` на `receipt.reference` / `inventory_count.reference`.
+
+    CorrelationId:
+      type: string
+      maxLength: 128
+      description: Сквозной идентификатор для трассировки; проходит в события.
+
+    Quantity:
+      type: integer
+      minimum: 1
+      description: Количество штук. Дробных единиц на складе нет.
+
+    StockState:
+      type: string
+      description: |
+        Состояние товара (раздел 7). Обязательны на первом круге `good`,
+        `reserved`, `defect`; остальные заведены в схеме с первого дня, чтобы
+        не мигрировать домен под первый же случай карантина.
+      enum: [good, reserved, quarantine, defect, blocked, processing]
+
+    TaskState:
+      type: string
+      description: |
+        Состояние задания (автомат раздела 7).
+        `short` — недостача, `manual_review` — товар без маппинга или кривые
+        метаданные WB, `diverged` — наш статус разошёлся со статусом WB
+        (инвариант 10: расхождение будит человека, а не пишется тихо).
+
+        `handed` и `accepted` автомат раздела 7 не перечисляет, но раздел 2.12
+        требует различать три разных факта: `shipped` — мы вызвали передачу
+        поставки, и WB ответил `complete`; `handed` — **человек подтвердил**
+        физическую передачу; `accepted` — приёмку подтвердила **сверка с WB**,
+        терминальный успех. Ровно на смешении первого со вторым держалась
+        иллюзия, что 6072 задания в `complete` доехали. Список совпадает с
+        `wms_task.state` в миграции 003.
+      enum:
+        - new
+        - reserved
+        - picking
+        - picked
+        - packed
+        - labeled
+        - in_supply
+        - shipped
+        - handed
+        - accepted
+        - short
+        - cancelled
+        - manual_review
+        - diverged
+
+    WbStatus:
+      type: string
+      description: |
+        Статус задания на стороне Wildberries (раздел 2.12). `complete` —
+        поставка передана, **не доказательство приёмки WB**.
+      enum: [new, confirm, complete, cancel]
+
+    ReceiptState:
+      type: string
+      description: Совпадает с `receipt.state` в миграции 005.
+      enum: [draft, counting, accepted, cancelled]
+
+    DiscrepancyKind:
+      type: string
+      description: |
+        Тип расхождения (раздел 7). `ledger_short` — сборка без остатка по
+        учёту: клапан 6.5, который раньше срабатывал молча.
+      enum: [shortage, surplus, mismatch, damage, ledger_short]
+
+    LabelFormat:
+      type: string
+      description: |
+        Формат стикера (`WB_STICKER_FORMAT`, приложение D). Целевое значение —
+        `zplv`: 1–3 КБ текста против 20–100 КБ картинки, принтер печатает
+        нативно. `png` оставлен фолбэком, пока формат не подтверждён на живом
+        принтере (раздел 13, вопрос 2).
+      enum: [zplv, zplh, svg, png]
+
+    Sha256:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: Контрольная сумма sha256 в нижнем регистре.
+
+    # === Здоровье ========================================================
+
+    HealthResult:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+        checks:
+          type: object
+          description: |
+            Живость зависимостей. Здесь же метрика «обработано за минуту» по
+            воркерам: молчащий воркер считается сломанным (инвариант 14), и
+            зелёный порт этого не показывает.
+          additionalProperties: true
+
+    # === Владелец и каталог ==============================================
+
+    SellerUpsertParams:
+      type: object
+      required: [seller_external_id, name]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        inn:
+          type: string
+          maxLength: 32
+        active:
+          type: boolean
+          default: true
+        allow_ledger_short:
+          type: boolean
+          default: true
+          description: |
+            Клапан «собрать без остатка» (раздел 6.5). Выключается по владельцу,
+            не глобально: убрать его совсем нельзя — в первый день новой WMS
+            учёт где-то будет неверен, и остановленный подбор снова погонит
+            операторов в обход.
+
+    SellerResult:
+      type: object
+      required: [owner_external_id, name, active, allow_ledger_short]
+      additionalProperties: false
+      properties:
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        owner_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        inn:
+          type: string
+        active:
+          type: boolean
+        allow_ledger_short:
+          type: boolean
+        created:
+          type: boolean
+          description: true — владелец заведён этим вызовом, false — уже существовал.
+
+    Product:
+      type: object
+      description: Товар владельца (`sku` раздела 7).
+      required: [owner_external_id, barcode]
+      additionalProperties: false
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        seller_sku:
+          type: string
+          maxLength: 128
+          description: Артикул продавца. Модель, а не конкретная вещь.
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        name:
+          type: string
+        dims_mm:
+          $ref: '#/components/schemas/Dimensions'
+        weight_g:
+          type: integer
+          minimum: 1
+        buffer:
+          type: integer
+          minimum: 0
+          description: Страховой запас, вычитается при публикации в WB (инвариант 7).
+
+    Dimensions:
+      type: object
+      description: Габариты в миллиметрах.
+      required: [l, w, h]
+      additionalProperties: false
+      properties:
+        l: {type: integer, minimum: 1}
+        w: {type: integer, minimum: 1}
+        h: {type: integer, minimum: 1}
+
+    CatalogProductsParams:
+      type: object
+      required: [seller_external_id]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcodes:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/Barcode'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+        cursor:
+          type: string
+
+    CatalogProductsResult:
+      type: object
+      required: [products]
+      additionalProperties: false
+      properties:
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/Product'
+        next_cursor:
+          type: ['string', 'null']
+
+    CatalogProductEnsureParams:
+      type: object
+      required: [seller_external_id, barcode]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        seller_sku:
+          type: string
+          maxLength: 128
+        name:
+          type: string
+        dims_mm:
+          $ref: '#/components/schemas/Dimensions'
+        weight_g:
+          type: integer
+          minimum: 1
+        buffer:
+          type: integer
+          minimum: 0
+
+    CatalogProductEnsureResult:
+      type: object
+      required: [product, created]
+      additionalProperties: false
+      properties:
+        product:
+          $ref: '#/components/schemas/Product'
+        created:
+          type: boolean
+
+    CatalogStocksParams:
+      type: object
+      required: [seller_external_id, barcode]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+
+    CatalogStocksBulkParams:
+      type: object
+      description: Форма запроса зафиксирована приложением C — одно поле.
+      required: [seller_external_id]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+
+    StockRow:
+      type: object
+      description: |
+        Строка остатка для публикации. `available = good − reserved − buffer(sku)`
+        (инвариант 7) — всегда занижаем.
+      required: [barcode, available]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        available:
+          type: integer
+          minimum: 0
+          description: |
+            Только целое неотрицательное. Строки с нецелым или отрицательным
+            значением, равно как и строки без штрихкода, в ответ не попадают —
+            они отбрасываются на стороне сервера (приложение C).
+
+    StocksResult:
+      type: object
+      required: [stocks]
+      additionalProperties: false
+      properties:
+        stocks:
+          type: array
+          items:
+            $ref: '#/components/schemas/StockRow'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        dropped_rows:
+          type: integer
+          minimum: 0
+          description: |
+            Сколько строк отброшено правилом отбраковки. Нужно, чтобы молчаливая
+            потеря позиций была видна: остаток, не доехавший до WB, — это
+            непроданный товар.
+
+    # === Складские документы и остаток ==================================
+
+    WarehouseDocumentParams:
+      type: object
+      description: |
+        Точный состав строк документа не зафиксирован мастер-контекстом —
+        перенос as-is с боевого моста. Поля ниже соответствуют разделу 7;
+        дополнительные ключи допускаются, чтобы существующие клиенты не
+        сломались на первом же неизвестном поле.
+      required: [seller_external_id, reference, doc_type, lines]
+      additionalProperties: true
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        reference:
+          $ref: '#/components/schemas/Reference'
+        doc_type:
+          type: string
+          description: |
+            Тип документа, попадает в `stock_move.doc_type`; список закрыт
+            миграцией 004. `opening` — начальный остаток, который даёт владелец
+            компании при переключении клиента (решение владельца 11).
+          enum:
+            - opening
+            - receipt
+            - putaway
+            - move
+            - reservation
+            - pick
+            - pack
+            - shipment
+            - inventory
+            - return
+            - adjustment
+        comment:
+          type: string
+        lines:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/WarehouseDocumentLine'
+
+    WarehouseDocumentLine:
+      type: object
+      required: [barcode, quantity]
+      additionalProperties: true
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        quantity:
+          $ref: '#/components/schemas/Quantity'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        state:
+          $ref: '#/components/schemas/StockState'
+
+    WarehouseDocumentResult:
+      type: object
+      description: |
+        Отдельной таблицы документа в схеме `wms` нет — маршрут пишет движения
+        прямо в журнал (инвариант 3), поэтому в ответе не идентификатор
+        документа, а его внешний номер и число записанных движений.
+      required: [reference, owner_external_id, state]
+      additionalProperties: false
+      properties:
+        reference:
+          $ref: '#/components/schemas/Reference'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        state:
+          type: string
+          enum: [applied, rejected]
+        moves:
+          type: integer
+          minimum: 0
+          description: Сколько движений записано в журнал.
+        duplicate:
+          type: boolean
+          description: true — документ с таким `reference` уже был применён.
+
+    WarehouseStockParams:
+      type: object
+      required: [seller_external_id]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        barcodes:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/Barcode'
+        states:
+          type: array
+          items:
+            $ref: '#/components/schemas/StockState'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+
+    StockPlacement:
+      type: object
+      description: Строка проекции `stock_balance` — где и в каком состоянии лежит товар.
+      required: [barcode, state, quantity]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        state:
+          $ref: '#/components/schemas/StockState'
+        quantity:
+          type: integer
+          minimum: 0
+        route_order:
+          type: ['integer', 'null']
+          description: Порядок обхода склада; по нему сортируется лист подбора.
+
+    WarehouseStockResult:
+      type: object
+      required: [owner_external_id, rows]
+      additionalProperties: false
+      properties:
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/StockPlacement'
+
+    # === Резерв ==========================================================
+
+    ReservationParams:
+      type: object
+      description: |
+        Форма зафиксирована приложением C мастера. Поля перечислены в том же
+        составе; обязательными сделаны те, без которых команда не выполнима
+        или не идемпотентна.
+      required: [idempotency_key, seller_external_id, wb_order_id, sku, quantity]
+      additionalProperties: false
+      properties:
+        request_id:
+          type: string
+          maxLength: 128
+          description: Идентификатор запроса на стороне клиента, для разбора логов.
+        idempotency_key:
+          $ref: '#/components/schemas/IdempotencyKey'
+        gateway_order_id:
+          type: string
+          maxLength: 128
+          description: Идентификатор заказа в шлюзе. Переходное поле — шлюз поглощается `wms`.
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        wb_account_external_id:
+          type: string
+          maxLength: 128
+          description: Кабинет Wildberries, из которого пришло задание.
+        wb_order_id:
+          type: ['integer', 'string']
+          description: |
+            Идентификатор сборочного задания WB. Второй внешний ключ
+            идемпотентности: в схеме ему соответствует `wms_task.wb_order_id UNIQUE`.
+        order_uid:
+          type: string
+          maxLength: 128
+        sku:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Поле называется `sku`, но Wildberries кладёт в него **штрихкод**
+            (раздел 3.2). Поиск товара идёт в три шага: `barcode` →
+            `external_sku` → `barcode == sku`, каждый с ограничением на
+            неоднозначность: два совпадения — это `AMBIGUOUS_PRODUCT_MAPPING`,
+            а не «берём первое». У одной карточки несколько размеров.
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        quantity:
+          $ref: '#/components/schemas/Quantity'
+        deadline:
+          type: string
+          format: date-time
+          description: |
+            Срок Wildberries. По нему, а не по времени создания, сортируется
+            выдача заданий сборщикам.
+        correlation_id:
+          $ref: '#/components/schemas/CorrelationId'
+      examples:
+        - request_id: 1f3a...-req
+          idempotency_key: wb-order-1234567890
+          gateway_order_id: gw-778
+          seller_external_id: seller-akey
+          wb_account_external_id: wb-акей-1
+          wb_order_id: 1234567890
+          order_uid: 8f0e...-uid
+          sku: '4680123456789'
+          barcode: '4680123456789'
+          quantity: 1
+          deadline: '2026-09-11T09:00:00Z'
+          correlation_id: corr-42
+
+    ReservationResult:
+      type: object
+      description: |
+        Ответ зафиксирован приложением C. **Клиент считает задание принятым
+        только при `status == "reserved"`**; любое другое значение трактуется
+        как отказ, и разбирать надо `error_code`.
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          minLength: 1
+          description: |
+            `reserved` — принято. Перечень остальных значений мастер-контекстом
+            не закреплён, поэтому здесь не enum: клиент обязан сравнивать с
+            `"reserved"`, а не перебирать варианты отказа.
+          examples: [reserved]
+        task_id:
+          type: string
+          description: Задание в `wms`. Присутствует и при `manual_review` — задание создано, резерв нет.
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        error_code:
+          oneOf:
+            - $ref: '#/components/schemas/ErrorCode'
+            - type: 'null'
+          description: |
+            Причина отказа. `SERIALIZATION_RETRY` — не ошибка данных, а
+            конкуренция за строку остатка: клиент обязан повторить вызов с тем
+            же `idempotency_key`.
+        reservation_id:
+          type: string
+          format: uuid
+        ledger_short:
+          type: boolean
+          description: |
+            true — резерв создан клапаном 6.5 поверх недостающего учётного
+            остатка. Записаны `discrepancy(kind='ledger_short')` и событие
+            `wms.stock.shortfall.v1`. Смена не встала, но расхождение видно.
+
+    # === Задания =========================================================
+
+    TaskProjection:
+      type: object
+      description: Проекция задания (`wms_task` раздела 7).
+      required: [task_id, owner_external_id, state, barcode, quantity]
+      additionalProperties: false
+      properties:
+        task_id:
+          type: string
+        wb_order_id:
+          type: ['integer', 'string']
+        wb_order_uid:
+          type: string
+        wb_account_external_id:
+          type: string
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        seller_sku:
+          type: string
+        name:
+          type: string
+        quantity:
+          $ref: '#/components/schemas/Quantity'
+        deadline:
+          type: ['string', 'null']
+          format: date-time
+        state:
+          $ref: '#/components/schemas/TaskState'
+        wb_status:
+          oneOf:
+            - $ref: '#/components/schemas/WbStatus'
+            - type: 'null'
+        reservation_id:
+          type: ['string', 'null']
+          format: uuid
+        label:
+          oneOf:
+            - $ref: '#/components/schemas/LabelSummary'
+            - type: 'null'
+        package_ref:
+          type: ['string', 'null']
+        supply_id:
+          type: ['string', 'null']
+        assignee:
+          type: ['string', 'null']
+          description: Кому выдано задание. NULL — свободно.
+        claim_expires_at:
+          type: ['string', 'null']
+          format: date-time
+          description: |
+            Конец лизинга. Истёк — задание снова доступно другим: сборщик мог
+            уйти со смены посреди обхода.
+        cancel_reason:
+          type: ['string', 'null']
+          description: Непуст при `state = 'cancelled'` (инвариант 11).
+        manual_review_code:
+          oneOf:
+            - $ref: '#/components/schemas/ErrorCode'
+            - type: 'null'
+        manual_review_reason:
+          type: ['string', 'null']
+        last_reconciled_at:
+          type: ['string', 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+
+    LabelSummary:
+      type: object
+      description: |
+        Сводка по этикетке без тела стикера — чтобы список заданий не таскал
+        мегабайты. Само тело отдаёт `/tasks/{taskId}/label`.
+      required: [ready, format]
+      additionalProperties: false
+      properties:
+        ready:
+          type: boolean
+          description: |
+            Стикер уже лежит локально. Целевое значение — true более чем в 99 %
+            случаев к моменту упаковки (инвариант 9).
+        format:
+          $ref: '#/components/schemas/LabelFormat'
+        version:
+          type: integer
+          minimum: 1
+        checksum:
+          $ref: '#/components/schemas/Sha256'
+        fetched_at:
+          type: ['string', 'null']
+          format: date-time
+        invalidated_at:
+          type: ['string', 'null']
+          format: date-time
+          description: Непусто — стикер недействителен (задание отменено после выдачи).
+
+    TasksPullParams:
+      type: object
+      required: [assignee, limit]
+      additionalProperties: false
+      properties:
+        assignee:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Сборщик или приёмщик, за которым закрепляются задания.
+        station_id:
+          type: string
+          format: uuid
+          description: Рабочее место — определяет, на какой принтер пойдёт стикер.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+          description: Сколько заданий забрать за вызов.
+        claim:
+          type: boolean
+          default: true
+          description: |
+            true — занять задания лизингом (`FOR UPDATE SKIP LOCKED`, порядок по
+            `deadline`). false — только посмотреть: экран обновляется чаще, чем
+            человек берёт работу, и занимать при каждом обновлении нельзя.
+        lease_seconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          default: 900
+          description: Срок лизинга. Истёк — задание вернётся в очередь.
+        owner_external_ids:
+          type: array
+          maxItems: 100
+          description: |
+            Фильтр по владельцам. Сессия подбора многопродавцовая (раздел 4),
+            поэтому по умолчанию фильтра нет — один обход собирает нескольких.
+          items:
+            $ref: '#/components/schemas/OwnerExternalId'
+        states:
+          type: array
+          description: По умолчанию `reserved` — то, что готово к подбору.
+          items:
+            $ref: '#/components/schemas/TaskState'
+        include_extended:
+          type: boolean
+          default: true
+          description: |
+            Отдавать вместе с заданием адрес, коробку и готовность стикера. Без
+            этого лист подбора пришлось бы досбирать вторым запросом на каждую
+            строку.
+
+    PullTask:
+      type: object
+      description: |
+        Задание в форме, пригодной для строки листа подбора: адрес, коробка,
+        порядок обхода. Сборщик должен видеть, куда идти, а не искать глазами.
+      required: [task, leased_until]
+      additionalProperties: false
+      properties:
+        task:
+          $ref: '#/components/schemas/TaskProjection'
+        leased_until:
+          type: ['string', 'null']
+          format: date-time
+          description: 'null, если вызов был с `claim: false`.'
+        placements:
+          type: array
+          description: Откуда брать. Отсортировано по `route_order` — змейкой по стеллажам.
+          items:
+            $ref: '#/components/schemas/StockPlacement'
+
+    TasksPullResult:
+      type: object
+      required: [tasks, served_at]
+      additionalProperties: false
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/PullTask'
+        served_at:
+          type: string
+          format: date-time
+          description: |
+            Момент ответа сервера. По нему меряется задержка «WB → доступность
+            в /tasks/pull» — целевые 2 с, p99.
+        available_total:
+          type: integer
+          minimum: 0
+          description: Сколько заданий ждёт подбора всего — размер очереди для экрана.
+
+    TaskScanParams:
+      type: object
+      description: Форма зафиксирована приложением C — одно поле.
+      required: [barcode]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+
+    TaskScanResult:
+      type: object
+      description: |
+        Клиент принимает результат, **только** если `owner_external_id` совпал
+        с ожидаемым и `status == "picked"` (приложение C).
+      required: [status, owner_external_id]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          minLength: 1
+          examples: [picked]
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        task_id:
+          type: string
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        state:
+          $ref: '#/components/schemas/TaskState'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        scanned_at:
+          type: string
+          format: date-time
+        scan_result:
+          type: string
+          description: |
+            Разбор скана, совпадает с `pick_line.scan_result` в миграции 006.
+            Отделено от `status`, чтобы экран мог показать сборщику **что
+            именно** не так: «не тот штрихкод» и «товар чужого владельца» —
+            разные ошибки с разными действиями.
+          enum: [ok, wrong_barcode, wrong_owner, not_found, short]
+        duplicate:
+          type: boolean
+          description: |
+            true — этот скан уже был принят раньше. Не ошибка: ответ мог
+            потеряться, и повтор обязан вернуть то же самое.
+
+    TaskPackParams:
+      type: object
+      required: [idempotency_key]
+      additionalProperties: false
+      properties:
+        idempotency_key:
+          $ref: '#/components/schemas/IdempotencyKey'
+        station_id:
+          type: string
+          format: uuid
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+          description: Транспортный короб, в который положено задание.
+        control_scan_barcode:
+          $ref: '#/components/schemas/Barcode'
+          description: |
+            Штрихкод контрольного скана при упаковке. Несовпадение — отказ:
+            это последнее место, где ошибка сборщика ловится до отгрузки.
+        actor_id:
+          type: string
+
+    TaskCommandResult:
+      type: object
+      description: Общий ответ команды по заданию — состояние после применения.
+      required: [task_id, owner_external_id, state]
+      additionalProperties: false
+      properties:
+        task_id:
+          type: string
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        state:
+          $ref: '#/components/schemas/TaskState'
+        version:
+          type: integer
+          minimum: 1
+        duplicate:
+          type: boolean
+          description: true — команда с этим ключом уже была применена.
+
+    TaskReturnToShelfParams:
+      type: object
+      required: [idempotency_key, reason]
+      additionalProperties: false
+      properties:
+        idempotency_key:
+          $ref: '#/components/schemas/IdempotencyKey'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Зачем товар вернулся на полку. Обязательна: возврат на полку без
+            причины — это ровно та тихая запись, из-за которой 2645 отмен на
+            проде имеют `manual_review_reason = NULL`.
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        actor_id:
+          type: string
+
+    TaskCancelParams:
+      type: object
+      description: Форма зафиксирована приложением C — два поля.
+      required: [cancellation_event_id, handed_over]
+      additionalProperties: false
+      properties:
+        cancellation_event_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Внешний ключ идемпотентности отмены (инвариант 5).
+        handed_over:
+          type: boolean
+          description: |
+            Задание уже физически передано в доставку. Тогда отмена — не стоп, а
+            вход в разбор возврата (раздел 2.12).
+
+    # Поля TaskCommandResult повторены здесь, а не подключены через allOf:
+    # `additionalProperties: false` в одной ветке allOf отвергает поля, объявленные
+    # в соседней, и схема стала бы невыполнимой. Строгость важнее экономии строк —
+    # молча проигнорированное поле в ответе об отмене дороже дубля.
+    TaskCancelResult:
+      type: object
+      required: [task_id, owner_external_id, state, cancel_reason]
+      additionalProperties: false
+      properties:
+        task_id:
+          type: string
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        state:
+          $ref: '#/components/schemas/TaskState'
+        version:
+          type: integer
+          minimum: 1
+        duplicate:
+          type: boolean
+          description: true — отмена с этим `cancellation_event_id` уже была применена.
+        cancel_reason:
+          type: string
+          minLength: 1
+          description: Причина, выведенная сервером. Непуста всегда (инвариант 11).
+        label_invalidated:
+          type: boolean
+          description: Локальный стикер помечен недействительным.
+        released_from_supply:
+          type: boolean
+          description: Заказ освобождён из поставки WB (`release_from_supply`).
+        stock_released:
+          type: boolean
+          description: Резерв снят, количество вернулось в `good`.
+
+    TaskReturnParams:
+      type: object
+      description: Форма зафиксирована приложением C — три поля.
+      required: [return_event_id, seller_external_id, reason]
+      additionalProperties: false
+      properties:
+        return_event_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Внешний ключ идемпотентности (инвариант 5); в схеме —
+            `wms_return.return_event_id UNIQUE`.
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+
+    TaskReturnResult:
+      type: object
+      description: Ответ зафиксирован приложением C — `{"return_id"}`.
+      required: [return_id]
+      additionalProperties: false
+      properties:
+        return_id:
+          type: string
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        duplicate:
+          type: boolean
+
+    # === Этикетки ========================================================
+
+    LabelResult:
+      type: object
+      description: |
+        Форма зафиксирована приложением C дословно. Отдаётся из локального
+        хранилища: вызов Wildberries в момент упаковки запрещён (инвариант 9).
+      required: [id, order_id, version, payload, content_type, checksum]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: Идентификатор этикетки (`wb_label.id`).
+        order_id:
+          type: ['integer', 'string']
+          description: |
+            **Обязан совпасть с заданием.** Несовпадение — стоп: напечатанный
+            чужой стикер отправит вещь другому покупателю.
+        version:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: Версия этикетки; растёт при перевыпуске.
+        payload:
+          type: string
+          contentEncoding: base64
+          description: |
+            Тело стикера в base64. Ограничение — 10 МБ после декодирования
+            (приложение C). Для целевого `zplv` это 1–3 КБ: лимит рассчитан на
+            PNG-фолбэк.
+        content_type:
+          type: string
+          examples: ['application/x-zpl', 'image/png']
+        checksum:
+          $ref: '#/components/schemas/Sha256'
+        format:
+          $ref: '#/components/schemas/LabelFormat'
+        sticker:
+          type: object
+          description: |
+            Метаданные стикера от Wildberries as-is (части штрихкода и прочее).
+            Состав определяет WB, поэтому здесь не фиксируется.
+          additionalProperties: true
+
+    LabelPrintParams:
+      type: object
+      required: [station_id, idempotency_key]
+      additionalProperties: false
+      properties:
+        station_id:
+          type: string
+          format: uuid
+          description: |
+            Рабочее место. Принтер на каждом месте свой (решение владельца 14),
+            поэтому арбитраж очереди не нужен — нужно лишь не перепутать станцию.
+        idempotency_key:
+          $ref: '#/components/schemas/IdempotencyKey'
+        copies:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        reprint:
+          type: boolean
+          default: false
+          description: |
+            Повторная печать: событие `label.reprinted.v1` вместо
+            `label.printed.v1`. Отделено от первой печати, потому что доля
+            перепечаток — метрика качества этикетки и принтера.
+        reason:
+          type: string
+          maxLength: 512
+          description: "Обязательна при `reprint: true` — иначе счётчик перепечаток нечем разбирать."
+        actor_id:
+          type: string
+
+    LabelPrintResult:
+      type: object
+      required: [task_id, format, payload, checksum, station_id]
+      additionalProperties: false
+      properties:
+        task_id:
+          type: string
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        format:
+          $ref: '#/components/schemas/LabelFormat'
+        content_type:
+          type: string
+        payload:
+          type: string
+          contentEncoding: base64
+          description: |
+            Готовые байты для `WritePrinter` с типом `RAW`. Никакой
+            растеризации на стороне агента: она и есть те 1–3 секунды, ради
+            которых переписан весь путь этикетки.
+        checksum:
+          $ref: '#/components/schemas/Sha256'
+        version:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        station_id:
+          type: string
+          format: uuid
+        printer_transport:
+          type: string
+          enum: [tcp, agent]
+          description: Сегодня `agent` — принтеры USB; `tcp` оставлен на случай сетевого.
+        reprint:
+          type: boolean
+        duplicate:
+          type: boolean
+
+    # === Приёмка =========================================================
+
+    ReceiptParams:
+      type: object
+      description: Форма зафиксирована приложением C мастера.
+      required: [seller_external_id, reference, lines]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        reference:
+          $ref: '#/components/schemas/Reference'
+        lines:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ReceiptLine'
+        seller_name:
+          type: string
+          maxLength: 256
+          description: |
+            Имя владельца. Используется, если склад видит этого продавца
+            впервые: приёмка заводит его сама, потому что товар уже приехал и
+            держать машину под разгрузкой из-за карточки нельзя.
+        seller_inn:
+          type: string
+          maxLength: 32
+        actor_id:
+          type: string
+
+    ReceiptLine:
+      type: object
+      description: |
+        Строка приёмки. Состав повторяет `receipt_line` раздела 7, но адресует
+        внешними идентификаторами: у клиента нет наших uuid.
+      required: [barcode, expected_qty]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        seller_sku:
+          type: string
+          maxLength: 128
+        name:
+          type: string
+        expected_qty:
+          type: integer
+          minimum: 0
+        actual_qty:
+          type: integer
+          minimum: 0
+          description: |
+            Факт пересчёта. Баланс двигается **по факту, а не по ожиданию**;
+            разница оформляется расхождением, а не подгонкой числа.
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        comment:
+          type: string
+
+    Discrepancy:
+      type: object
+      description: Типизированное расхождение (`discrepancy` раздела 7).
+      required: [kind, barcode, qty]
+      additionalProperties: false
+      properties:
+        discrepancy_id:
+          type: string
+          format: uuid
+        kind:
+          $ref: '#/components/schemas/DiscrepancyKind'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        qty:
+          type: integer
+        decision:
+          type: ['string', 'null']
+          enum: [pending, accepted, rejected, written_off, null]
+        liable:
+          type: ['string', 'null']
+          enum: [owner, warehouse, carrier, unknown]
+          description: Кто отвечает — не «недостача вообще», а кто виноват и что делать.
+        comment:
+          type: ['string', 'null']
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        created_at:
+          type: string
+          format: date-time
+
+    ReceiptResult:
+      type: object
+      required: [receipt_id, reference, owner_external_id, state]
+      additionalProperties: false
+      properties:
+        receipt_id:
+          type: string
+          format: uuid
+        reference:
+          $ref: '#/components/schemas/Reference'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        owner_created:
+          type: boolean
+          description: true — владелец заведён этой приёмкой по `seller_name`/`seller_inn`.
+        state:
+          $ref: '#/components/schemas/ReceiptState'
+        lines_accepted:
+          type: integer
+          minimum: 0
+        discrepancies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Discrepancy'
+        duplicate:
+          type: boolean
+          description: true — приёмка с таким `reference` уже применена, повтор ничего не добавил.
+
+    ReceiptsScreenParams:
+      type: object
+      additionalProperties: false
+      properties:
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        reference:
+          $ref: '#/components/schemas/Reference'
+        states:
+          type: array
+          description: "По умолчанию — незакрытые приёмки: экран показывает работу, а не архив."
+          items:
+            $ref: '#/components/schemas/ReceiptState'
+        actor_id:
+          type: string
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+
+    ReceiptScreenItem:
+      type: object
+      required: [receipt_id, reference, owner_external_id, state, lines]
+      additionalProperties: false
+      properties:
+        receipt_id:
+          type: string
+          format: uuid
+        reference:
+          $ref: '#/components/schemas/Reference'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        owner_name:
+          type: string
+        state:
+          $ref: '#/components/schemas/ReceiptState'
+        created_at:
+          type: string
+          format: date-time
+        actor_id:
+          type: ['string', 'null']
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReceiptLine'
+        discrepancies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Discrepancy'
+
+    ReceiptsScreenResult:
+      type: object
+      required: [receipts, generated_at]
+      additionalProperties: false
+      properties:
+        receipts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReceiptScreenItem'
+        generated_at:
+          type: string
+          format: date-time
+
+    PutawayScreenParams:
+      type: object
+      additionalProperties: false
+      properties:
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        reference:
+          $ref: '#/components/schemas/Reference'
+          description: Ограничить одной приёмкой.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+
+    CellSuggestion:
+      type: object
+      required: [cell_address]
+      additionalProperties: false
+      properties:
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        route_order:
+          type: ['integer', 'null']
+        free_capacity:
+          type: ['integer', 'null']
+          minimum: 0
+        holds_same_sku:
+          type: boolean
+          description: |
+            В ячейке уже лежит этот товар. Сильный довод положить туда же:
+            один SKU в одном месте — короче обход и меньше пересорта.
+
+    PutawayItem:
+      type: object
+      required: [owner_external_id, barcode, qty_to_place]
+      additionalProperties: false
+      properties:
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        name:
+          type: string
+        qty_to_place:
+          type: integer
+          minimum: 1
+        source_reference:
+          $ref: '#/components/schemas/Reference'
+        suggested_cells:
+          type: array
+          items:
+            $ref: '#/components/schemas/CellSuggestion'
+        boxes:
+          type: array
+          description: Уже заведённые коробки этого товара — куда доложить.
+          items:
+            $ref: '#/components/schemas/BoxProjection'
+
+    PutawayScreenResult:
+      type: object
+      required: [items, generated_at]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PutawayItem'
+        generated_at:
+          type: string
+          format: date-time
+
+    # === Инвентаризация ==================================================
+
+    InventorySheetParams:
+      type: object
+      required: [seller_external_id]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        scope:
+          type: string
+          enum: [partial, full]
+          default: partial
+        cell_addresses:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/CellAddress'
+        barcodes:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/Barcode'
+
+    InventorySheetLine:
+      type: object
+      required: [barcode, expected_qty]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        name:
+          type: string
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        expected_qty:
+          type: integer
+          minimum: 0
+          description: |
+            Учётное количество. Отдаётся отдельным полем, чтобы приложение
+            могло его скрыть: считающий не должен видеть ожидание до ввода факта.
+        route_order:
+          type: ['integer', 'null']
+
+    InventorySheetResult:
+      type: object
+      required: [owner_external_id, lines, generated_at]
+      additionalProperties: false
+      properties:
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/InventorySheetLine'
+        generated_at:
+          type: string
+          format: date-time
+
+    InventoryCountParams:
+      type: object
+      description: Форма зафиксирована приложением C мастера.
+      required: [seller_external_id, reference, scope, lines]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        reference:
+          $ref: '#/components/schemas/Reference'
+        scope:
+          type: string
+          enum: [partial, full]
+        lines:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/InventoryCountLine'
+        actor_id:
+          type: string
+
+    InventoryCountLine:
+      type: object
+      description: Строка пересчёта (`inventory_count_line` раздела 7).
+      required: [barcode, fact_qty]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        expected_qty:
+          type: integer
+          minimum: 0
+        fact_qty:
+          type: integer
+          minimum: 0
+
+    InventoryCountResult:
+      type: object
+      required: [count_id, reference, owner_external_id, state]
+      additionalProperties: false
+      properties:
+        count_id:
+          type: string
+          format: uuid
+        reference:
+          $ref: '#/components/schemas/Reference'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        state:
+          type: string
+          description: Совпадает с `inventory_count.state` в миграции 005.
+          enum: [draft, counting, applied, cancelled]
+        applied_at:
+          type: ['string', 'null']
+          format: date-time
+        moves:
+          type: integer
+          minimum: 0
+          description: |
+            Сколько движений записано: излишки приходуются, недостачи
+            списываются, всё через `stock_move` с `doc_type='count'` — баланс
+            никогда не правится напрямую (инвариант 3).
+        discrepancies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Discrepancy'
+        duplicate:
+          type: boolean
+
+    # === Коробки и адреса ================================================
+
+    BoxProjection:
+      type: object
+      description: Коробка (`box` раздела 2.9 и раздела 7).
+      required: [barcode, owner_external_id, quantity, counted, comment, state]
+      additionalProperties: false
+      properties:
+        box_id:
+          type: string
+          format: uuid
+        barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        product_barcode:
+          $ref: '#/components/schemas/Barcode'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        quantity:
+          type: integer
+          minimum: 0
+        counted:
+          type: boolean
+          description: false — количество не пересчитывали; `quantity = 0` тогда не значит «пусто».
+        comment:
+          type: string
+          minLength: 1
+        sequence:
+          type: ['integer', 'null']
+          minimum: 1
+        total_boxes:
+          type: ['integer', 'null']
+          minimum: 1
+        state:
+          type: string
+          enum: [stored, removed]
+        created_at:
+          type: string
+          format: date-time
+
+    BoxUpsertParams:
+      type: object
+      required: [barcode, seller_external_id, comment]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        product_barcode:
+          $ref: '#/components/schemas/Barcode'
+          description: Один товар на коробку — практика склада, сохраняется.
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        quantity:
+          type: integer
+          minimum: 0
+          default: 0
+        counted:
+          type: boolean
+          default: false
+        comment:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Обязателен. Через месяц на складе стоят сотни одинаковых коробок, и
+            без пометки нужную не найти.
+        sequence:
+          type: integer
+          minimum: 1
+        total_boxes:
+          type: integer
+          minimum: 1
+        actor_id:
+          type: string
+
+    BoxResult:
+      type: object
+      required: [box]
+      additionalProperties: false
+      properties:
+        box:
+          $ref: '#/components/schemas/BoxProjection'
+        created:
+          type: boolean
+
+    BoxListParams:
+      type: object
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        product_barcode:
+          $ref: '#/components/schemas/Barcode'
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        state:
+          type: string
+          enum: [stored, removed]
+          default: stored
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+        cursor:
+          type: string
+
+    BoxListResult:
+      type: object
+      required: [boxes]
+      additionalProperties: false
+      properties:
+        boxes:
+          type: array
+          items:
+            $ref: '#/components/schemas/BoxProjection'
+        next_cursor:
+          type: ['string', 'null']
+
+    BoxRemoveParams:
+      type: object
+      required: [barcode, idempotency_key, reason]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        idempotency_key:
+          $ref: '#/components/schemas/IdempotencyKey'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Куда делась коробка. Без причины по штрихкоду потом ничего не восстановить.
+        actor_id:
+          type: string
+
+    StorageLookupParams:
+      type: object
+      required: [seller_external_id, barcode]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        states:
+          type: array
+          description: "По умолчанию — `good`: сборщика интересует то, что можно взять."
+          items:
+            $ref: '#/components/schemas/StockState'
+
+    StorageLookupResult:
+      type: object
+      required: [owner_external_id, placements]
+      additionalProperties: false
+      properties:
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        placements:
+          type: array
+          description: Отсортировано по `route_order` — по маршруту обхода, а не по количеству.
+          items:
+            $ref: '#/components/schemas/StockPlacement'
+
+    StorageCountParams:
+      type: object
+      required: [seller_external_id, barcode]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+
+    StorageCountResult:
+      type: object
+      required: [owner_external_id, barcode, total, by_state]
+      additionalProperties: false
+      properties:
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        total:
+          type: integer
+          minimum: 0
+        by_state:
+          type: object
+          description: Разбивка по состояниям товара; ключи — значения `StockState`.
+          additionalProperties:
+            type: integer
+            minimum: 0
+        available:
+          type: integer
+          minimum: 0
+          description: То же число, что уедет в WB — `good − reserved − buffer`.
+
+    # === Отгрузка ========================================================
+
+    ShipmentParams:
+      type: object
+      required: [seller_external_id, idempotency_key, action]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        idempotency_key:
+          $ref: '#/components/schemas/IdempotencyKey'
+        action:
+          type: string
+          enum: [open, add_orders, close, deliver, hand_over, reconcile]
+          description: |
+            `deliver` требует пройденной валидации `metaDetails` — обязательна
+            с релизов Wildberries 2026-03/04, без неё поставка не передаётся.
+
+            `hand_over` и `reconcile` разведены намеренно: первое переводит
+            поставку в `handed_to_wb` и требует `handed_over_by` — подпись
+            живого человека; второе ставит `accepted_by_wb` по результату
+            сверки с WB. Вывести приёмку из статуса `complete` нельзя.
+        wb_supply_id:
+          type: ['string', 'null']
+          description: Поставка WB (WB-GI-…). null при `open` — она ещё не создана.
+        task_ids:
+          type: array
+          maxItems: 100
+          description: До 100 заданий за вызов — ограничение WB (приложение D).
+          items:
+            type: string
+        handed_over_by:
+          type: string
+          description: |
+            Кто подтвердил передачу. `HANDED_TO_WB` ставится **только** живым
+            человеком: статус WB `complete` приёмку не доказывает.
+
+    ShipmentResult:
+      type: object
+      required: [shipment_id, owner_external_id, state]
+      additionalProperties: false
+      properties:
+        shipment_id:
+          type: string
+          format: uuid
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        wb_supply_id:
+          type: ['string', 'null']
+        state:
+          type: string
+          description: Совпадает с `shipment.state` в миграции 006.
+          enum: [open, closed, handed_to_wb, accepted_by_wb, cancelled]
+        handed_by:
+          type: ['string', 'null']
+          description: |
+            Кто подтвердил передачу. Непусто при `handed_to_wb` — схема не даёт
+            перевести поставку в это состояние без подписи.
+        handed_at:
+          type: ['string', 'null']
+          format: date-time
+        orders:
+          type: integer
+          minimum: 0
+          description: Заказов в поставке — тарифицируемое количество (`wb.supply.shipped.v1`).
+        closed_at:
+          type: ['string', 'null']
+          format: date-time
+        accepted_at:
+          type: ['string', 'null']
+          format: date-time
+          description: Когда WB отсканировал QR поставки (`scanDt`). null — ещё не сканировал.
+        duplicate:
+          type: boolean
+
+    ShipmentsPickedParams:
+      type: object
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 100
+        cursor:
+          type: string
+
+    ShipmentsPickedResult:
+      type: object
+      required: [tasks]
+      additionalProperties: false
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskProjection'
+        next_cursor:
+          type: ['string', 'null']
+
+    # === Возвраты ========================================================
+
+    ReturnReceiveParams:
+      type: object
+      required: [return_event_id, seller_external_id]
+      additionalProperties: false
+      properties:
+        return_event_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        quantity:
+          $ref: '#/components/schemas/Quantity'
+        task_id:
+          type: string
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        reason:
+          type: string
+          maxLength: 512
+        actor_id:
+          type: string
+
+    ReturnDecisionParams:
+      type: object
+      required: [return_event_id, decision]
+      additionalProperties: false
+      properties:
+        return_event_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: "Ключ идемпотентности решения: второе решение — второй счёт клиенту."
+        decision:
+          type: string
+          enum: [resellable, defective]
+          description: |
+            Соответствует событиям `wms.return.resellable.v1` и
+            `wms.return.defective.v1`. `resellable` возвращает товар в `good`,
+            `defective` — в `defect`, мимо доступного остатка.
+        reason:
+          type: string
+          maxLength: 512
+        cell_address:
+          $ref: '#/components/schemas/CellAddress'
+        box_barcode:
+          $ref: '#/components/schemas/BoxBarcode'
+        actor_id:
+          type: string
+
+    ReturnResult:
+      type: object
+      required: [return_id, owner_external_id, state]
+      additionalProperties: false
+      properties:
+        return_id:
+          type: string
+        task_id:
+          type: ['string', 'null']
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        state:
+          type: string
+          description: |
+            Совпадает с `wms_return.state` в миграции 006. Годность к
+            перепродаже — это `decision`, а не состояние: возврат может быть
+            `decided` с любым из двух решений.
+          enum: [expected, received, decided]
+        decision:
+          type: ['string', 'null']
+          enum: [resellable, defective, null]
+        received_at:
+          type: ['string', 'null']
+          format: date-time
+        duplicate:
+          type: boolean
+
+    ReturnsReceiptParams:
+      type: object
+      required: [reference, lines]
+      additionalProperties: false
+      properties:
+        reference:
+          $ref: '#/components/schemas/Reference'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        warehouse_code:
+          $ref: '#/components/schemas/WarehouseCode'
+        lines:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ReturnReceiveParams'
+        actor_id:
+          type: string
+
+    ReturnsReceiptResult:
+      type: object
+      required: [reference, returns]
+      additionalProperties: false
+      properties:
+        reference:
+          $ref: '#/components/schemas/Reference'
+        returns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReturnResult'
+        unmatched:
+          type: integer
+          minimum: 0
+          description: |
+            Сколько строк не удалось привязать к заданию (`wb.return.unmatched.v1`).
+            Ноль не гарантирован: возврат может приехать раньше, чем WB отдаст связь.
+        duplicate:
+          type: boolean
+
+    # === Кабинеты Wildberries ============================================
+
+    WbAccountsParams:
+      description: |
+        Дискриминатор `op` вместо двух путей: маршрутов в контракте ровно два,
+        добавить третий — изменение контракта через поток 0.
+      oneOf:
+        - $ref: '#/components/schemas/WbAccountsListParams'
+        - $ref: '#/components/schemas/WbAccountUpsertParams'
+      discriminator:
+        propertyName: op
+        mapping:
+          list: '#/components/schemas/WbAccountsListParams'
+          upsert: '#/components/schemas/WbAccountUpsertParams'
+
+    WbAccountsListParams:
+      type: object
+      required: [op]
+      additionalProperties: false
+      properties:
+        op:
+          const: list
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        external_id:
+          type: string
+          maxLength: 128
+        status:
+          $ref: '#/components/schemas/WbAccountStatus'
+        mode:
+          $ref: '#/components/schemas/WbAccountMode'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+
+    WbAccountUpsertParams:
+      type: object
+      description: |
+        Идемпотентен по `external_id`. Значение токена здесь не передаётся
+        никогда — только `secret_ref` на секрет в провайдере.
+      required: [op, external_id, seller_external_id, display_name, secret_ref]
+      additionalProperties: false
+      properties:
+        op:
+          const: upsert
+        external_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Внешний идентификатор кабинета — ключ идемпотентности.
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        secret_ref:
+          $ref: '#/components/schemas/SecretRef'
+        scopes:
+          type: array
+          description: |
+            Категории доступа токена (приложение D). `Маркетплейс` обязательна,
+            `Контент` нужна для карточек, `Статистика` опциональна.
+          items:
+            type: string
+        mode:
+          $ref: '#/components/schemas/WbAccountMode'
+        status:
+          $ref: '#/components/schemas/WbAccountStatus'
+        wb_warehouse_id:
+          type: ['integer', 'null']
+          description: Склад на стороне WB, куда публикуются остатки.
+
+    SecretRef:
+      type: string
+      minLength: 1
+      maxLength: 512
+      description: |
+        **Ссылка** на секрет в провайдере, не значение токена (инвариант 15).
+        Схема базы дополнительно отбивает случайную запись живого JWT: строка,
+        начинающаяся с `eyJ`, отвергается. Живой токен на стенде отправил бы
+        настоящие команды в кабинет клиента, и узнал бы об этом клиент, а не мы.
+
+    WbAccountMode:
+      type: string
+      enum: [shadow, live]
+      description: |
+        `shadow` — только `GET /api/v3/orders`, ни одной записи в WB (шаг 2
+        миграции). Переключение в `live` делается по одному кабинету и
+        обратимо за минуту.
+
+    WbAccountStatus:
+      type: string
+      enum: [ACTIVE, AUTH_ERROR, RATE_LIMITED, DISABLED]
+
+    WbAccount:
+      type: object
+      description: |
+        Кабинет Wildberries. Поля со значением токена в этой схеме нет
+        намеренно и добавлять его нельзя (инвариант 15).
+      required: [id, external_id, owner_external_id, display_name, secret_ref, mode, status]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        external_id:
+          type: string
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        display_name:
+          type: string
+        secret_ref:
+          $ref: '#/components/schemas/SecretRef'
+        scopes:
+          type: array
+          items:
+            type: string
+        mode:
+          $ref: '#/components/schemas/WbAccountMode'
+        status:
+          $ref: '#/components/schemas/WbAccountStatus'
+        token_type:
+          type: ['string', 'null']
+          enum: [BASIC, SERVICE, null]
+        token_expires_at:
+          type: ['string', 'null']
+          format: date-time
+        last_verified_at:
+          type: ['string', 'null']
+          format: date-time
+        last_sync_at:
+          type: ['string', 'null']
+          format: date-time
+        next_sync_at:
+          type: ['string', 'null']
+          format: date-time
+        sync_error_code:
+          type: ['string', 'null']
+        wb_warehouse_id:
+          type: ['integer', 'null']
+
+    WbAccountsResult:
+      type: object
+      required: [accounts]
+      additionalProperties: false
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/WbAccount'
+        created:
+          type: boolean
+          description: "Только для `op = \"upsert\"`: кабинет заведён этим вызовом."
+
+    WbAccountVerifyParams:
+      type: object
+      additionalProperties: false
+      properties:
+        idempotency_key:
+          $ref: '#/components/schemas/IdempotencyKey'
+        refresh_scopes:
+          type: boolean
+          default: true
+          description: Перечитать категории доступа токена, а не верить сохранённым.
+
+    WbAccountCheck:
+      type: object
+      required: [name, passed]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          description: |
+            Имя проверки: `token_valid`, `scope_marketplace`, `scope_content`,
+            `rate_limit`, `warehouse_bound`.
+        passed:
+          type: boolean
+        detail:
+          type: string
+          description: |
+            Человекочитаемое пояснение **без секретов**: ни токена, ни его
+            фрагментов, ни заголовков запроса.
+
+    WbAccountVerifyResult:
+      type: object
+      required: [account_id, status, checks, verified_at]
+      additionalProperties: false
+      properties:
+        account_id:
+          type: string
+          format: uuid
+        external_id:
+          type: string
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        status:
+          $ref: '#/components/schemas/WbAccountStatus'
+        token_type:
+          type: ['string', 'null']
+        scopes:
+          type: array
+          items:
+            type: string
+        token_expires_at:
+          type: ['string', 'null']
+          format: date-time
+        rate_limit_blocked_until:
+          type: ['string', 'null']
+          format: date-time
+          description: Непусто — кабинет придержан ограничителем (лимит WB 300 запросов в минуту).
+        checks:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/WbAccountCheck'
+        verified_at:
+          type: string
+          format: date-time

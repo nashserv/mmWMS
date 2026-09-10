@@ -1,0 +1,2171 @@
+# Каталог событий сервиса `wms` — заморожен потоком 0.
+#
+# Зачем этот файл: потоки B (приложение сборщика) и C (деньги и кабинеты) пишут
+# консьюмеры до того, как поток A напишет продюсера. Расплывчатый каталог означает,
+# что три агента будут спорить о форме сообщения вместо того, чтобы её использовать.
+# Поэтому здесь заморожены имена событий, форма конверта и форма каждого payload.
+#
+# Источники (правки только вместе с ними, потоком 0 — правило 9.5.2 мастера):
+#   * приложение A мастер-контекста — список событий as-is;
+#   * приложение E — конверт, WMS_EVENT_TYPES и дословные схемы payload;
+#   * раздел 7 — модель данных, откуда взяты имена полей (owner_id, sku_id, cell_id,
+#     box_id, task_id, qty, reason, state);
+#   * раздел 6.5 — новое событие wms.stock.shortfall.v1;
+#   * раздел 8 — инварианты, в первую очередь 15 (секреты в события не попадают).
+#
+# Почему AsyncAPI 3.0.0, а не 2.6: в 3.0.0 направление задаётся операцией, а не
+# каналом. Здесь через один exchange идут и события, которые wms издаёт, и четыре
+# унаследованные команды, которые wms принимает; в 2.6 пришлось бы либо заводить
+# два документа, либо описывать команды как publish с точки зрения чужого сервиса.
+# Биндинги RabbitMQ (amqp 0.3.0) в 3.0.0 те же самые.
+
+asyncapi: 3.0.0
+
+id: urn:mmx:wms:contracts:asyncapi
+
+info:
+  title: MM-Express WMS — каталог событий
+  version: 1.0.0
+  description: |
+    События сервиса `wms` — единственного владельца склада и интеграции с Wildberries
+    после вывода Odoo и поглощения `wb-fbs-gateway` (разделы 6.3 и 6.7 мастер-контекста).
+
+    **Событие — это уведомление, а не способ доставки** (раздел 6.1). Задание доступно
+    рабочему месту через `POST /api/mmx/wms/v1/tasks/pull` сразу после коммита
+    транзакции, без публикации события (инвариант 8). Потребители событий — биллинг,
+    портал, аналитика; склад от шины не зависит и продолжает работать при выключенном
+    RabbitMQ (проверка 14 полного прогона, раздел 9.6).
+
+    **Порядок событий по заданию.** `outbox.sequence` инкрементируется в ТОЙ ЖЕ
+    транзакции Postgres, что и движение товара (`stock_move`) — см. `x-ordering-guarantee`
+    ниже и схему `OutboxSequence`. Потребители полагаются на монотонность `sequence`
+    в пределах одного задания и обязаны отбрасывать сообщение с `sequence`, не большим
+    последнего обработанного для этого `task_id`.
+
+    **Секреты.** Токены Wildberries, `secret_ref`, заголовки авторизации и любые другие
+    секреты не попадают ни в конверт, ни в payload — никогда (инвариант 15, раздел 12).
+    Это касается и полей вроде `payload` этикетки: в `wms.label.attached.v1` едут
+    идентификатор, формат и контрольная сумма, но не сам ZPL.
+  contact:
+    name: Поток 0 — контракты и стенд
+  license:
+    name: Proprietary — MM-Express
+    url: https://mm-express.example/license
+  tags:
+    - name: wms-core
+      description: Приёмка, резерв, подбор, упаковка, отгрузка
+    - name: wms-returns
+      description: Возвраты — контрактный минимум (раздел 6.7)
+    - name: inventory
+      description: Журнал остатков и публикация остатка
+    - name: wb-inherited
+      description: События поглощённого шлюза Wildberries (раздел 6.3)
+    - name: legacy-command
+      description: Команды as-is, целевой моделью не используются (раздел 6.2)
+
+  # Требование к реализации, а не описание. Проверяется тестом потока A и шагами 4 и 6
+  # полного прогона (раздел 9.6): движение, запись в outbox и инкремент sequence
+  # видны атомарно, либо не видны вовсе.
+  x-ordering-guarantee:
+    scope: task_id
+    field: payload.sequence
+    rule: >-
+      INSERT INTO outbox (aggregate_id, sequence, ...) выполняется в той же транзакции,
+      что и INSERT INTO stock_move / UPDATE wms_task. Номер берётся под блокировкой
+      строки задания (SELECT ... FOR UPDATE по wms_task.id), поэтому в пределах одного
+      task_id последовательность строго монотонна и без дыр. Уникальность пары
+      (aggregate_id, sequence) закреплена индексом outbox_sequence_key.
+    consumer_contract: >-
+      Потребитель хранит последний обработанный sequence по task_id и отбрасывает
+      сообщения с sequence <= сохранённого. Это единственная защита от переигрывания
+      DLQ и повторной доставки RabbitMQ (at-least-once).
+
+defaultContentType: application/json
+
+servers:
+  stand:
+    host: 'rabbitmq:5672'
+    protocol: amqp
+    protocolVersion: '0.9.1'
+    description: |
+      Стенд `151.245.140.225` (приложение F). RabbitMQ 4.1.2, exchange `mmx.events`.
+      Живых токенов WB на стенде нет и быть не должно — проверка первым шагом
+      при разворачивании (раздел 12).
+    security:
+      - $ref: '#/components/securitySchemes/amqpUserPassword'
+  production:
+    host: 'rabbitmq:5671'
+    protocol: amqps
+    protocolVersion: '0.9.1'
+    description: 'Боевой контур: тот же exchange, но AMQPS (раздел 2.2).'
+    security:
+      - $ref: '#/components/securitySchemes/amqpUserPassword'
+
+# Один topic-exchange `mmx.events` на всю платформу. Канал = routing key = имя типа
+# события: потребитель подписывается маской (`wms.return.*`, `inventory.#`) и не
+# зависит от того, какие ещё события мы добавим рядом.
+channels:
+  # ---------------------------------------------------------------------------
+  # Команды as-is. В целевой модели резерв, отмена и возврат — это транзакция
+  # внутри wms, а не сообщение через очередь (разделы 6.2 и 6.3: gateway-command-worker
+  # исчезает). Каналы сохранены, потому что до полного переключения кабинетов
+  # (раздел 11) внешние сервисы продолжают их слать, и wms обязана их принимать.
+  # ---------------------------------------------------------------------------
+  wms.reserve.v1:
+    address: wms.reserve.v1
+    title: Команда «зарезервировать под задание»
+    description: >-
+      Форма — приложение C, `/reservations`. Целевой путь — синхронный HTTP-вызов
+      того же маршрута; сообщение остаётся только для совместимости на время миграции.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.reserve.v1'
+
+  wms.cancel.v1:
+    address: wms.cancel.v1
+    title: Команда «отменить задание»
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.cancel.v1'
+
+  wms.return.v1:
+    address: wms.return.v1
+    title: Команда «оформить возврат по заданию»
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.return.v1'
+
+  wms.return-request.v1:
+    address: wms.return-request.v1
+    title: Команда «заявка на возврат»
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.return-request.v1'
+
+  # ---------------------------------------------------------------------------
+  # События резерва и подбора
+  # ---------------------------------------------------------------------------
+  wms.reservation.succeeded.v1:
+    address: wms.reservation.succeeded.v1
+    title: Резерв создан
+    description: >-
+      Издаётся из той же транзакции, что создала `wms_task` и `reservation`
+      (раздел 6.2). Расхождение «заказ есть, резерва нет» невозможно по построению.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.reservation.succeeded.v1'
+
+  wms.reservation.failed.v1:
+    address: wms.reservation.failed.v1
+    title: Резерв не создан
+    description: >-
+      `error_code` обязателен и берётся из закрытого списка приложения C.
+      Немаппленный товар уходит сюда с `PRODUCT_MAPPING_MISSING` и переводит задание
+      в `manual_review`, а не в тихую отмену — как раз та дыра из раздела 3.2.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.reservation.failed.v1'
+
+  wms.stock.shortfall.v1:
+    address: wms.stock.shortfall.v1
+    title: Собрано без остатка (клапан ledger_short)
+    description: >-
+      Новое в версии 1.2 мастера (раздел 6.5). Товара по учёту не хватило, но резерв
+      всё равно создан: движение с `reason = 'ledger_short'` и
+      `discrepancy(kind='ledger_short')` пишутся в той же транзакции. Смена не встаёт,
+      но ошибка становится видимой, счётной и адресной — экран начальника склада плюс
+      счётчик Prometheus. Молчаливого `_force_reservation` больше нет (инвариант 12).
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.stock.shortfall.v1'
+
+  wms.picking.started.v1:
+    address: wms.picking.started.v1
+    title: Подбор начат
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.picking.started.v1'
+
+  wms.item.scanned.v1:
+    address: wms.item.scanned.v1
+    title: Скан у стойки
+    description: >-
+      Тарифицируемое и учётное действие одновременно (инвариант 13). Поток C считает
+      по нему выработку смены, поэтому в payload есть и `owner_id`, и
+      `seller_external_id`: биллинг знает клиента по внешнему идентификатору.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.item.scanned.v1'
+
+  wms.picking.completed.v1:
+    address: wms.picking.completed.v1
+    title: Подбор завершён
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.picking.completed.v1'
+
+  wms.packing.completed.v1:
+    address: wms.packing.completed.v1
+    title: Упаковка завершена (контрольный скан пройден)
+    description: >-
+      Главный рубеж качества склада (раздел 4) и тарифицируемая операция потока C.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.packing.completed.v1'
+
+  wms.label.attached.v1:
+    address: wms.label.attached.v1
+    title: Этикетка привязана к заданию
+    description: >-
+      Стикер тянется заранее и лежит локально (раздел 6.6, инвариант 9). В событие
+      едут идентификатор, формат и sha256, но НЕ сам ZPL: событие — уведомление,
+      а не канал доставки полезной нагрузки на 10 МБ.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.label.attached.v1'
+
+  wms.returned.to.shelf.v1:
+    address: wms.returned.to.shelf.v1
+    title: Товар возвращён на полку
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.returned.to.shelf.v1'
+
+  wms.stock.released.v1:
+    address: wms.stock.released.v1
+    title: Резерв снят, товар вернулся в good
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.stock.released.v1'
+
+  wms.order.cancelled.v1:
+    address: wms.order.cancelled.v1
+    title: Задание отменено
+    description: >-
+      `cancel_reason` обязателен на уровне схемы БД (инвариант 11) и здесь тоже:
+      2645 отмен с `manual_review_reason = NULL` в боевом контуре — прямое следствие
+      того, что причина была необязательной.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.order.cancelled.v1'
+
+  # ---------------------------------------------------------------------------
+  # Возвраты — контрактный минимум (раздел 6.7, открытый вопрос 10)
+  # ---------------------------------------------------------------------------
+  wms.return.expected.v1:
+    address: wms.return.expected.v1
+    title: Возврат ожидается
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.return.expected.v1'
+
+  wms.return.received.v1:
+    address: wms.return.received.v1
+    title: Возврат принят на склад
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.return.received.v1'
+
+  wms.return.resellable.v1:
+    address: wms.return.resellable.v1
+    title: Возврат годен к продаже
+    description: 'Решение по возврату: товар уходит в состояние `good`.'
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.return.resellable.v1'
+
+  wms.return.defective.v1:
+    address: wms.return.defective.v1
+    title: Возврат браком
+    description: 'Решение по возврату: товар уходит в состояние `defect`.'
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.return.defective.v1'
+
+  # ---------------------------------------------------------------------------
+  # Журнал остатков
+  # ---------------------------------------------------------------------------
+  inventory.movement.recorded.v1:
+    address: inventory.movement.recorded.v1
+    title: Движение товара записано
+    description: >-
+      Схема payload перенесена из приложения E дословно и НЕ расширяется: под неё
+      уже написаны потребители в биллинге и аналитике. Поля `owner_id`/`cell_id`
+      здесь отсутствуют намеренно — их источник истины `stock_move`, доступный
+      по HTTP; событие остаётся уведомлением.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/inventory.movement.recorded.v1'
+
+  inventory.stock.updated.v1:
+    address: inventory.stock.updated.v1
+    title: Остаток пересчитан
+    description: >-
+      Издаётся после каждого движения. `available = good - reserved - buffer`
+      и всегда занижается (инвариант 6.4/7). Публикация в WB уходит немедленно,
+      без таймеров, — событие лишь уведомляет портал и каталог о том, что уже сделано.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/inventory.stock.updated.v1'
+
+  # ---------------------------------------------------------------------------
+  # Унаследовано от поглощённого `wb-fbs-gateway` (раздел 6.3). Полный каталог wb.*
+  # живёт в контракте шлюза; здесь только те четыре, чьи схемы приложение E задаёт
+  # дословно, — они издаются тем же outbox сервиса `wms` и на них уже подписаны
+  # биллинг (wb.supply.shipped.v1 — 62 начисления за месяц) и возвраты.
+  # ---------------------------------------------------------------------------
+  wb.fbs.order.synced.v1:
+    address: wb.fbs.order.synced.v1
+    title: Задание WB получено опросом
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wb.fbs.order.synced.v1'
+
+  wb.fbs.order.updated.v1:
+    address: wb.fbs.order.updated.v1
+    title: Задание WB изменилось
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wb.fbs.order.updated.v1'
+
+  wb.supply.shipped.v1:
+    address: wb.supply.shipped.v1
+    title: Поставка передана в WB
+    description: >-
+      Тарифицируемое событие потока C. `accepted_at` = `scanDt` из WB и может быть
+      null: передача поставки не доказательство приёмки (раздел 2.12).
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wb.supply.shipped.v1'
+
+  wb.fbs.return.detected.v1:
+    address: wb.fbs.return.detected.v1
+    title: WB сообщил о возврате
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wb.fbs.return.detected.v1'
+
+operations:
+  # `send` — то, что сервис `wms` кладёт в exchange из собственного outbox.
+  # `receive` — то, что он вычитывает из своих очередей.
+  receiveWmsReserve:
+    action: receive
+    channel:
+      $ref: '#/channels/wms.reserve.v1'
+    summary: Принять команду резерва (совместимость на время миграции)
+    tags:
+      - name: legacy-command
+  receiveWmsCancel:
+    action: receive
+    channel:
+      $ref: '#/channels/wms.cancel.v1'
+    summary: Принять команду отмены задания
+    tags:
+      - name: legacy-command
+  receiveWmsReturn:
+    action: receive
+    channel:
+      $ref: '#/channels/wms.return.v1'
+    summary: Принять команду оформления возврата
+    tags:
+      - name: legacy-command
+  receiveWmsReturnRequest:
+    action: receive
+    channel:
+      $ref: '#/channels/wms.return-request.v1'
+    summary: Принять заявку на возврат
+    tags:
+      - name: legacy-command
+
+  sendWmsReservationSucceeded:
+    action: send
+    channel:
+      $ref: '#/channels/wms.reservation.succeeded.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsReservationFailed:
+    action: send
+    channel:
+      $ref: '#/channels/wms.reservation.failed.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsStockShortfall:
+    action: send
+    channel:
+      $ref: '#/channels/wms.stock.shortfall.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsPickingStarted:
+    action: send
+    channel:
+      $ref: '#/channels/wms.picking.started.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsItemScanned:
+    action: send
+    channel:
+      $ref: '#/channels/wms.item.scanned.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsPickingCompleted:
+    action: send
+    channel:
+      $ref: '#/channels/wms.picking.completed.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsPackingCompleted:
+    action: send
+    channel:
+      $ref: '#/channels/wms.packing.completed.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsLabelAttached:
+    action: send
+    channel:
+      $ref: '#/channels/wms.label.attached.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsReturnedToShelf:
+    action: send
+    channel:
+      $ref: '#/channels/wms.returned.to.shelf.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsStockReleased:
+    action: send
+    channel:
+      $ref: '#/channels/wms.stock.released.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsOrderCancelled:
+    action: send
+    channel:
+      $ref: '#/channels/wms.order.cancelled.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+
+  sendWmsReturnExpected:
+    action: send
+    channel:
+      $ref: '#/channels/wms.return.expected.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-returns
+  sendWmsReturnReceived:
+    action: send
+    channel:
+      $ref: '#/channels/wms.return.received.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-returns
+  sendWmsReturnResellable:
+    action: send
+    channel:
+      $ref: '#/channels/wms.return.resellable.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-returns
+  sendWmsReturnDefective:
+    action: send
+    channel:
+      $ref: '#/channels/wms.return.defective.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-returns
+
+  sendInventoryMovementRecorded:
+    action: send
+    channel:
+      $ref: '#/channels/inventory.movement.recorded.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: inventory
+  sendInventoryStockUpdated:
+    action: send
+    channel:
+      $ref: '#/channels/inventory.stock.updated.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: inventory
+
+  sendWbFbsOrderSynced:
+    action: send
+    channel:
+      $ref: '#/channels/wb.fbs.order.synced.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wb-inherited
+  sendWbFbsOrderUpdated:
+    action: send
+    channel:
+      $ref: '#/channels/wb.fbs.order.updated.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wb-inherited
+  sendWbSupplyShipped:
+    action: send
+    channel:
+      $ref: '#/channels/wb.supply.shipped.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wb-inherited
+  sendWbFbsReturnDetected:
+    action: send
+    channel:
+      $ref: '#/channels/wb.fbs.return.detected.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wb-inherited
+
+components:
+  securitySchemes:
+    amqpUserPassword:
+      type: userPassword
+      description: >-
+        Логин и пароль сервисного пользователя RabbitMQ. Берутся только из env
+        по паттерну `${VAR:?set outside Git}` (раздел 12), в репозиторий не попадают.
+
+  channelBindings:
+    mmxEvents:
+      amqp:
+        is: routingKey
+        exchange:
+          name: mmx.events
+          type: topic
+          durable: true
+          autoDelete: false
+          vhost: /
+        bindingVersion: 0.3.0
+
+  operationBindings:
+    persistent:
+      amqp:
+        # deliveryMode 2 = persistent. Outbox переживает рестарт брокера: событие уже
+        # закоммичено вместе с движением товара, потерять его при перезапуске RabbitMQ
+        # значит разойтись с базой.
+        deliveryMode: 2
+        mandatory: false
+        bindingVersion: 0.3.0
+
+  messages:
+    # Каждое сообщение — это конверт EventEnvelope, у которого сужены ровно два поля:
+    # `type` до константы и `payload` до конкретной схемы. Сужение через allOf, а не
+    # копированием конверта: копия однажды разойдётся с оригиналом, и разойдётся молча.
+    wms.reserve.v1:
+      name: wms.reserve.v1
+      title: Команда резерва
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.reserve.v1
+              payload:
+                $ref: '#/components/schemas/ReserveCommandPayload'
+
+    wms.cancel.v1:
+      name: wms.cancel.v1
+      title: Команда отмены
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.cancel.v1
+              payload:
+                $ref: '#/components/schemas/CancelCommandPayload'
+
+    wms.return.v1:
+      name: wms.return.v1
+      title: Команда возврата
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.return.v1
+              payload:
+                $ref: '#/components/schemas/ReturnCommandPayload'
+
+    wms.return-request.v1:
+      name: wms.return-request.v1
+      title: Заявка на возврат
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.return-request.v1
+              payload:
+                $ref: '#/components/schemas/ReturnRequestPayload'
+
+    wms.reservation.succeeded.v1:
+      name: wms.reservation.succeeded.v1
+      title: Резерв создан
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.reservation.succeeded.v1
+              payload:
+                $ref: '#/components/schemas/ReservationSucceededPayload'
+
+    wms.reservation.failed.v1:
+      name: wms.reservation.failed.v1
+      title: Резерв не создан
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.reservation.failed.v1
+              payload:
+                $ref: '#/components/schemas/ReservationFailedPayload'
+
+    wms.stock.shortfall.v1:
+      name: wms.stock.shortfall.v1
+      title: Сборка без остатка
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.stock.shortfall.v1
+              payload:
+                $ref: '#/components/schemas/StockShortfallPayload'
+
+    wms.picking.started.v1:
+      name: wms.picking.started.v1
+      title: Подбор начат
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.picking.started.v1
+              payload:
+                $ref: '#/components/schemas/PickingStartedPayload'
+
+    wms.item.scanned.v1:
+      name: wms.item.scanned.v1
+      title: Скан у стойки
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.item.scanned.v1
+              payload:
+                $ref: '#/components/schemas/ItemScannedPayload'
+
+    wms.picking.completed.v1:
+      name: wms.picking.completed.v1
+      title: Подбор завершён
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.picking.completed.v1
+              payload:
+                $ref: '#/components/schemas/PickingCompletedPayload'
+
+    wms.packing.completed.v1:
+      name: wms.packing.completed.v1
+      title: Упаковка завершена
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.packing.completed.v1
+              payload:
+                $ref: '#/components/schemas/PackingCompletedPayload'
+
+    wms.label.attached.v1:
+      name: wms.label.attached.v1
+      title: Этикетка привязана
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.label.attached.v1
+              payload:
+                $ref: '#/components/schemas/LabelAttachedPayload'
+
+    wms.returned.to.shelf.v1:
+      name: wms.returned.to.shelf.v1
+      title: Товар возвращён на полку
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.returned.to.shelf.v1
+              payload:
+                $ref: '#/components/schemas/ReturnedToShelfPayload'
+
+    wms.stock.released.v1:
+      name: wms.stock.released.v1
+      title: Резерв снят
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.stock.released.v1
+              payload:
+                $ref: '#/components/schemas/StockReleasedPayload'
+
+    wms.order.cancelled.v1:
+      name: wms.order.cancelled.v1
+      title: Задание отменено
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.order.cancelled.v1
+              payload:
+                $ref: '#/components/schemas/OrderCancelledPayload'
+
+    wms.return.expected.v1:
+      name: wms.return.expected.v1
+      title: Возврат ожидается
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.return.expected.v1
+              payload:
+                $ref: '#/components/schemas/ReturnExpectedPayload'
+
+    wms.return.received.v1:
+      name: wms.return.received.v1
+      title: Возврат принят
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.return.received.v1
+              payload:
+                $ref: '#/components/schemas/ReturnReceivedPayload'
+
+    wms.return.resellable.v1:
+      name: wms.return.resellable.v1
+      title: Возврат годен к продаже
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.return.resellable.v1
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/ReturnDecisionPayload'
+                  - type: object
+                    properties:
+                      decision:
+                        const: resellable
+                      state_to:
+                        const: good
+
+    wms.return.defective.v1:
+      name: wms.return.defective.v1
+      title: Возврат браком
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.return.defective.v1
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/ReturnDecisionPayload'
+                  - type: object
+                    properties:
+                      decision:
+                        const: defective
+                      state_to:
+                        const: defect
+
+    inventory.movement.recorded.v1:
+      name: inventory.movement.recorded.v1
+      title: Движение записано
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: inventory.movement.recorded.v1
+              payload:
+                $ref: '#/components/schemas/InventoryMovementPayload'
+
+    inventory.stock.updated.v1:
+      name: inventory.stock.updated.v1
+      title: Остаток пересчитан
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: inventory.stock.updated.v1
+              payload:
+                $ref: '#/components/schemas/InventoryStockUpdatedPayload'
+
+    wb.fbs.order.synced.v1:
+      name: wb.fbs.order.synced.v1
+      title: Задание WB получено
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wb.fbs.order.synced.v1
+              payload:
+                $ref: '#/components/schemas/TaskPayload'
+
+    wb.fbs.order.updated.v1:
+      name: wb.fbs.order.updated.v1
+      title: Задание WB изменилось
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wb.fbs.order.updated.v1
+              payload:
+                $ref: '#/components/schemas/TaskPayload'
+
+    wb.supply.shipped.v1:
+      name: wb.supply.shipped.v1
+      title: Поставка передана
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wb.supply.shipped.v1
+              payload:
+                $ref: '#/components/schemas/SupplyShippedPayload'
+
+    wb.fbs.return.detected.v1:
+      name: wb.fbs.return.detected.v1
+      title: Возврат обнаружен в WB
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wb.fbs.return.detected.v1
+              payload:
+                $ref: '#/components/schemas/ReturnDetectedPayload'
+
+  schemas:
+    # =========================================================================
+    # Конверт. Раздел 2.4 и приложение E, без отклонений: ровно шесть полей,
+    # все обязательны, additionalProperties запрещены. Запрет здесь не косметика —
+    # он и есть техническая гарантия инварианта 15: поле `wb_token`, случайно
+    # добавленное в конверт, не пройдёт валидацию при эмиссии.
+    # =========================================================================
+    EventEnvelope:
+      type: object
+      additionalProperties: false
+      description: |
+        Общий конверт шины `mmx.events`.
+
+        Токены Wildberries, `secret_ref`, ключи и пароли не попадают ни в конверт,
+        ни в `payload` — никогда (инвариант 15, раздел 12). При эмиссии тип события
+        валидируется по `WmsEventType` для семейства `wms.*`.
+      required:
+        - event_id
+        - tenant_id
+        - type
+        - occurred_at
+        - payload
+        - correlation_id
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Ключ идемпотентности доставки. `outbox.event_id UNIQUE`.
+        tenant_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Арендатор платформы.
+        type:
+          type: string
+          minLength: 1
+          description: >-
+            Имя типа события, оно же routing key в exchange `mmx.events`.
+            Для семейства `wms.*` допустимы только значения `WmsEventType`
+            (издаваемые) и `WmsCommandType` (принимаемые).
+        occurred_at:
+          type: string
+          format: date-time
+          description: >-
+            Момент бизнес-факта, а не публикации. Между `occurred_at` и попаданием
+            в брокер лежит outbox, задержка нормальна и не влияет на порядок:
+            порядок задаёт `payload.sequence`.
+        payload:
+          type: object
+          description: Тело события. Форма определяется полем `type`.
+        correlation_id:
+          type: string
+          minLength: 1
+          description: Сквозной идентификатор цепочки, от опроса WB до начисления.
+
+    # =========================================================================
+    # Примитивы. Вынесены, чтобы формат `task_id` был одинаков во всех двадцати
+    # с лишним payload, а не «почти одинаков».
+    # =========================================================================
+    Uuid:
+      type: string
+      format: uuid
+
+    OutboxSequence:
+      type: integer
+      minimum: 0
+      description: |
+        Номер события в пределах одного задания.
+
+        ТРЕБОВАНИЕ К РЕАЛИЗАЦИИ (приложение E, последний абзац): инкремент выполняется
+        в той же транзакции Postgres, что и движение товара, под блокировкой строки
+        `wms_task`. Последовательность строго монотонна и без дыр в пределах `task_id`.
+        В схеме это `outbox.sequence` при `outbox.aggregate_id = task_id`, защищённое
+        уникальным индексом `outbox_sequence_key` — два события с одним номером
+        по одному заданию база не примет.
+        Потребитель обязан отбрасывать сообщения с `sequence`, не большим последнего
+        обработанного для этого задания, — иначе переигрывание DLQ или повторная
+        доставка RabbitMQ откатят состояние назад.
+
+    Qty:
+      type: integer
+      minimum: 1
+      description: Количество единиц товара. Ноль движением не является.
+
+    Barcode:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: >-
+        Штрихкод вещи на полке. У Wildberries это поле называется `sku`, но приходит
+        в нём именно штрихкод (раздел 3.2): артикул определяет модель, штрихкод — вещь.
+
+    SellerExternalId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: >-
+        Внешний идентификатор продавца (`owner.seller_external_id`). Едет рядом
+        с `owner_id` там, где событие потребляет биллинг: он знает клиента по
+        внешнему ключу, а не по uuid склада.
+
+    Sha256:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+
+    StockState:
+      type: string
+      description: Состояние товара (раздел 7). Домен `wms_stock_state` в схеме БД.
+      enum:
+        - good
+        - reserved
+        - quarantine
+        - defect
+        - blocked
+        - processing
+
+    ScanResult:
+      type: string
+      description: >-
+        Результат скана у стойки (`pick_line.scan_result`). Чужой штрихкод и чужой
+        владелец — разные исходы: первое ошибка сборщика, второе нарушение изоляции
+        владельца (инвариант 6) и повод для алерта.
+      enum:
+        - ok
+        - wrong_barcode
+        - wrong_owner
+        - not_found
+        - short
+
+    ReservationErrorCode:
+      type: string
+      description: >-
+        Коды отказа резерва — закрытый список из приложения C, сохранены все.
+        Свободная строка здесь запрещена: в боевом контуре именно она превращала
+        `PRODUCT_MAPPING_MISSING` в отмену без причины.
+      enum:
+        - SELLER_MAPPING_MISSING
+        - PRODUCT_MAPPING_MISSING
+        - AMBIGUOUS_PRODUCT_MAPPING
+        - WAREHOUSE_UNKNOWN
+        - INSUFFICIENT_STOCK
+        - SERIALIZATION_RETRY
+
+    LabelFormat:
+      type: string
+      description: >-
+        `WB_STICKER_FORMAT`. Целевое значение `zplv` (раздел 6.6), `png` остаётся
+        как откат, пока формат не подтверждён живым принтером (раздел 13, вопрос 2).
+      enum:
+        - png
+        - svg
+        - zplv
+        - zplh
+
+    TaskStatus:
+      type: string
+      description: >-
+        Канонический статус задания в терминах поглощённого шлюза. Используется
+        в `InventoryMovementPayload` и `TaskProjection` — форма перенесена как есть,
+        под неё уже написаны потребители.
+      enum:
+        - RECEIVED
+        - MANUAL_REVIEW
+        - RESERVATION_REQUESTED
+        - RESERVED
+        - RESERVATION_FAILED
+        - PICKING
+        - PICKED
+        - PACKING
+        - PACKED
+        - SUPPLY_ASSIGNED
+        - LABEL_PENDING
+        - LABEL_READY
+        - READY_FOR_DELIVERY
+        - IN_DELIVERY_BATCH
+        - OUT_FOR_DELIVERY
+        - HANDED_TO_WB
+        - ACCEPTED_BY_WB
+        - RESHIPMENT_REQUIRED
+        - DELIVERY_FAILED
+        - RETURN_REQUESTED
+        - RETURNED_TO_WMS
+        - CANCELLED
+
+    WmsTaskState:
+      type: string
+      description: >-
+        Состояние `wms_task.state` — автомат задания из раздела 7. Отличается от
+        `TaskStatus`: это внутреннее состояние новой WMS. Полная таблица соответствия
+        `wms_task.state` ↔ рабочее место ↔ канонический ↔ WB — `docs/state-mapping.md`.
+
+        `handed` и `accepted` в разделе 7 не перечислены, но добавлены в схему
+        (`migrations/003_tasks_reservations.sql`): «передано человеком» и
+        «подтверждено сверкой» — разные факты, `complete` у WB приёмку не доказывает
+        (раздел 2.12). Список здесь держится в точности как CHECK в базе.
+      enum:
+        - new
+        - reserved
+        - picking
+        - picked
+        - packed
+        - labeled
+        - in_supply
+        - shipped
+        - handed
+        - accepted
+        - short
+        - cancelled
+        - manual_review
+        - diverged
+
+    WmsEventType:
+      type: string
+      description: |
+        Список `WMS_EVENT_TYPES` из приложения E — валидируется при эмиссии.
+        Расширен на `wms.stock.shortfall.v1` (версия 1.2 мастера, раздел 6.5).
+
+        Обратить внимание: `wms.reserve.v1`, `wms.cancel.v1`, `wms.return.v1` и
+        `wms.return-request.v1` сюда не входят — это команды, а не события
+        (см. `WmsCommandType`). `wms.stock.released.v1` в приложении A каталога
+        событий есть, а в списке приложения E его нет; расхождение исходных
+        документов, разрешено в пользу приложения E — список валидации не
+        расширяем, канал существует и издаётся.
+      enum:
+        - wms.reservation.succeeded.v1
+        - wms.reservation.failed.v1
+        - wms.picking.started.v1
+        - wms.item.scanned.v1
+        - wms.picking.completed.v1
+        - wms.packing.completed.v1
+        - wms.label.attached.v1
+        - wms.returned.to.shelf.v1
+        - wms.return.expected.v1
+        - wms.return.received.v1
+        - wms.return.resellable.v1
+        - wms.return.defective.v1
+        - wms.order.cancelled.v1
+        - wms.stock.shortfall.v1
+
+    WmsCommandType:
+      type: string
+      description: >-
+        Команды, которые wms принимает из шины. В целевой модели не используются —
+        резерв и отмена стали транзакцией (раздел 6.2). Держатся до переключения
+        последнего кабинета (раздел 11, шаг 6).
+      enum:
+        - wms.reserve.v1
+        - wms.cancel.v1
+        - wms.return.v1
+        - wms.return-request.v1
+
+    # =========================================================================
+    # Payload команд. Формы взяты из приложения C дословно.
+    # =========================================================================
+    ReserveCommandPayload:
+      type: object
+      additionalProperties: false
+      description: Приложение C, «Резерв» (`/reservations`).
+      required:
+        - request_id
+        - idempotency_key
+        - seller_external_id
+        - wb_account_external_id
+        - wb_order_id
+        - order_uid
+        - sku
+        - barcode
+        - quantity
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+        idempotency_key:
+          type: string
+          minLength: 1
+          description: >-
+            Повтор возвращает тот же ответ и не создаёт второго движения
+            (инвариант 5).
+        gateway_order_id:
+          type: ['string', 'null']
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        wb_account_external_id:
+          type: string
+          minLength: 1
+        wb_order_id:
+          type: integer
+          format: int64
+        order_uid:
+          type: string
+          minLength: 1
+        sku:
+          type: string
+          minLength: 1
+          description: Поле WB. Содержит штрихкод, а не артикул (раздел 3.2).
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        quantity:
+          $ref: '#/components/schemas/Qty'
+        deadline:
+          type: ['string', 'null']
+          format: date-time
+          description: Срок WB. Выдача заданий сборщикам сортируется по нему, а не по времени создания.
+        correlation_id:
+          type: ['string', 'null']
+
+    CancelCommandPayload:
+      type: object
+      additionalProperties: false
+      description: Приложение C, «Отмена» (`/tasks/{id}/cancel`).
+      required:
+        - task_id
+        - cancellation_event_id
+        - handed_over
+        - reason
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        cancellation_event_id:
+          type: string
+          minLength: 1
+          description: Ключ идемпотентности отмены.
+        handed_over:
+          type: boolean
+          description: >-
+            Физически передано перевозчику. Если true — это не стоп, а разбор
+            возврата (раздел 2.12).
+        reason:
+          type: string
+          minLength: 1
+          description: >-
+            Обязательна. `wms_task.cancel_reason NOT NULL при state='cancelled'`
+            (инвариант 11).
+
+    ReturnCommandPayload:
+      type: object
+      additionalProperties: false
+      description: Приложение C, «Возврат» (`/tasks/{id}/return`).
+      required:
+        - task_id
+        - return_event_id
+        - seller_external_id
+        - reason
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        return_event_id:
+          type: string
+          minLength: 1
+          description: Внешний ключ идемпотентности, `wms_return.return_event_id UNIQUE`.
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        reason:
+          type: string
+          minLength: 1
+
+    ReturnRequestPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - return_event_id
+        - seller_external_id
+        - reason
+      properties:
+        return_event_id:
+          type: string
+          minLength: 1
+        task_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+          description: >-
+            Может отсутствовать: WB присылает возвраты, которые к нашему заданию
+            не привязываются (`wb.return.unmatched.v1` в каталоге as-is).
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        reason:
+          type: string
+          minLength: 1
+
+    # =========================================================================
+    # Payload событий резерва, подбора и отгрузки.
+    # Имена полей — из раздела 7 мастера, чтобы payload читался тем же словарём,
+    # что и таблицы: owner_id, sku_id, cell_id, box_id, task_id, qty, reason, state.
+    # =========================================================================
+    ReservationSucceededPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - task_id
+        - reservation_id
+        - owner_id
+        - sku_id
+        - qty
+        - wb_order_id
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        reservation_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        cell_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        box_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        qty:
+          $ref: '#/components/schemas/Qty'
+        wb_order_id:
+          type: integer
+          format: int64
+        deadline:
+          type: ['string', 'null']
+          format: date-time
+        ledger_short:
+          type: boolean
+          default: false
+          description: >-
+            Резерв создан клапаном 6.5, товара по учёту не было. Рядом обязано
+            уйти `wms.stock.shortfall.v1` с тем же `task_id`.
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    ReservationFailedPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - wb_order_id
+        - barcode
+        - quantity
+        - error_code
+        - sequence
+      properties:
+        task_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+          description: >-
+            null, если задание не удалось даже создать (например,
+            `SELLER_MAPPING_MISSING` — владелец неизвестен).
+        owner_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        wb_order_id:
+          type: integer
+          format: int64
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        quantity:
+          $ref: '#/components/schemas/Qty'
+        error_code:
+          $ref: '#/components/schemas/ReservationErrorCode'
+        manual_review_code:
+          oneOf:
+            - $ref: '#/components/schemas/ReservationErrorCode'
+            - type: 'null'
+          description: >-
+            Заполнен, когда задание ушло в `manual_review`. Товар без маппинга —
+            это `manual_review` с кодом, а не остаток и не тихая отмена
+            (инвариант 6, раздел 3.2).
+        manual_review_reason:
+          type: ['string', 'null']
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    StockShortfallPayload:
+      type: object
+      additionalProperties: false
+      description: |
+        Сборка без остатка — клапан `ledger_short` (раздел 6.5).
+
+        Состав полей заморожен потоком 0 ровно в этом виде (файл 01, пункт 3):
+        `owner_id`, `sku_id`, `cell_id`, `qty_short`, `task_id`. Ничего больше
+        сюда не добавляется — событие адресует расхождение, а не описывает задание.
+        В той же транзакции пишутся движение с `reason = 'ledger_short'` и
+        `discrepancy(kind='ledger_short')`; событие — третий след из трёх
+        (инвариант 12).
+      required:
+        - owner_id
+        - sku_id
+        - cell_id
+        - qty_short
+        - task_id
+      properties:
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        cell_id:
+          $ref: '#/components/schemas/Uuid'
+        qty_short:
+          type: integer
+          minimum: 1
+          description: Сколько единиц дописано сверх учётного остатка.
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+
+    PickingStartedPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - task_id
+        - session_id
+        - owner_id
+        - actor_id
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        session_id:
+          $ref: '#/components/schemas/Uuid'
+          description: >-
+            `pick_session.id`. Сессия многопродавцовая: один обход собирает задания
+            нескольких клиентов (раздел 4).
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        actor_id:
+          $ref: '#/components/schemas/Uuid'
+        station_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    ItemScannedPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - task_id
+        - owner_id
+        - sku_id
+        - barcode
+        - qty
+        - scan_result
+        - actor_id
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        session_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        cell_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        box_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+          description: Коробка, которую сборщик «пикнул» у стойки (раздел 2.9).
+        qty:
+          $ref: '#/components/schemas/Qty'
+        scan_result:
+          $ref: '#/components/schemas/ScanResult'
+        actor_id:
+          $ref: '#/components/schemas/Uuid'
+        station_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    PickingCompletedPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - task_id
+        - session_id
+        - owner_id
+        - picked_qty
+        - actor_id
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        session_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        picked_qty:
+          type: integer
+          minimum: 0
+          description: Ноль допустим — это недостача, задание уходит в `short`.
+        actor_id:
+          $ref: '#/components/schemas/Uuid'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    PackingCompletedPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        Контрольный скан пройден, задание упаковано. Тарифицируемая операция:
+        поток C начисляет по ней (amount 45, partner_amount 15, net_amount 30).
+      required:
+        - task_id
+        - owner_id
+        - sku_id
+        - qty
+        - actor_id
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        qty:
+          $ref: '#/components/schemas/Qty'
+        package_ref:
+          type: ['string', 'null']
+          description: '`wms_task.package_ref` — упаковка или транспортный короб.'
+        box_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        station_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        actor_id:
+          $ref: '#/components/schemas/Uuid'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    LabelAttachedPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        Содержимое этикетки в событие не кладётся: до 10 МБ полезной нагрузки
+        через шину — это не уведомление. ZPL лежит в `wb_label` и отдаётся
+        по `/labels/{task_id}/print`.
+      required:
+        - task_id
+        - label_id
+        - format
+        - checksum
+        - version
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        label_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        format:
+          $ref: '#/components/schemas/LabelFormat'
+        checksum:
+          $ref: '#/components/schemas/Sha256'
+        version:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        supply_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+          description: >-
+            Стикер выдаётся WB только для задания, уже лежащего в поставке, —
+            требование WB, сохранено (раздел 3.3).
+        fetched_at:
+          type: string
+          format: date-time
+          description: >-
+            Когда стикер был получен от WB. Должен быть раньше начала подбора
+            (инвариант 9, шаг 7 полного прогона).
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    ReturnedToShelfPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - task_id
+        - owner_id
+        - sku_id
+        - qty
+        - reason
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        cell_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        box_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        qty:
+          $ref: '#/components/schemas/Qty'
+        state_to:
+          $ref: '#/components/schemas/StockState'
+        reason:
+          type: string
+          minLength: 1
+          description: '`stock_move.reason` — почему вещь вернулась на полку.'
+        actor_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    StockReleasedPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        Резерв снят, `qty` вернулось из `reserved` в `good`. Следом обязано уйти
+        `inventory.stock.updated.v1` и немедленная публикация остатка в WB
+        (раздел 6.4).
+      required:
+        - task_id
+        - reservation_id
+        - owner_id
+        - sku_id
+        - qty
+        - release_reason
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        reservation_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        cell_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        box_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        qty:
+          $ref: '#/components/schemas/Qty'
+        release_reason:
+          type: string
+          minLength: 1
+          description: '`reservation.release_reason`.'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    OrderCancelledPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - task_id
+        - wb_order_id
+        - owner_id
+        - cancel_reason
+        - sequence
+      properties:
+        task_id:
+          $ref: '#/components/schemas/Uuid'
+        wb_order_id:
+          type: integer
+          format: int64
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        cancel_reason:
+          type: string
+          minLength: 1
+          description: >-
+            Обязательна. Пустая причина — это те самые 2645 отмен без объяснения
+            в боевом контуре (раздел 3).
+        handed_over:
+          type: boolean
+          default: false
+        released_qty:
+          type: integer
+          minimum: 0
+          description: Сколько вернулось в `good`. Ноль, если резерва не было.
+        label_invalidated:
+          type: boolean
+          default: false
+          description: >-
+            Стикер помечен недействительным, заказ освобождён из поставки
+            (`release_from_supply`, раздел 6.6).
+        state:
+          $ref: '#/components/schemas/WmsTaskState'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    # =========================================================================
+    # Возвраты. Контрактный минимум: принять и решить (раздел 6.7).
+    # =========================================================================
+    ReturnExpectedPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - return_id
+        - return_event_id
+        - owner_id
+      properties:
+        return_id:
+          $ref: '#/components/schemas/Uuid'
+        return_event_id:
+          type: string
+          minLength: 1
+        task_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        sku_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        qty:
+          $ref: '#/components/schemas/Qty'
+        reason:
+          type: ['string', 'null']
+
+    ReturnReceivedPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - return_id
+        - owner_id
+        - qty
+      properties:
+        return_id:
+          $ref: '#/components/schemas/Uuid'
+        task_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        sku_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        qty:
+          $ref: '#/components/schemas/Qty'
+        cell_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        box_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        state_to:
+          $ref: '#/components/schemas/StockState'
+          description: >-
+            Куда лёг товар до решения. Обычно `quarantine`: принят физически,
+            но продавать его ещё нельзя.
+        actor_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+
+    ReturnDecisionPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        Общая форма решения по возврату. Конкретный тип события сужает `decision`
+        и `state_to`: `wms.return.resellable.v1` → good, `wms.return.defective.v1`
+        → defect. Одна схема на два события — чтобы поток C писал один обработчик,
+        а не два расходящихся.
+      required:
+        - return_id
+        - owner_id
+        - qty
+        - decision
+      properties:
+        return_id:
+          $ref: '#/components/schemas/Uuid'
+        task_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        sku_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        qty:
+          $ref: '#/components/schemas/Qty'
+        decision:
+          type: string
+          enum:
+            - resellable
+            - defective
+        state_to:
+          $ref: '#/components/schemas/StockState'
+        cell_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        box_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        reason:
+          type: ['string', 'null']
+        actor_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+
+    # =========================================================================
+    # Журнал остатков.
+    # InventoryMovementPayload перенесён из приложения E дословно — форма as-is,
+    # менять её значит ломать уже написанных потребителей.
+    # =========================================================================
+    InventoryMovementPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        Приложение E, `inventory.movement.recorded.v1`. Форма зафиксирована as-is.
+        Событие издаётся из той же транзакции, что записала `stock_move`;
+        `stock_move` append-only, триггер запрещает UPDATE и DELETE (инвариант 3).
+      required:
+        - movement_type
+        - sku
+        - quantity
+        - order_id
+        - status
+        - occurred_at
+      properties:
+        movement_type:
+          $ref: '#/components/schemas/WmsEventType'
+        sku:
+          type: string
+          minLength: 1
+        quantity:
+          type: number
+        order_id:
+          type: integer
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        occurred_at:
+          type: string
+          format: date-time
+        reference:
+          type: ['string', 'number', 'null']
+
+    InventoryStockUpdatedPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        Проекция `stock_balance` после движения. `available` считается по формуле
+        раздела 6.4 и всегда занижается; отрицательное значение в WB не уезжает —
+        строки с отрицательным `available` отбрасываются (приложение C).
+      required:
+        - owner_id
+        - sku_id
+        - barcode
+        - good
+        - reserved
+        - buffer
+        - available
+      properties:
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        sku_id:
+          $ref: '#/components/schemas/Uuid'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        good:
+          type: integer
+          minimum: 0
+        reserved:
+          type: integer
+          minimum: 0
+        buffer:
+          type: integer
+          minimum: 0
+          description: '`sku.buffer` — страховой запас.'
+        available:
+          type: integer
+          minimum: 0
+          description: 'good - reserved - buffer, не ниже нуля.'
+        published_to_wb:
+          type: boolean
+          default: false
+          description: >-
+            Ушла ли публикация в WB. Отдельный флаг, потому что публикация живёт
+            вне транзакции: событие едет сразу, вызов WB может ждать ограничителя.
+
+    # =========================================================================
+    # Унаследованные от шлюза схемы. Приложение E, перенесены дословно:
+    # additionalProperties у них не запрещены намеренно — приложение E задаёт
+    # только обязательные поля, а гейтвей исторически кладёт больше.
+    # =========================================================================
+    TaskPayload:
+      type: object
+      description: '`wb.fbs.order.synced.v1`, `wb.fbs.order.updated.v1`.'
+      required:
+        - task
+      properties:
+        task:
+          $ref: '#/components/schemas/TaskProjection'
+
+    TaskProjection:
+      type: object
+      description: >-
+        Публичная проекция задания шлюза. Токенов и секретов не содержит и не будет
+        содержать (инвариант 15); внутренний `last_wms_sequence` наружу не отдаётся.
+      required:
+        - id
+        - seller_id
+        - account_id
+        - order_id
+        - order_uid
+        - sku
+        - wb_status
+        - status
+        - version
+        - updated_at
+      properties:
+        id:
+          type: string
+        seller_id:
+          type: string
+        account_id:
+          type: string
+        order_id:
+          type: integer
+          format: int64
+        order_uid:
+          type: string
+        sku:
+          type: string
+          description: Поле WB. Содержит штрихкод (раздел 3.2).
+        destination:
+          type: ['integer', 'null']
+        cargo_type:
+          type: ['integer', 'null']
+        deadline:
+          type: ['string', 'null']
+        required_meta:
+          type: array
+          items:
+            type: string
+        optional_meta:
+          type: array
+          items:
+            type: string
+        is_b2b:
+          type: ['boolean', 'null']
+        cross_border_type:
+          type: ['integer', 'null']
+        wb_status:
+          type: string
+          enum:
+            - new
+            - confirm
+            - complete
+            - cancel
+        wb_system_status:
+          type: ['string', 'null']
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        wms_task_id:
+          type: ['string', 'null']
+        supply_id:
+          type: ['string', 'null']
+        label_id:
+          type: ['string', 'null']
+        delivery_batch_id:
+          type: ['string', 'null']
+        version:
+          type: integer
+          minimum: 1
+        manual_reason:
+          type: ['string', 'null']
+        last_reconciled_at:
+          type: ['string', 'null']
+        reshipment_source_supply_id:
+          type: ['string', 'null']
+        updated_at:
+          type: string
+
+    SupplyShippedPayload:
+      type: object
+      description: 'Приложение E, `wb.supply.shipped.v1`. Тарифицируемое событие.'
+      required:
+        - supply
+        - seller_id
+        - orders
+        - accepted_at
+        - name
+      properties:
+        supply:
+          type: string
+          description: Идентификатор поставки WB (WB-GI-…).
+        seller_id:
+          type: string
+          description: Организация клиента, кому выставляется счёт.
+        orders:
+          type: integer
+          minimum: 0
+          description: Заказов в поставке — тарифицируемое количество.
+        accepted_at:
+          type: ['string', 'null']
+          format: date-time
+          description: >-
+            Когда WB отсканировал QR поставки (`scanDt`). null — поставка передана,
+            но приёмка WB не подтверждена; это не доказательство приёмки (раздел 2.12).
+        name:
+          type: string
+
+    ReturnDetectedPayload:
+      type: object
+      description: 'Приложение E, `wb.fbs.return.detected.v1`.'
+      required:
+        - return_id
+        - task_id
+      properties:
+        return_id:
+          type: string
+          pattern: '^wb-[0-9a-f-]{36}$'
+        task_id:
+          type: string
+          format: uuid
