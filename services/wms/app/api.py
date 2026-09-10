@@ -75,25 +75,47 @@ async def health(request: Request) -> JSONResponse:
 
 @router.post("/sellers")
 async def sellers(request: Request) -> JSONResponse:
-    return _result(await _body(request), {"sellers": fixtures.SELLERS})
+    """Список владельцев, а с параметрами — ещё и заведение нового.
+
+    Клиента заводят на ходу (шаг 1 прогона), и заведённый обязан быть виден
+    резерву. Пока маршрут только читал, любой новый продавец получал
+    SELLER_MAPPING_MISSING — и весь прогон вставал на первом же шаге.
+    """
+    body = await _body(request)
+    params = _params(body)
+    seller = params.get("seller_external_id")
+    created = None
+    if seller:
+        created = state.register_owner(
+            str(seller), name=params.get("name"), inn=params.get("inn"),
+            allow_ledger_short=params.get("allow_ledger_short"))
+    return _result(body, {"sellers": state.owners(), "seller": created})
 
 
 @router.post("/catalog/products")
 async def catalog_products(request: Request) -> JSONResponse:
     body = await _body(request)
     seller = _params(body).get("seller_external_id")
-    items = [p for p in fixtures.PRODUCTS if not seller or p["seller_external_id"] == seller]
-    return _result(body, {"products": items})
+    return _result(body, {"products": state.products(seller)})
 
 
 @router.post("/catalog/products/ensure")
 async def catalog_products_ensure(request: Request) -> JSONResponse:
     body = await _body(request)
     params = _params(body)
+    seller = str(params.get("seller_external_id", ""))
+    barcode = str(params.get("barcode", ""))
+    if not seller or not barcode:
+        return _result(body, {"status": "rejected", "error_code": "SELLER_MAPPING_MISSING"})
+
+    # Товар заводится у владельца: изоляция владельца доходит до каталога
+    # (инвариант 6), одинаковый штрихкод у двух клиентов — разные вещи.
+    state.register_owner(seller)
+    product, created = state.register_product(
+        seller, barcode, seller_sku=params.get("seller_sku"), name=params.get("name"))
     return _result(body, {
-        "product_id": uid(),
-        "barcode": params.get("barcode"),
-        "created": not fixtures.barcode_is_known(str(params.get("barcode", ""))),
+        "product_id": product["sku_id"], "sku_id": product["sku_id"],
+        "barcode": barcode, "seller_external_id": seller, "created": created,
     })
 
 
@@ -118,8 +140,26 @@ async def catalog_stocks_bulk(request: Request) -> JSONResponse:
 
 @router.post("/warehouse/documents")
 async def warehouse_documents(request: Request) -> JSONResponse:
+    """Складской документ: со строками — применяет, без них — перечисляет.
+
+    Начальный остаток при переключении клиента даёт владелец компании
+    (решение владельца 11), поэтому он заезжает документом с doc_type='opening'
+    и оставляет след, а не появляется на складе сам.
+    """
     body = await _body(request)
-    return _result(body, {"documents": state.documents})
+    params = _params(body)
+    lines = params.get("lines")
+    reference = params.get("reference")
+    if not lines or not reference:
+        return _result(body, {"documents": state.documents})
+
+    seller = str(params.get("seller_external_id", ""))
+    state.register_owner(seller)
+    document = state.apply_document(
+        seller_external_id=seller, reference=str(reference),
+        doc_type=str(params.get("doc_type", "adjustment")),
+        lines=lines, comment=params.get("comment"))
+    return _result(body, document)
 
 
 @router.post("/warehouse/stock")
@@ -154,20 +194,21 @@ async def reservations(request: Request) -> JSONResponse:
     wb_order_id = params.get("wb_order_id")
     failure = (correlation_id, wb_order_id, barcode, quantity)
 
-    if not fixtures.seller_is_known(seller):
+    if not state.owner_is_known(seller):
         return _result(body, _reservation_error(ErrorCode.SELLER_MAPPING_MISSING, *failure))
 
     if barcode == fixtures.AMBIGUOUS_BARCODE:
         # Два совпадения — это AMBIGUOUS, а не «берём первое» (раздел 3.2).
         return _result(body, _reservation_error(ErrorCode.AMBIGUOUS_PRODUCT_MAPPING, *failure))
 
-    if not fixtures.barcode_is_known(barcode):
+    product = state.product(seller, barcode)
+    if product is None:
         return _result(body, _reservation_error(ErrorCode.PRODUCT_MAPPING_MISSING, *failure))
 
-    product = fixtures.product_by_barcode(barcode) or {}
-    ledger_short = product.get("available", 0) < quantity
+    good = state.good_qty(seller, barcode)
+    ledger_short = good < quantity
 
-    if ledger_short and not fixtures.allows_ledger_short(seller):
+    if ledger_short and not state.allows_ledger_short(seller):
         return _result(body, _reservation_error(ErrorCode.INSUFFICIENT_STOCK, *failure))
 
     task = state.reserve(
@@ -182,7 +223,7 @@ async def reservations(request: Request) -> JSONResponse:
         # (раздел 6.5). Молчаливого _force_reservation больше нет.
         _emit("wms.stock.shortfall.v1", {
             "owner_id": task["owner_id"], "sku_id": task["sku_id"],
-            "cell_id": task["cell_id"], "qty_short": quantity - int(product.get("available", 0)),
+            "cell_id": task["cell_id"], "qty_short": quantity - max(0, good),
             "task_id": task["task_id"],
             # sequence сюда не кладём: контракт задаёт этому payload ровно пять
             # полей и additionalProperties: false (пункт 3 файла 01).
@@ -369,7 +410,8 @@ async def receipts(request: Request) -> JSONResponse:
     receipt = state.receive(
         seller_external_id=str(params.get("seller_external_id", "")),
         reference=str(params.get("reference", uid())),
-        lines=params.get("lines") or [])
+        lines=params.get("lines") or [],
+        seller_name=params.get("seller_name"), seller_inn=params.get("seller_inn"))
     return _result(body, receipt)
 
 
@@ -378,7 +420,7 @@ async def receipts_screen(request: Request) -> JSONResponse:
     body = await _body(request)
     return _result(body, {
         "open_receipts": state.open_receipts(),
-        "cells": fixtures.CELLS,
+        "cells": state.cells(),
         "discrepancy_kinds": ["shortage", "surplus", "mismatch", "damage"],
     })
 
@@ -389,8 +431,8 @@ async def putaway_screen(request: Request) -> JSONResponse:
     return _result(body, {
         "pending": state.pending_putaway(),
         # Порядок обхода — то, по чему сортируется лист подбора (раздел 4).
-        "cells": sorted(fixtures.CELLS, key=lambda c: (c["route_order"] is None,
-                                                       c["route_order"] or 0)),
+        "cells": sorted(state.cells(), key=lambda c: (c["route_order"] is None,
+                                                     c["route_order"] or 0)),
     })
 
 
@@ -515,9 +557,27 @@ async def label_print(task_id: str, request: Request) -> JSONResponse:
 
 @router.post("/wb/accounts")
 async def wb_accounts(request: Request) -> JSONResponse:
-    """Кабинеты WB. Значение токена не отдаётся никогда (инвариант 15)."""
+    """Кабинеты WB: перечисление и заведение.
+
+    Значение токена не принимается и не отдаётся никогда — только ссылка
+    secret_ref (инвариант 15, раздел 12).
+    """
     body = await _body(request)
-    return _result(body, {"accounts": fixtures.WB_ACCOUNTS})
+    params = _params(body)
+    created = None
+    if str(params.get("op", "list")) == "upsert" and params.get("external_id"):
+        account, was_created = state.register_wb_account(
+            str(params["external_id"]),
+            seller_external_id=params.get("seller_external_id"),
+            display_name=params.get("display_name"),
+            secret_ref=params.get("secret_ref"),
+            mode=params.get("mode"), status=params.get("status"),
+            token_type=params.get("token_type"),
+            wb_warehouse_id=params.get("wb_warehouse_id"))
+        created = was_created
+        if params.get("seller_external_id"):
+            state.register_owner(str(params["seller_external_id"]))
+    return _result(body, {"accounts": state.wb_accounts(), "created": created})
 
 
 @router.post("/wb/accounts/{account_id}/verify")

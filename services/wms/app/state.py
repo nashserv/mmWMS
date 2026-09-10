@@ -49,6 +49,31 @@ class MockState:
             self._returns: dict[str, dict[str, Any]] = {}
             self._shipments: list[dict[str, Any]] = []
             self.documents: list[dict[str, Any]] = []
+
+            # Реестры. Фикстуры — начальное наполнение, а не единственная
+            # правда: клиента, товар и кабинет заводят на ходу, и заведённое
+            # обязано быть видно резерву. Иначе happy-path недостижим ни для
+            # прогона, ни для потоков B и C.
+            self._owners: dict[str, dict[str, Any]] = {
+                seller["seller_external_id"]: dict(seller) for seller in fixtures.SELLERS
+            }
+            # Остаток в карточку товара не кладём: он живёт в _stock, и две
+            # копии одного числа однажды разойдутся молча.
+            self._products: dict[tuple[str, str], dict[str, Any]] = {
+                (product["seller_external_id"], product["barcode"]):
+                    {key: value for key, value in product.items() if key != "available"}
+                for product in fixtures.PRODUCTS
+            }
+            self._wb_accounts: dict[str, dict[str, Any]] = {
+                account["external_id"]: dict(account) for account in fixtures.WB_ACCOUNTS
+            }
+            self._cells: dict[str, dict[str, Any]] = {
+                cell["address"]: dict(cell) for cell in fixtures.CELLS
+            }
+            # Где лежит товар, у которого ещё нет своей коробки: заведённый
+            # документом адрес нужен событию о недостаче (раздел 6.5).
+            self._placement: dict[tuple[str, str], str] = {}
+
             self._stock: dict[tuple[str, str], int] = {
                 (product["seller_external_id"], product["barcode"]): int(product["available"])
                 for product in fixtures.PRODUCTS
@@ -57,6 +82,179 @@ class MockState:
 
     def ready(self) -> bool:
         return True
+
+    # ------------------------------------------------------------ реестры
+
+    def register_owner(self, seller_external_id: str, *, name: Any = None, inn: Any = None,
+                       allow_ledger_short: Any = None) -> dict[str, Any]:
+        """Заводит владельца товара. Идемпотентно по внешнему идентификатору.
+
+        Повторный вызов возвращает того же владельца, а не заводит второго
+        (инвариант 5). Заново присвоенный owner_id обесценил бы все уже
+        выпущенные события.
+        """
+        with self._lock:
+            existing = self._owners.get(seller_external_id)
+            if existing is not None:
+                if name is not None:
+                    existing["name"] = name
+                if inn is not None:
+                    existing["inn"] = inn
+                if allow_ledger_short is not None:
+                    existing["allow_ledger_short"] = bool(allow_ledger_short)
+                return dict(existing)
+
+            owner = {
+                "owner_id": uid(),
+                "seller_external_id": seller_external_id,
+                "name": name or seller_external_id,
+                "inn": inn,
+                # Клапан «собрать без остатка» по умолчанию включён: в первый
+                # день учёт где-то неверен, и вставшая смена гонит операторов
+                # в обход — ровно та беда, которую чиним (раздел 6.5).
+                "allow_ledger_short": True if allow_ledger_short is None
+                                      else bool(allow_ledger_short),
+            }
+            self._owners[seller_external_id] = owner
+            return dict(owner)
+
+    def owners(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(owner) for owner in self._owners.values()]
+
+    def owner_is_known(self, seller_external_id: str) -> bool:
+        with self._lock:
+            return seller_external_id in self._owners
+
+    def owner_id_of(self, seller_external_id: str) -> str | None:
+        with self._lock:
+            owner = self._owners.get(seller_external_id)
+            return owner["owner_id"] if owner else None
+
+    def allows_ledger_short(self, seller_external_id: str) -> bool:
+        with self._lock:
+            owner = self._owners.get(seller_external_id)
+            return bool(owner["allow_ledger_short"]) if owner else False
+
+    def register_product(self, seller_external_id: str, barcode: str, *,
+                         seller_sku: Any = None, name: Any = None) -> tuple[dict[str, Any], bool]:
+        """Заводит SKU у владельца. Идемпотентно по паре владелец + штрихкод.
+
+        Возвращает товар и признак того, что он заведён именно сейчас.
+        """
+        with self._lock:
+            key = (seller_external_id, barcode)
+            existing = self._products.get(key)
+            if existing is not None:
+                return dict(existing), False
+
+            product = {
+                "sku_id": uid(),
+                "seller_external_id": seller_external_id,
+                "barcode": barcode,
+                "seller_sku": seller_sku,
+                "name": name or barcode,
+            }
+            self._products[key] = product
+            self._stock.setdefault(key, 0)
+            return dict(product), True
+
+    def product(self, seller_external_id: str, barcode: str) -> dict[str, Any] | None:
+        with self._lock:
+            product = self._products.get((seller_external_id, barcode))
+            return dict(product) if product else None
+
+    def products(self, seller_external_id: Any = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = []
+            for key, product in self._products.items():
+                seller, _ = key
+                if seller_external_id and seller != seller_external_id:
+                    continue
+                # Наличие карточки не означает наличия вещи на полке, поэтому
+                # остаток подставляется из журнала, а не хранится в карточке.
+                rows.append({**product, "available": max(0, self._stock.get(key, 0))})
+            return rows
+
+    def good_qty(self, seller_external_id: str, barcode: str) -> int:
+        """Годный остаток. По нему решается, сработает ли клапан 6.5."""
+        with self._lock:
+            return self._stock.get((seller_external_id, barcode), 0)
+
+    def register_wb_account(self, external_id: str, **fields: Any) -> tuple[dict[str, Any], bool]:
+        """Заводит кабинет WB. Значение токена сюда не попадает никогда.
+
+        Принимается только secret_ref — ссылка на секрет (инвариант 15).
+        """
+        with self._lock:
+            existing = self._wb_accounts.get(external_id)
+            created = existing is None
+            account = existing or {"id": uid(), "external_id": external_id}
+            for key in ("seller_external_id", "display_name", "secret_ref",
+                        "mode", "status", "token_type", "wb_warehouse_id"):
+                if fields.get(key) is not None:
+                    account[key] = fields[key]
+            account.setdefault("mode", "shadow")
+            account.setdefault("status", "ACTIVE")
+            self._wb_accounts[external_id] = account
+            return dict(account), created
+
+    def wb_accounts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(account) for account in self._wb_accounts.values()]
+
+    def register_cell(self, address: str, *, route_order: Any = None,
+                      zone: str = "STOR") -> dict[str, Any]:
+        with self._lock:
+            existing = self._cells.get(address)
+            if existing is not None:
+                return dict(existing)
+            cell = {"cell_id": uid(), "address": address, "zone": zone,
+                    "route_order": route_order}
+            self._cells[address] = cell
+            return dict(cell)
+
+    def cells(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(cell) for cell in self._cells.values()]
+
+    def apply_document(self, *, seller_external_id: str, reference: str, doc_type: str,
+                       lines: list[dict[str, Any]], comment: Any = None) -> dict[str, Any]:
+        """Складской документ: заводит адреса и двигает остаток.
+
+        Начальный остаток при переключении клиента даёт владелец компании
+        (решение владельца 11), поэтому он заезжает документом, а не появляется
+        сам. Идемпотентно по reference (инвариант 5).
+        """
+        with self._lock:
+            for document in self.documents:
+                if document.get("reference") == reference:
+                    return dict(document)
+
+            applied = []
+            for line in lines:
+                barcode = str(line.get("barcode", ""))
+                if not barcode:
+                    continue
+                quantity = int(line.get("quantity", 0))
+                self.register_product(seller_external_id, barcode)
+                key = (seller_external_id, barcode)
+                self._stock[key] = self._stock.get(key, 0) + quantity
+
+                address = line.get("cell_address")
+                if address:
+                    cell = self.register_cell(str(address))
+                    self._placement[key] = cell["cell_id"]
+                applied.append({"barcode": barcode, "quantity": quantity,
+                                "cell_address": address})
+
+            document = {
+                "document_id": uid(), "reference": reference, "doc_type": doc_type,
+                "seller_external_id": seller_external_id, "comment": comment,
+                "state": "applied", "lines": applied, "created_at": now(),
+            }
+            self.documents.append(document)
+            return dict(document)
 
     def next_sequence(self, task_id: str) -> int:
         """Номер события в пределах задания.
@@ -79,7 +277,7 @@ class MockState:
             self._reserved[key] = self._reserved.get(key, 0) + quantity
             self._stock[key] = self._stock.get(key, 0) - quantity
 
-            product = fixtures.product_by_barcode(barcode) or {}
+            product = self._products.get(key) or {}
             task = {
                 "task_id": task_id,
                 "reservation_id": uid(),
@@ -87,14 +285,14 @@ class MockState:
                 "owner_external_id": seller_external_id,
                 # Настоящие UUID: контракт событий требует формат uuid, и
                 # заглушка обязана отдавать то, подо что пишутся консьюмеры.
-                "owner_id": fixtures.owner_id_of(seller_external_id),
+                "owner_id": self.owner_id_of(seller_external_id),
                 "sku_id": product.get("sku_id"),
                 "barcode": barcode,
                 "quantity": quantity,
                 "state": TaskState.RESERVED.value,
                 "wb_status": "new",
                 "deadline": deadline,
-                "cell_id": self._cell_for(barcode),
+                "cell_id": self._cell_for(seller_external_id, barcode),
                 "assignee": None,
                 "claim_expires_at": None,
                 "created_at": now(),
@@ -221,18 +419,29 @@ class MockState:
                 if not barcode or box.get("barcode_product") == barcode
             ]
 
-    def _cell_for(self, barcode: str) -> str | None:
-        """Идентификатор ячейки, а не её адрес: в событиях ездят UUID."""
+    def _cell_for(self, seller_external_id: str, barcode: str) -> str | None:
+        """Идентификатор ячейки, а не её адрес: в событиях ездят UUID.
+
+        Сначала коробка — фактическая единица адресации (раздел 2.9), затем
+        адрес, заданный документом. Без ячейки расхождение неадресно, и
+        инвентаризация не знает, куда идти.
+        """
         for box in self._boxes:
-            if box.get("barcode_product") == barcode:
+            if (box.get("barcode_product") == barcode
+                    and box.get("seller_external_id") == seller_external_id):
                 return box.get("cell_id")
-        return None
+        return self._placement.get((seller_external_id, barcode))
 
     # ------------------------------------------------------------ приёмка
 
     def receive(self, *, seller_external_id: str, reference: str,
-                lines: list[dict[str, Any]]) -> dict[str, Any]:
+                lines: list[dict[str, Any]], seller_name: Any = None,
+                seller_inn: Any = None) -> dict[str, Any]:
         with self._lock:
+            # Владельца, которого склад видит впервые, заводим по имени и ИНН
+            # (приложение C). Товар, пришедший впервые, — тоже: приёмка это
+            # первый момент, когда вещь вообще появляется на складе.
+            self.register_owner(seller_external_id, name=seller_name, inn=seller_inn)
             # Идемпотентность по reference (инвариант 5): повтор — тот же ответ,
             # а не вторая приёмка.
             if reference in self._receipts:
@@ -246,8 +455,12 @@ class MockState:
                 if actual is None:
                     continue
                 # Баланс двигается по факту, а не по ожиданию (шаг 3 прогона).
+                self.register_product(seller_external_id, barcode)
                 key = (seller_external_id, barcode)
                 self._stock[key] = self._stock.get(key, 0) + int(actual)
+                address = line.get("cell_address")
+                if address:
+                    self._placement[key] = self.register_cell(str(address))["cell_id"]
                 if expected is not None and int(actual) != int(expected):
                     discrepancies.append({
                         "barcode": barcode,

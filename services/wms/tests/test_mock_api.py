@@ -109,9 +109,123 @@ def test_ledger_short_reserves_and_leaves_a_trace(client: TestClient) -> None:
     assert len(sequences) == len(set(sequences)), f"номера событий повторяются: {sequences}"
 
 
+def test_a_client_registered_at_runtime_can_reserve(client: TestClient) -> None:
+    """Happy-path целиком: завели клиента, товар, остаток — резерв проходит.
+
+    Это путь шага 1 прогона. Пока маршруты только читали, заведённый на ходу
+    продавец не существовал для резерва, и любой вызов возвращал
+    SELLER_MAPPING_MISSING — весь прогон вставал на первом шаге, и потоки B и C
+    не могли пройти ни одного сценария против заглушки.
+    """
+    seller = "runtime-seller"
+    barcode = "4600000000017"
+
+    call(client, "/sellers", {"seller_external_id": seller, "name": "Клиент на ходу",
+                              "inn": "0000000000", "allow_ledger_short": True})
+    call(client, "/catalog/products/ensure", {
+        "seller_external_id": seller, "barcode": barcode, "name": "Товар на ходу"})
+    call(client, "/warehouse/documents", {
+        "seller_external_id": seller, "reference": "OPEN-1", "doc_type": "opening",
+        "comment": "начальный остаток от владельца компании",
+        "lines": [{"barcode": barcode, "quantity": 10, "cell_address": "FR-01-01"}]})
+
+    result = call(client, "/reservations", {
+        "seller_external_id": seller, "barcode": barcode, "quantity": 2,
+        "wb_order_id": 5501, "idempotency_key": "idem-5501", "correlation_id": "corr-5501"})
+
+    assert result["status"] == "reserved", result
+    assert result["owner_external_id"] == seller
+    assert result["error_code"] is None
+    # Остаток был — значит это обычный резерв, а не клапан раздела 6.5.
+    assert result["ledger_short"] is False
+
+
+def test_registering_a_client_twice_does_not_create_a_second_one(client: TestClient) -> None:
+    """Инвариант 5. Новый owner_id обесценил бы уже выпущенные события."""
+    first = call(client, "/sellers", {"seller_external_id": "twice", "name": "Первый"})
+    second = call(client, "/sellers", {"seller_external_id": "twice", "name": "Второй"})
+    assert first["seller"]["owner_id"] == second["seller"]["owner_id"]
+    assert sum(1 for owner in second["sellers"]
+               if owner["seller_external_id"] == "twice") == 1
+
+
+def test_opening_document_is_idempotent_by_reference(client: TestClient) -> None:
+    """Повторный документ — тот же ответ, а не второй начальный остаток."""
+    call(client, "/sellers", {"seller_external_id": "open-twice"})
+    call(client, "/catalog/products/ensure",
+         {"seller_external_id": "open-twice", "barcode": "4600000000024"})
+    params = {"seller_external_id": "open-twice", "reference": "OPEN-SAME",
+              "doc_type": "opening",
+              "lines": [{"barcode": "4600000000024", "quantity": 7,
+                         "cell_address": "FR-01-02"}]}
+    first = call(client, "/warehouse/documents", params)
+    second = call(client, "/warehouse/documents", params)
+    assert first["document_id"] == second["document_id"]
+
+    stocks = call(client, "/catalog/stocks/bulk",
+                  {"seller_external_id": "open-twice"})["stocks"]
+    assert [row["available"] for row in stocks if row["barcode"] == "4600000000024"] == [7]
+
+
+def test_a_sku_of_one_owner_is_invisible_to_another(client: TestClient) -> None:
+    """Изоляция владельца доходит до каталога (инвариант 6).
+
+    Одинаковый штрихкод у двух клиентов — это две разные вещи на полке.
+    """
+    call(client, "/sellers", {"seller_external_id": "owner-one"})
+    call(client, "/catalog/products/ensure",
+         {"seller_external_id": "owner-one", "barcode": "4600000000031"})
+    call(client, "/sellers", {"seller_external_id": "owner-two"})
+
+    result = call(client, "/reservations", {
+        "seller_external_id": "owner-two", "barcode": "4600000000031", "quantity": 1,
+        "wb_order_id": 5502, "correlation_id": "corr-5502"})
+    assert result["error_code"] == "PRODUCT_MAPPING_MISSING"
+
+
+def test_receipt_registers_an_owner_the_warehouse_sees_for_the_first_time(
+        client: TestClient) -> None:
+    """Приложение C: владельца заводят по seller_name и seller_inn.
+
+    Приёмка — первый момент, когда вещь вообще появляется на складе.
+    """
+    result = call(client, "/receipts", {
+        "seller_external_id": "brand-new", "warehouse_code": "RUM",
+        "reference": "RCP-NEW-1", "seller_name": "ИП Новый", "seller_inn": "1111111111",
+        "lines": [{"barcode": "4600000000048", "expected_qty": 4, "actual_qty": 4}]})
+    assert result["state"] == "accepted"
+
+    reserved = call(client, "/reservations", {
+        "seller_external_id": "brand-new", "barcode": "4600000000048", "quantity": 1,
+        "wb_order_id": 5503, "correlation_id": "corr-5503"})
+    assert reserved["status"] == "reserved", reserved
+
+
+def test_wb_account_upsert_keeps_the_token_out(client: TestClient) -> None:
+    """Инвариант 15: принимается ссылка на секрет, не его значение."""
+    result = call(client, "/wb/accounts", {
+        "op": "upsert", "external_id": "wb-new-1", "seller_external_id": "seller-a",
+        "display_name": "Новый кабинет", "secret_ref": "vault://mmx/stand/new",
+        "mode": "shadow", "status": "ACTIVE"})
+    assert result["created"] is True
+    account = next(a for a in result["accounts"] if a["external_id"] == "wb-new-1")
+    assert account["secret_ref"].startswith("vault://")
+    assert not {key.lower() for key in account} & {
+        "token", "api_key", "secret", "access_token", "authorization"}
+
+
 def test_valve_is_per_owner_not_global(client: TestClient) -> None:
-    """Раздел 6.5: клапан отключается на уровне владельца товара."""
-    result = reserve(client, fixtures.ZERO_STOCK_BARCODE, seller="seller-b")
+    """Раздел 6.5: клапан отключается на уровне владельца товара.
+
+    У seller-b он выключен, поэтому нехватка остатка — отказ, а не сборка в
+    минус. Товар заводим этому же владельцу: чужой SKU дал бы отказ маппинга,
+    а не проверку клапана (инвариант 6).
+    """
+    call(client, "/catalog/products/ensure", {
+        "seller_external_id": "seller-b", "barcode": "2000000000777",
+        "name": "Товар без остатка у seller-b"})
+
+    result = reserve(client, "2000000000777", seller="seller-b")
     assert result["error_code"] == "INSUFFICIENT_STOCK"
 
 
