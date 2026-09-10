@@ -1,0 +1,97 @@
+# Алерты стенда. Каждое правило — из раздела 10 мастера («критерии идеально»)
+# или из инварианта раздела 8. Правил без источника здесь нет.
+#
+# Главный урок боевого контура: мониторинг следил за портами, а не за работой
+# (раздел 3.5). Четыре воркера стояли Up с зелёным healthcheck и нулём строк
+# лога. Поэтому ниже нет ни одного правила вида «процесс жив».
+
+groups:
+
+  - name: wms-workers
+    rules:
+      # Инвариант 14: молчащий воркер считается сломанным.
+      - alert: WorkerSilent
+        expr: |
+          sum by (worker) (increase(mmx_wms_worker_processed_total[15m])) == 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Воркер {{ $labels.worker }} не обработал ничего за 15 минут"
+          description: >-
+            Ноль обработанных единиц. В боевом контуре так молчали
+            gateway-sync-worker, gateway-command-worker, catalog-stock-worker и
+            workstation-inbox-consumer — при этом healthcheck был зелёный.
+            Проверять работу, а не порт.
+
+  - name: wms-invariants
+    rules:
+      # Инвариант 10: расхождение с WB — состояние и алерт, а не тихая запись.
+      - alert: TasksDiverged
+        expr: mmx_wms_tasks_diverged > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Расхождение статуса с Wildberries: {{ $value }} заданий"
+          description: >-
+            Наш статус не сходится со статусом WB. В боевом контуре таких
+            заданий 2467 из 6374, и все они молчали. Это будит человека.
+
+      # Инвариант 12: сборка без остатка обязана быть видимой и счётной.
+      - alert: LedgerShortBurst
+        expr: increase(mmx_wms_stock_shortfall_total[1h]) > 10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Сборок без остатка за час: {{ $value }}"
+          description: >-
+            Клапан раздела 6.5 сработал больше десяти раз за час. Смена не
+            встала — это правильно, но учёт разошёлся с полкой, и инвентаризация
+            должна прийти по адресам из discrepancy(kind='ledger_short').
+
+      # Инвариант 4: удержание блокировки под 100 мс, и это измеряется.
+      - alert: LockHeldTooLong
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, operation) (rate(mmx_wms_lock_hold_seconds_bucket[5m]))) > 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p99 удержания блокировки {{ $labels.operation }} выше 100 мс"
+          description: >-
+            Скорее всего внутрь транзакции попал HTTP-вызов (инвариант 2).
+            Вызов WB на 500 мс внутри блокировки роняет пропускную способность
+            на три порядка.
+
+  - name: wms-criteria
+    rules:
+      # Раздел 10: нажатие «печать» → движение головки < 300 мс.
+      - alert: LabelPrintSlow
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(mmx_wms_label_print_duration_seconds_bucket[5m]))) > 0.3
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p99 печати этикетки выше 300 мс"
+          description: >-
+            Цель — меньше 300 мс от нажатия до движения головки. Сейчас
+            {{ $value | humanizeDuration }}. Проверить, что стикер берётся
+            локально, а не запрашивается у WB в момент упаковки.
+
+      # Инвариант 9: стикер лежит локально до того, как человек нажал печать.
+      - alert: LabelsNotPrefetched
+        expr: mmx_wms_labels_ready == 0 and sum(mmx_wms_tasks{state="reserved"}) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Есть зарезервированные задания, но ни одного готового стикера"
+          description: >-
+            Стикеры перестали тянуться заранее. Упаковщик будет ждать WB —
+            ровно та беда, которую чиним (раздел 6.6).
+
+      - alert: ServiceNotReady
+        expr: mmx_service_ready == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Сервис {{ $labels.service }} не готов"
