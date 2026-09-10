@@ -697,6 +697,7 @@ def finish_sync_with_cursor(cursor: Cursor, account_id: uuid.UUID, *, cursor_val
 
 def tasks_awaiting_labels(cursor: Cursor, *, limit: int = 100,
                           only_accounts: Sequence[str] | None = None,
+                          exclude_accounts: Sequence[Any] | None = None,
                           modes: Sequence[str] = ("live",)) -> list[dict[str, Any]]:
     """Задания, у которых ещё нет действующего стикера.
 
@@ -707,6 +708,11 @@ def tasks_awaiting_labels(cursor: Cursor, *, limit: int = 100,
     Режимы кабинета фильтруются вызывающим: запрос стикера — это запись в WB
     (он кладёт заказ в поставку), а в shadow писать нельзя. Что считать
     разрешённым, решает `wb.writes_allowed`, а не этот запрос.
+
+    `exclude_accounts` — кабинеты, которым сейчас не звонят: они только что
+    ответили отказом и стоят на паузе. Без этого кабинет, чьи заказы WB не
+    знает вовсе, набивает собой всю пачку и стикеры не достаются никому —
+    очередь встаёт головой.
     """
     cursor.execute(
         "SELECT t.id, t.wb_order_id, t.wb_account_id, t.owner_id, t.supply_id, "
@@ -718,9 +724,11 @@ def tasks_awaiting_labels(cursor: Cursor, *, limit: int = 100,
         "   AND l.id IS NULL "
         "   AND a.mode = ANY(%(modes)s) AND a.status = 'ACTIVE' "
         "   AND (%(only)s::text[] IS NULL OR a.external_id = ANY(%(only)s)) "
+        "   AND (%(skip)s::uuid[] IS NULL OR NOT (t.wb_account_id = ANY(%(skip)s))) "
         " ORDER BY t.deadline NULLS LAST, t.created_at "
         " LIMIT %(limit)s",
         {"limit": limit, "only": list(only_accounts) if only_accounts else None,
+         "skip": list(exclude_accounts) if exclude_accounts else None,
          "modes": list(modes)})
     return cursor.fetchall()
 

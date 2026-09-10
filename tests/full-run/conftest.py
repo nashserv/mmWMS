@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Any, Iterator
 
 import pytest
@@ -113,20 +114,82 @@ def tidy_stand(wms: Wms, db: Db) -> Iterator[None]:
     все прогоны станут аккуратными.
     """
     _cancel_leftovers(wms, db, "до прогона")
+    _wait_for_the_cabinet_limit(db)
     yield
     _cancel_leftovers(wms, db, "после прогона")
 
 
+def _wait_for_the_cabinet_limit(db: Db) -> None:
+    """Ждёт, пока освободится окно ограничителя кабинета прогона.
+
+    Нагрузочный шаг 16 заводит около 160 заданий за двадцать секунд, и каждое
+    движение публикует остаток — это сотни вызовов в один кабинет при лимите
+    Wildberries 300 в минуту (приложение D). Ограничитель честно придерживает
+    очередь, ровно как описано в разделе 6.4, и кабинет остаётся закрытым до
+    конца минуты.
+
+    Для самого прогона это значит, что два запуска подряд не проходят: шаг 4
+    ждёт задания две секунды, а опрос кабинета в это время отбит лимитом.
+    Поэтому прогон дожидается свободного окна ДО начала — так же, как
+    разбирает за собой незакрытые задания. Окно не сбрасывается: сброс
+    ограничителя спрятал бы ровно то поведение, ради которого он есть.
+    """
+    from scenario import WB_ACCOUNT
+
+    # Сколько кабинет должен оставаться свободным, прежде чем считать окно
+    # устоявшимся.
+    settle_s = 3.0
+
+    # Публикация остатка уходит фоново, вне транзакции (инвариант 2), поэтому
+    # отмены, сделанные уборкой, догорают уже после неё. Ждём не «сейчас
+    # свободно», а «свободно и остаётся свободным»: иначе прогон стартует в
+    # промежутке, а блокировка приезжает через полсекунды — и краснеет шаг 4.
+    deadline = time.monotonic() + 120
+    clear_since = None
+    warned = False
+    while time.monotonic() < deadline:
+        try:
+            # Придержать кабинет могут с двух сторон: наш ограничитель
+            # (`wb_rate_limit.blocked_until`) и сам Wildberries, ответивший 429
+            # — тогда опросчик отодвигает `next_sync_at` и ставит кабинету
+            # статус RATE_LIMITED. Ждать надо обе.
+            blocked = db.value(
+                "SELECT GREATEST( "
+                "         COALESCE(MAX(EXTRACT(EPOCH FROM (rl.blocked_until - now()))), 0), "
+                "         COALESCE(MAX(EXTRACT(EPOCH FROM (a.next_sync_at - now()))), 0)) AS s "
+                "  FROM wb_account a "
+                "  LEFT JOIN wb_rate_limit rl ON rl.account_id = a.id "
+                " WHERE a.external_id = %s "
+                "   AND (rl.blocked_until > now() "
+                "        OR (a.sync_error_code IS NOT NULL AND a.next_sync_at > now()))",
+                (WB_ACCOUNT,))
+        except Exception:  # noqa: BLE001 — ожидание не имеет права ронять прогон
+            return
+        if not blocked or float(blocked) <= 0:
+            if clear_since is None:
+                clear_since = time.monotonic()
+            if time.monotonic() - clear_since >= settle_s:
+                return
+            time.sleep(0.5)
+            continue
+        clear_since = None
+        if not warned:
+            print(f"\nкабинет {WB_ACCOUNT} придержан ограничителем — жду окно "
+                  f"({float(blocked):.0f} с); это след прошлого прогона, не поломка")
+            warned = True
+        time.sleep(2)
+
+
 def _cancel_leftovers(wms: Wms, db: Db, when: str) -> None:
-    """Снять незакрытые задания клиента прогона. Тихо: это уборка, не проверка."""
-    from scenario import SELLER
+    """Снять незакрытые задания клиентов прогона. Тихо: это уборка, не проверка."""
+    from scenario import LOAD_SELLER, SELLER
 
     try:
         rows = db.rows(
             "SELECT t.id FROM wms_task t JOIN owner o ON o.id = t.owner_id "
-            " WHERE o.seller_external_id = %s "
+            " WHERE o.seller_external_id = ANY(%s) "
             "   AND t.state IN ('new', 'reserved', 'picking', 'picked') "
-            " ORDER BY t.created_at LIMIT 2000", (SELLER,))
+            " ORDER BY t.created_at LIMIT 5000", ([SELLER, LOAD_SELLER],))
     except Exception:  # noqa: BLE001 — уборка не имеет права ронять прогон
         return
 

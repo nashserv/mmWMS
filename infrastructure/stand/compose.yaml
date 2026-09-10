@@ -195,6 +195,13 @@ services:
       WB_STICKER_FORMAT: ${WB_STICKER_FORMAT:-zplv}
       WB_SYNC_ONLY_ACCOUNTS: ${WB_SYNC_ONLY_ACCOUNTS:-}
       WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
+      # Период опроса кабинета. Полсекунды — это 120 запросов в минуту на
+      # кабинет из 300 разрешённых (приложение D): сорок процентов бюджета
+      # уходит на опрос, и на стикеры, поставки и публикацию остатка остаётся
+      # меньше, чем нужно. Секунда укладывается в критерий раздела 10
+      # («WB → доступность меньше 2 с, p99») с запасом вдвое и оставляет
+      # бюджет работе.
+      WB_SYNC_INTERVAL_SECONDS: ${WB_SYNC_INTERVAL_SECONDS:-1.0}
     command: ["python", "-m", "app.workers.wb_sync"]
 
   # Стикеры заранее, пачкой до 100 (раздел 6.6).

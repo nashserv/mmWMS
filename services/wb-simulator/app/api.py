@@ -46,7 +46,13 @@ class Simulator:
             self._cards: dict[str, list[dict[str, Any]]] = {}
             self._next_nm_id = 170000001
             self._calls: dict[str, list[float]] = {}
-            self._next_order_id = 900001
+            # Идентификатор заказа не должен повторяться между перезапусками.
+            # Счётчик с фиксированного числа выдавал бы те же номера, что уже
+            # лежат в Postgres от прошлых прогонов, и опросчик отсеивал бы
+            # свежие заказы как уже известные (`known_orders`): задания не
+            # заводятся, остаток не двигается, а шаг 4 краснеет «good не упал».
+            # У настоящего Wildberries номера сквозные, поэтому берём время.
+            self._next_order_id = 900_000_000 + int(time.time()) % 90_000_000
             self._next_supply = 1
 
     # Лимит считается по кабинету, а не глобально: у WB он именно такой.
@@ -118,8 +124,19 @@ class Simulator:
 
     def orders(self, account: str, next_cursor: int) -> tuple[list[dict[str, Any]], int]:
         with self._lock:
-            rows = [o for o in self._orders if o["account"] == account][next_cursor:]
-            return rows, next_cursor + len(rows)
+            rows = [o for o in self._orders if o["account"] == account]
+            # Курсор из прошлой жизни симулятора обнуляем. Симулятор держит
+            # заказы в памяти, а `wb_sync_cursor` лежит в Postgres и переживает
+            # его перезапуск: после `docker compose up --build wb-simulator`
+            # клиент просит «с 185-го», заказов пять, и он навсегда получает
+            # пустой ответ. Настоящий Wildberries память не теряет, поэтому у
+            # него такого не бывает; симулятор существует ради
+            # воспроизводимости стенда, и терять её на своём же перезапуске
+            # ему нельзя.
+            if next_cursor > len(rows):
+                next_cursor = 0
+            page = rows[next_cursor:]
+            return page, next_cursor + len(page)
 
     def create_supply(self, account: str) -> str:
         with self._lock:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 from collections import defaultdict
 from typing import Any, Sequence
 
@@ -36,6 +37,13 @@ log = logging.getLogger("wms.wb_labels")
 
 STICKER_FORMAT = (os.getenv("WB_STICKER_FORMAT") or "zplv").strip().lower()
 BATCH = min(int(os.getenv("WB_LABEL_BATCH", str(STICKER_BATCH))), STICKER_BATCH)
+
+# Пауза кабинету после отказа Wildberries: 2 с, удваивается на каждом отказе
+# подряд, не больше минуты. Первый отказ может быть случайностью, десятый —
+# нет, и звонить в него каждые полсекунды значит выбирать лимит кабинета
+# впустую и заслонять собой все остальные (раздел 6.4).
+FAILURE_BACKOFF_S = 2.0
+FAILURE_BACKOFF_MAX_S = 60.0
 IDLE_SECONDS = float(os.getenv("WB_LABEL_IDLE_SECONDS", "0.5"))
 
 
@@ -46,13 +54,22 @@ class WbLabelWorker:
         self._pool = pool
         self._only = list(only_accounts) if only_accounts else _configured_accounts()
         self._format = (sticker_format or STICKER_FORMAT)
+        # Кабинеты на паузе: когда можно звонить снова. Кабинет, чьих заказов
+        # Wildberries не знает (заказ отменён у WB, кабинет перепутан), отвечает
+        # отказом на каждый вызов. Без паузы его задания набивают собой всю
+        # пачку, и стикеры перестают доставаться всем остальным — очередь
+        # встаёт головой. Пауза растёт с числом отказов подряд.
+        self._cooldown: dict[Any, float] = {}
+        self._failures: dict[Any, int] = {}
 
     def tick(self) -> int:
+        now = time.monotonic()
+        paused = [account_id for account_id, until in self._cooldown.items() if until > now]
         with self._pool.connection() as connection:
             with single(connection) as cursor:
                 pending = repo.tasks_awaiting_labels(
                     cursor, limit=BATCH, only_accounts=self._only,
-                    modes=_writable_modes())
+                    exclude_accounts=paused, modes=_writable_modes())
         if not pending:
             return 0
 
@@ -82,7 +99,15 @@ class WbLabelWorker:
                     sticker_format=self._format)
         except (WbError, SecretUnavailable) as failure:
             LABELS_FETCHED.labels(format=self._format, outcome="error").inc(len(tasks))
-            log.warning("кабинет %s: стикеры не получены (%s)", account_external, failure)
+            # Пауза с ростом: 2, 4, 8… до минуты. Повторять один и тот же
+            # отказ каждые полсекунды бессмысленно и вредно — этим кабинет
+            # выбирает лимит и заслоняет остальные.
+            failures = self._failures.get(account_id, 0) + 1
+            self._failures[account_id] = failures
+            wait = min(FAILURE_BACKOFF_MAX_S, FAILURE_BACKOFF_S * (2 ** (failures - 1)))
+            self._cooldown[account_id] = time.monotonic() + wait
+            log.warning("кабинет %s: стикеры не получены (%s), пауза %.0f с (отказов подряд %d)",
+                        account_external, failure, wait, failures)
             return 0
 
         by_order = {sticker.wb_order_id: sticker for sticker in stickers}
@@ -98,6 +123,9 @@ class WbLabelWorker:
                         checksum=hashlib.sha256(sticker.payload).hexdigest(),
                         label_format=self._format)
                     saved += 1
+        # Получилось — пауза снимается.
+        self._failures.pop(account_id, None)
+        self._cooldown.pop(account_id, None)
         LABELS_FETCHED.labels(format=self._format, outcome="ok").inc(saved)
         if saved:
             log.info("кабинет %s: стикеров получено %d из %d заданий",
