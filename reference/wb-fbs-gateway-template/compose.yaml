@@ -1,0 +1,70 @@
+services:
+  gateway:
+    build: .
+    environment:
+      APP_ENV: development
+      WB_ADAPTER: fake
+      ACCOUNT_STORAGE_BACKEND: postgres
+      DATABASE_URL: postgresql://wb_gateway:change-me@postgres:5432/wb_gateway
+      IDEMPOTENCY_HASH_KEY: ${WB_IDEMPOTENCY_HASH_KEY:-development-only-idempotency-key}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-development-only-service-token}
+      CALLBACK_SHARED_TOKEN: ${CALLBACK_SHARED_TOKEN:-development-only-callback-token}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      SECRET_PROVIDER: vault
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-development-only-not-a-production-secret}
+      WB_CLIENT_SECRET_FILE: /run/secrets/wb_client_secret
+    secrets: [wb_client_secret]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      vault: {condition: service_healthy}
+      redis: {condition: service_started}
+      minio: {condition: service_started}
+    ports: ["127.0.0.1:8080:8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  migrate:
+    image: postgres:16.8-bookworm
+    restart: "no"
+    depends_on: {postgres: {condition: service_healthy}}
+    environment:
+      DATABASE_URL: postgresql://wb_gateway:change-me@postgres:5432/wb_gateway
+      EXTRA_MIGRATIONS: /migrations/001_initial.sql /migrations/002_wb_connection_lifecycle.sql /migrations/003_durable_fbs_workflow.sql /migrations/004_wms_event_sequence.sql /migrations/005_wb_sync_scheduler.sql /migrations/006_wb_shipment_compatibility.sql /migrations/007_wb_lifecycle_reconciliation.sql /migrations/008_account_scoped_reads.sql /migrations/009_pre_account_rate_limits.sql
+    volumes:
+      - ../../infrastructure/integration/migrate.sh:/migrate.sh:ro
+      - ./migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+  postgres:
+    image: postgres:16.8-bookworm
+    environment: {POSTGRES_DB: wb_gateway, POSTGRES_USER: wb_gateway, POSTGRES_PASSWORD: change-me}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U wb_gateway -d wb_gateway"], interval: 10s, timeout: 5s, retries: 5}
+  redis:
+    image: redis:7.4.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis-data:/data]
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment: {MINIO_ROOT_USER: local-minio, MINIO_ROOT_PASSWORD: local-minio-change-me}
+    volumes: [minio-data:/data]
+  vault:
+    image: hashicorp/vault:1.18.3
+    cap_add: [IPC_LOCK]
+    environment: {VAULT_DEV_ROOT_TOKEN_ID: "${VAULT_DEV_ROOT_TOKEN_ID:-development-only-not-a-production-secret}", VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200}
+    command: ["vault", "server", "-dev"]
+    healthcheck:
+      test: ["CMD-SHELL", "VAULT_ADDR=http://127.0.0.1:8200 vault status >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+volumes: {postgres-data: {}, redis-data: {}, minio-data: {}}
+secrets:
+  # FakeWB does not consume this value. Override the path when exercising a
+  # BASIC/SERVICE token against an explicitly approved non-production account.
+  wb_client_secret:
+    file: ${WB_CLIENT_SECRET_PATH:-/dev/null}

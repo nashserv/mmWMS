@@ -11,6 +11,10 @@
    - **[docs/03-stream-b-picker-app.md](docs/03-stream-b-picker-app.md)** → ветка `stream-b`
    - **[docs/04-stream-c-billing-accounts.md](docs/04-stream-c-billing-accounts.md)** → ветка `stream-c`
 
+## Справочные материалы
+
+- **[reference/wb-fbs-gateway-template/](reference/wb-fbs-gateway-template/)** — шаблон сервиса, снятый read-only с боевого `wb-fbs-gateway` (Dockerfile, зависимости, конфиг тестов, паттерны config/metrics/secrets). Для потока 0, пункт 8. Только чтение, не собирать.
+
 ## Стенд
 
 Сервер `151.245.140.225` (8 vCPU / 32 ГБ / 240 ГБ NVMe, Ubuntu 24.04, Docker). Доступ только по SSH-ключу, пароль root отключён. Реквизиты — приложение F в `docs/00-master-context.md`.
