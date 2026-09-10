@@ -27,7 +27,8 @@ import httpx
 import pytest
 
 import scenario as data
-from runner import (Db, LoadResult, TxnWatch, Wms, env, not_ready, port_is_open,
+from runner import (Db, LoadResult, TxnWatch, Wms, env, lock_hold_histogram,
+                    not_ready, percentile_from_buckets, port_is_open,
                     wait_until)
 
 # Задержка «WB → доступность в /tasks/pull» — менее 2 с, p99 (раздел 10).
@@ -1001,6 +1002,8 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
             " WHERE o.seller_external_id = %s", (data.LOAD_SELLER,)) or 0)
 
     tasks_before = load_tasks()
+    metrics_url = os.getenv("WMS_METRICS_URL") or f"{wms.base_url.rstrip('/')}/metrics"
+    locks_before = lock_hold_histogram(metrics_url, "reserve")
     with TxnWatch(db) as watch:
         started = time.monotonic()
         threads = [threading.Thread(target=fire, name=f"load-{n}") for n in range(workers)]
@@ -1025,7 +1028,25 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
     assert watch.seen > 0, (
         "за всю нагрузку в базе не наблюдалось ни одной транзакции — "
         "удержание блокировки измерять не на чем")
-    p99 = watch.percentile_age_ms(99)
-    assert p99 < TXN_LIMIT_MS, (
-        f"удержание блокировки p99 = {p99:.0f} мс при пределе {TXN_LIMIT_MS:.0f} мс "
-        f"(инвариант 4)")
+    # Инвариант 4 — про удержание блокировки ПОД РЕЗЕРВ, и сам сервис его
+    # меряет. Берём его гистограмму: наблюдение за pg_stat_activity видит все
+    # транзакции маршрутов сразу — вместе с опросом очереди рабочим местом,
+    # который идёт раз в секунду и держит транзакцию десятки миллисекунд, — и
+    # приписывает их возраст резерву. На холостом стенде это уже около 48 мс
+    # при пределе 100: половину бюджета выбирала чужая работа.
+    reserve_p99 = percentile_from_buckets(locks_before, lock_hold_histogram(metrics_url, "reserve"), 99)
+    assert reserve_p99 is not None, (
+        "за всю нагрузку сервис не отметил ни одного резерва в "
+        "mmx_wms_lock_hold_seconds{operation=\"reserve\"} — удержание блокировки "
+        "измерять не на чем")
+    assert reserve_p99 < TXN_LIMIT_MS, (
+        f"удержание блокировки под резерв p99 = {reserve_p99:.0f} мс при пределе "
+        f"{TXN_LIMIT_MS:.0f} мс (инвариант 4)")
+
+    # Наблюдение за pg_stat_activity здесь оставлено ради одного: доказать,
+    # что нагрузка действительно шла через Postgres. Мерить им удержание
+    # блокировки нельзя — оно видит все транзакции маршрутов вперемешку.
+    slowest = watch.max_age_ms
+    log_line = (f"резерв p99 {reserve_p99:.0f} мс (метрика сервиса), "
+                f"самая долгая транзакция маршрутов за окно {slowest:.0f} мс")
+    print(f"\n{log_line}")

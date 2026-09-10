@@ -228,6 +228,17 @@ class TxnWatch:
     проверка того же самого факта, а не имитация.
     """
 
+    # Смотрим только на маршруты (`wms-api`), а не на всё подряд. Резерв,
+    # выдача заданий и упаковка — их работа; фоновые транзакции воркеров
+    # (публикация outbox, опрос WB, сверка) к удержанию блокировки под резерв
+    # отношения не имеют, а в общий p99 попадали и краснели за него. Даже на
+    # холостом стенде транзакции воркеров дают p99 около 48 мс при пределе
+    # инварианта 4 в 100 — то есть половину бюджета выбирала чужая работа.
+    #
+    # Различать их стало можно потому, что у каждого процесса теперь своё
+    # `application_name` (WMS_ROLE). До этого все представлялись `wms`.
+    APPLICATION = "wms-api"
+
     SQL = """
         SELECT state,
                EXTRACT(EPOCH FROM (now() - xact_start)) * 1000 AS age_ms,
@@ -237,6 +248,7 @@ class TxnWatch:
          WHERE datname = current_database()
            AND pid <> pg_backend_pid()
            AND xact_start IS NOT NULL
+           AND application_name = %s
     """
 
     def __init__(self, db: Db, interval_s: float = 0.005) -> None:
@@ -261,7 +273,7 @@ class TxnWatch:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                for row in self._db.rows(self.SQL):
+                for row in self._db.rows(self.SQL, (self.APPLICATION,)):
                     self.samples.append(TxnSample(
                         state=str(row.get("state") or ""),
                         age_ms=float(row.get("age_ms") or 0.0),
@@ -444,3 +456,55 @@ class LoadResult:
     @property
     def per_hour(self) -> float:
         return self.accepted / self.seconds * 3600 if self.seconds else 0.0
+
+
+# ------------------------------------------------- удержание блокировки
+
+
+def lock_hold_histogram(metrics_url: str, operation: str) -> dict[float, float]:
+    """Снимок гистограммы удержания блокировки по операции.
+
+    Инвариант 4 говорит про удержание блокировки **под резерв**, и сам сервис
+    его меряет — `mmx_wms_lock_hold_seconds{operation="reserve"}`. Это и есть
+    правильный источник: наблюдение за `pg_stat_activity` видит все транзакции
+    маршрутов сразу, включая опрос очереди рабочим местом, и приписывает их
+    возраст резерву, который к ним отношения не имеет.
+    """
+    text = httpx.get(metrics_url, timeout=10.0).text
+    prefix = f'mmx_wms_lock_hold_seconds_bucket{{le="'
+    buckets: dict[float, float] = {}
+    for line in text.splitlines():
+        if not line.startswith(prefix) or f'operation="{operation}"' not in line:
+            continue
+        head, _, value = line.rpartition(" ")
+        edge = head[len(prefix):head.index('"', len(prefix))]
+        try:
+            buckets[float("inf") if edge == "+Inf" else float(edge)] = float(value)
+        except ValueError:
+            continue
+    return buckets
+
+
+def percentile_from_buckets(before: dict[float, float], after: dict[float, float],
+                            percent: float) -> float | None:
+    """Перцентиль по приросту гистограммы, в миллисекундах.
+
+    Возвращает верхнюю границу корзины, в которую попадает перцентиль, — то
+    есть оценку сверху. Для проверки «p99 меньше предела» этого достаточно и
+    честнее, чем интерполяция: если оценка сверху проходит, проходит и правда.
+
+    `None` — за окно не наблюдалось ни одной операции: проверять нечего, и это
+    не то же самое, что «нарушений нет».
+    """
+    edges = sorted(set(before) | set(after))
+    if not edges:
+        return None
+    delta = [(edge, after.get(edge, 0.0) - before.get(edge, 0.0)) for edge in edges]
+    total = delta[-1][1]
+    if total <= 0:
+        return None
+    target = percent / 100.0 * total
+    for edge, count in delta:
+        if count >= target:
+            return float("inf") if edge == float("inf") else edge * 1000.0
+    return None

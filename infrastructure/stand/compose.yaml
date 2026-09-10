@@ -143,6 +143,9 @@ services:
       rabbitmq-init: {condition: service_completed_successfully}
     environment:
       APP_ENV: development
+      # Как процесс представляется Postgres: по этому имени в pg_stat_activity
+      # видно, чья транзакция. Без него маршрут и воркеры неразличимы.
+      WMS_ROLE: api
       # Поток A слит — стенд поднимает настоящий сервис. Заглушка никуда не
       # делась: тот же образ поднимает её по WMS_MOCK=true, и вернуться к ней
       # можно переменной, а не пересборкой (правило 9.5.4).
@@ -202,6 +205,7 @@ services:
       # («WB → доступность меньше 2 с, p99») с запасом вдвое и оставляет
       # бюджет работе.
       WB_SYNC_INTERVAL_SECONDS: ${WB_SYNC_INTERVAL_SECONDS:-1.0}
+      WMS_ROLE: wb-sync
     command: ["python", "-m", "app.workers.wb_sync"]
 
   # Стикеры заранее, пачкой до 100 (раздел 6.6).
@@ -209,6 +213,7 @@ services:
     <<: *wms-worker
     environment:
       <<: *wms-worker-env
+      WMS_ROLE: wb-labels
     command: ["python", "-m", "app.workers.wb_labels"]
 
   # Сверка статусов с WB. Читает только GET /api/v3/orders, поэтому работает
@@ -217,6 +222,7 @@ services:
     <<: *wms-worker
     environment:
       <<: *wms-worker-env
+      WMS_ROLE: wb-reconcile
     command: ["python", "-m", "app.workers.wb_reconcile"]
 
   # События из outbox в шину, плюс партиции и ретеншен. На проде
@@ -225,6 +231,7 @@ services:
     <<: *wms-worker
     environment:
       <<: *wms-worker-env
+      WMS_ROLE: outbox
     command: ["python", "-m", "app.workers.outbox_publisher"]
 
   wb-simulator:

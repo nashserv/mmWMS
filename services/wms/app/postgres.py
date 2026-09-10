@@ -32,6 +32,16 @@ RETRYABLE_SQLSTATES = frozenset({
 class PoolClosed(RuntimeError):
     """Пул остановлен, соединение выдать нельзя."""
 
+def application_name() -> str:
+    """Как процесс представляется Postgres.
+
+    `WMS_ROLE` задаётся на процесс: `api` у маршрутов, имя воркера у воркеров.
+    Без него — `wms`, как было.
+    """
+    role = (os.getenv("WMS_ROLE") or "").strip()
+    return f"wms-{role}" if role else "wms"
+
+
 
 class ConnectionPool:
     """Ограниченный пул синхронных соединений.
@@ -56,10 +66,19 @@ class ConnectionPool:
         connection = psycopg.connect(
             self._dsn, autocommit=False, row_factory=dict_row,
             connect_timeout=self._connect_timeout)
-        # Идентификатор приложения виден в pg_stat_activity — по нему прогон
-        # отличает наши транзакции от чужих (шаги 4 и 16).
+        # Идентификатор приложения виден в pg_stat_activity — по нему видно,
+        # ЧЬЯ это транзакция. Имя у каждого процесса своё: до этого и маршрут,
+        # и все четыре воркера представлялись одинаково `wms`, и отличить
+        # удержание блокировки резервом от фоновой транзакции публикатора
+        # outbox было нечем — шаг 16 прогона мерил инвариант 4 вперемешку с
+        # чужой работой и краснел на ней. Тот же вопрос «чья это транзакция»
+        # не имел ответа и в бою (раздел 3.5).
         with connection.cursor() as cursor:
-            cursor.execute("SET application_name = 'wms'")
+            # `SET` параметров не принимает, поэтому через set_config: имя
+            # роли приходит из окружения, и подставлять его в текст запроса
+            # руками не нужно.
+            cursor.execute("SELECT set_config('application_name', %s, false)",
+                           (application_name(),))
         connection.commit()
         return connection
 
