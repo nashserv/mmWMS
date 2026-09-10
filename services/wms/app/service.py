@@ -158,7 +158,19 @@ class WmsService:
                                 correlation_id=correlation_id, aggregate=order_aggregate,
                                 seller=seller)
 
-        owner = repo.find_owner(cursor, seller)
+        owner = repo.find_owner(cursor, seller) if seller else None
+        account_hint = repo.find_account(
+            cursor, external_id=_text(params.get("wb_account_external_id")))
+        if not seller and account_hint is not None:
+            # Продавца в запросе не назвали, но назвали кабинет. Владельца
+            # определяет кабинет: задание пришло именно из него, и гадать тут
+            # не о чем. Так зовёт резерв внутренний опросчик WB.
+            #
+            # Подставлять кабинет вместо НАЗВАННОГО, но неизвестного продавца
+            # нельзя ни при каких условиях: это отгрузка чужой вещи по чужому
+            # заказу (инвариант 6). Названный и не найденный — всегда отказ.
+            owner = repo.owner_by_id(cursor, account_hint["owner_id"])
+            seller = owner["seller_external_id"] if owner else seller
         if owner is None or not owner["active"]:
             # Владельца нет — задания тоже не будет: owner_id в схеме NOT NULL,
             # и приписать чужой товар первому попавшемуся клиенту нельзя
@@ -168,10 +180,7 @@ class WmsService:
                                 quantity=quantity, correlation_id=correlation_id,
                                 aggregate=order_aggregate, seller=seller)
 
-        account = repo.find_account(
-            cursor, external_id=_text(params.get("wb_account_external_id")))
-        if account is None:
-            account = repo.sole_account_of_owner(cursor, owner["id"])
+        account = account_hint or repo.sole_account_of_owner(cursor, owner["id"])
         if account is None or account["owner_id"] != owner["id"]:
             # Кабинет чужой или неизвестен. Это тоже разрыв связки
             # «продавец ↔ кабинет», поэтому код тот же: другого в приложении C нет.

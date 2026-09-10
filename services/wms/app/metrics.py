@@ -102,3 +102,41 @@ def refresh_runtime_metrics(state: Any) -> None:
 def prometheus_payload(state: Any) -> tuple[bytes, str]:
     refresh_runtime_metrics(state)
     return generate_latest(), CONTENT_TYPE_LATEST
+
+
+# --- Опрос Wildberries -----------------------------------------------------
+# Критерий раздела 10: задержка «WB → доступность в /tasks/pull» под 2 с, p99.
+# Сегодня она не измеряется вовсе, и «иногда заказы не приходят» нечем ни
+# подтвердить, ни опровергнуть.
+
+WB_SYNC_LAST_SUCCESS = Gauge(
+    "mmx_wb_sync_last_success_unixtime",
+    "Most recent successful WB account synchronization timestamp.",
+)
+WB_SYNC_LAG = Histogram(
+    "mmx_wms_wb_sync_duration_seconds",
+    "Duration of one WB account synchronization cycle.",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
+WB_CALLS = Counter(
+    "mmx_wms_wb_calls_total",
+    "Calls to Wildberries by operation and outcome.",
+    ("operation", "outcome"),
+)
+# Инвариант 7: публикация остатка уходит сразу после движения, без таймеров.
+STOCK_PUSH = Counter(
+    "mmx_wms_stock_push_total",
+    "Stock publications sent to Wildberries.",
+    ("outcome",),
+)
+STOCK_PUSH_DELAY = Histogram(
+    "mmx_wms_stock_push_delay_seconds",
+    "Delay between the stock movement and the publication call leaving.",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+)
+# Инвариант 9: стикер лежит локально до того, как человек нажал печать.
+LABELS_FETCHED = Counter(
+    "mmx_wms_labels_fetched_total",
+    "Labels pre-fetched from Wildberries.",
+    ("format", "outcome"),
+)

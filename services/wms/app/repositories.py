@@ -536,3 +536,156 @@ def mark_failed(cursor: Cursor, rows: Iterable[tuple[int, Any, str]]) -> None:
         "UPDATE outbox SET attempts = attempts + 1, last_error = %s "
         " WHERE id = %s AND occurred_at = %s",
         [(error[:500], row_id, occurred_at) for row_id, occurred_at, error in payload])
+
+
+# --------------------------------------------------- лизинг опроса кабинетов
+
+def lease_accounts(cursor: Cursor, *, limit: int = 8, lease_seconds: int = 120,
+                   modes: Sequence[str] = ("shadow", "live"),
+                   only: Sequence[str] | None = None) -> list[dict[str, Any]]:
+    """Занимает кабинеты под опрос.
+
+    Паттерн лизинга перенесён из существующего шлюза как есть (файл 02: он
+    написан хорошо, переносить как есть): `sync_claimed_at`, `sync_attempts`,
+    `next_sync_at`. Смысл — два опросчика не должны бить в один кабинет: лимит
+    у Wildberries общий на кабинет, и вдвоём они выберут его вдвое быстрее.
+
+    SKIP LOCKED, а не ожидание: занятый кабинет опросит тот, кто его занял.
+    """
+    cursor.execute(
+        "WITH due AS ("
+        "    SELECT id FROM wb_account "
+        "     WHERE status IN ('ACTIVE', 'RATE_LIMITED') "
+        "       AND mode = ANY(%(modes)s) "
+        # Переключение на новую WMS идёт по одному кабинету, не пачкой
+        # (раздел 11, шаг 6), и откат обязан быть возможен за минуту.
+        # Пустой список означает «все», а не «ни одного».
+        "       AND (%(only)s::text[] IS NULL OR external_id = ANY(%(only)s)) "
+        "       AND (next_sync_at IS NULL OR next_sync_at <= now()) "
+        "       AND (sync_claimed_at IS NULL "
+        "            OR sync_claimed_at < now() - make_interval(secs => %(lease)s)) "
+        "     ORDER BY next_sync_at NULLS FIRST "
+        "     LIMIT %(limit)s FOR UPDATE SKIP LOCKED) "
+        "UPDATE wb_account a SET sync_claimed_at = now() "
+        "  FROM due, owner o WHERE a.id = due.id AND o.id = a.owner_id "
+        "RETURNING a.id, a.owner_id, a.external_id, a.display_name, a.secret_ref, a.mode, "
+        "          a.status, a.wb_warehouse_id, a.sync_attempts, o.seller_external_id, "
+        "          o.allow_ledger_short",
+        {"limit": limit, "lease": lease_seconds, "modes": list(modes),
+         "only": list(only) if only else None})
+    return cursor.fetchall()
+
+
+def sync_cursor(cursor: Cursor, account_id: uuid.UUID) -> int:
+    cursor.execute("SELECT cursor FROM wb_sync_cursor WHERE account_id = %s", (account_id,))
+    row = cursor.fetchone()
+    if row is None or row["cursor"] is None:
+        return 0
+    try:
+        return int(row["cursor"])
+    except (TypeError, ValueError):
+        return 0
+
+
+def save_sync_cursor(cursor: Cursor, account_id: uuid.UUID, value: int) -> None:
+    cursor.execute(
+        "INSERT INTO wb_sync_cursor (account_id, cursor, last_seen_at) "
+        "VALUES (%s, %s, now()) "
+        "ON CONFLICT (account_id) DO UPDATE SET cursor = EXCLUDED.cursor, "
+        "                                       last_seen_at = now()",
+        (account_id, str(value)))
+
+
+def finish_sync(cursor: Cursor, account_id: uuid.UUID, *, next_in_seconds: float,
+                error_code: str | None = None, status: str | None = None) -> None:
+    """Закрывает цикл опроса кабинета.
+
+    Счётчик попыток сбрасывается только успехом: по нему видно кабинет, который
+    «работает», но каждый раз падает, — молчащий воркер считается сломанным
+    (инвариант 14).
+    """
+    cursor.execute(
+        "UPDATE wb_account SET "
+        "    sync_claimed_at = NULL, "
+        "    last_sync_at = CASE WHEN %(error)s::text IS NULL THEN now() ELSE last_sync_at END, "
+        "    next_sync_at = now() + make_interval(secs => %(next)s), "
+        "    sync_attempts = CASE WHEN %(error)s::text IS NULL "
+        "                         THEN 0 ELSE sync_attempts + 1 END, "
+        "    sync_error_code = %(error)s::text, "
+        "    status = COALESCE(%(status)s::text, status) "
+        "  WHERE id = %(account)s",
+        {"account": account_id, "next": float(next_in_seconds),
+         "error": error_code, "status": status})
+
+
+def owner_by_id(cursor: Cursor, owner_id: uuid.UUID) -> dict[str, Any] | None:
+    cursor.execute(
+        "SELECT id, seller_external_id, name, inn, active, allow_ledger_short "
+        "  FROM owner WHERE id = %s", (owner_id,))
+    return cursor.fetchone()
+
+
+def known_orders(cursor: Cursor, wb_order_ids: Sequence[int]) -> set[int]:
+    """Какие из этих заказов WB уже стали заданиями.
+
+    Опрос идёт с перекрытием (раздел 6.7), поэтому большая часть страницы —
+    это заказы, которые мы уже завели. Спрашивать про них по одному значит
+    открывать транзакцию и брать блокировку строки ради заведомо известного
+    ответа: 22 кабинета по два опроса в секунду дали бы сотни таких
+    транзакций в секунду на пустом месте.
+    """
+    if not wb_order_ids:
+        return set()
+    cursor.execute("SELECT wb_order_id FROM wms_task WHERE wb_order_id = ANY(%s)",
+                   (list(wb_order_ids),))
+    return {int(row["wb_order_id"]) for row in cursor.fetchall()}
+
+
+def take_slot_and_cursor(cursor: Cursor, account_id: uuid.UUID, *, cost: int = 1,
+                         limit: int = 300) -> tuple[bool, float, int]:
+    """Занять место в минутном окне и прочитать курсор — одним запросом.
+
+    Опросчик делает это перед каждым вызовом в Wildberries, то есть десятки
+    раз в секунду на все кабинеты. Два круга до сервера вместо одного здесь
+    дороже самой работы.
+    """
+    cursor.execute(
+        "WITH permit AS ("
+        "    INSERT INTO wb_rate_limit (account_id, window_start, used) "
+        "    VALUES (%(account)s, date_trunc('minute', now()), %(cost)s) "
+        "    ON CONFLICT (account_id, window_start) DO UPDATE SET "
+        "        used = wb_rate_limit.used + %(cost)s "
+        "      WHERE wb_rate_limit.used + %(cost)s <= %(limit)s "
+        "        AND (wb_rate_limit.blocked_until IS NULL "
+        "             OR wb_rate_limit.blocked_until <= now()) "
+        "    RETURNING used) "
+        "SELECT (SELECT used FROM permit) AS used, "
+        "       (SELECT cursor FROM wb_sync_cursor WHERE account_id = %(account)s) AS cursor, "
+        "       EXTRACT(EPOCH FROM (date_trunc('minute', now()) "
+        "                           + interval '1 minute' - now())) AS wait",
+        {"account": account_id, "cost": cost, "limit": limit})
+    row = cursor.fetchone() or {}
+    allowed = row.get("used") is not None
+    try:
+        position = int(row.get("cursor") or 0)
+    except (TypeError, ValueError):
+        position = 0
+    return allowed, float(row.get("wait") or 0), position
+
+
+def finish_sync_with_cursor(cursor: Cursor, account_id: uuid.UUID, *, cursor_value: int,
+                            next_in_seconds: float, status: str | None = None) -> None:
+    """Сохранить курсор и закрыть цикл опроса — одним запросом."""
+    cursor.execute(
+        "WITH saved AS ("
+        "    INSERT INTO wb_sync_cursor (account_id, cursor, last_seen_at) "
+        "    VALUES (%(account)s, %(cursor)s, now()) "
+        "    ON CONFLICT (account_id) DO UPDATE SET cursor = EXCLUDED.cursor, "
+        "                                           last_seen_at = now()) "
+        "UPDATE wb_account SET sync_claimed_at = NULL, last_sync_at = now(), "
+        "                      next_sync_at = now() + make_interval(secs => %(next)s), "
+        "                      sync_attempts = 0, sync_error_code = NULL, "
+        "                      status = COALESCE(%(status)s::text, status) "
+        "  WHERE id = %(account)s",
+        {"account": account_id, "cursor": str(cursor_value),
+         "next": float(next_in_seconds), "status": status})

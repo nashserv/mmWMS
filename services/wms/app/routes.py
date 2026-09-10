@@ -77,19 +77,15 @@ def create_router(pool: ConnectionPool, publisher: EventPublisher) -> APIRouter:
     catalog = CatalogOperations(pool)
     stock = StockOperations(pool)
 
-    def publish(outcome_events: Any) -> None:
-        """Отправляет уже записанные в outbox события сразу, не дожидаясь воркера.
-
-        Событие уже долговечно — оно в базе (раздел 6.1). Эта отправка только
-        сокращает задержку; её падение ничего не теряет и не имеет права
-        уронить операцию склада.
-        """
-        for emitted in outcome_events or ():
-            try:
-                publisher.publish(emitted.envelope)
-            except Exception:
-                log.warning("событие %s не ушло в шину сразу; заберёт публикатор",
-                            emitted.envelope.type, exc_info=False)
+    # Событий отсюда никто не отправляет намеренно. Они уже записаны в outbox
+    # той же транзакцией, что и движение товара, и в шину их несёт единственный
+    # публикатор (app/workers/outbox_publisher.py).
+    #
+    # Раньше маршрут отправлял их ещё и сам «чтобы побыстрее». Это давало две
+    # беды сразу: каждое событие уезжало в шину дважды, и десять миллисекунд
+    # разговора с брокером ложились на горячий путь резерва — тот самый, для
+    # которого раздел 10 требует «WB → задание» под 2 с. Склад от шины не
+    # зависит (раздел 6.1), торопиться с уведомлением незачем.
 
     def guarded(handler: Callable[[dict[str, Any]], Any]):
         """Обёртка вокруг обработчика: валидация — 400 по протоколу, сбой — 500.
@@ -171,9 +167,7 @@ def create_router(pool: ConnectionPool, publisher: EventPublisher) -> APIRouter:
             raise ValueError("sku обязателен: у Wildberries в нём приходит штрихкод")
         if params.get("wb_order_id") in (None, ""):
             raise ValueError("wb_order_id обязателен: это ключ идемпотентности задания")
-        outcome = wms.reserve(params)
-        publish(outcome.events)
-        return outcome.as_result()
+        return wms.reserve(params).as_result()
 
     post("/reservations", reservations)
 

@@ -204,6 +204,29 @@ def is_retryable(error: BaseException) -> bool:
 
 
 @contextmanager
+def single(connection: psycopg.Connection) -> Iterator[psycopg.Cursor]:
+    """Один запрос — без транзакции вовсе.
+
+    Postgres и так выполняет одиночный запрос атомарно, а явные BEGIN/COMMIT
+    вокруг него дают лишний круг до сервера и промежуток, в котором бэкенд
+    сидит `idle in transaction`, ожидая COMMIT. Для фоновых воркеров, которые
+    делают такие запросы десятками в секунду, это ровно тот шум, по которому
+    потом невозможно отличить настоящую долгую транзакцию от рабочей.
+
+    Многошаговые операции сюда не относятся: у резерва (раздел 6.2) транзакция
+    обязана быть явной и общей на все пять шагов.
+    """
+    previous = connection.autocommit
+    connection.autocommit = True
+    cursor = connection.cursor()
+    try:
+        yield cursor
+    finally:
+        cursor.close()
+        connection.autocommit = previous
+
+
+@contextmanager
 def transaction(connection: psycopg.Connection) -> Iterator[psycopg.Cursor]:
     """Одна транзакция — один курсор.
 
