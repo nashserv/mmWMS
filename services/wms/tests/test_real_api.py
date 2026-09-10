@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import os
+import pathlib
+import re
 import uuid
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from dbfixtures import require_database, unique
@@ -172,17 +175,36 @@ def test_a_live_token_is_refused_as_a_secret_ref(client: TestClient, seller: dic
     assert "ссылка на секрет" in body["error"]["message"]
 
 
-def test_unwritten_routes_say_so_out_loud(client: TestClient, seller: dict) -> None:
-    """Ненаписанный маршрут отвечает отказом, а не правдоподобной выдумкой.
+def test_every_contract_route_is_served(client: TestClient, seller: dict) -> None:
+    """Ни один маршрут контракта не отвечает «этого ещё нет».
 
-    Заглушка под настоящим именем — это то, как заглушки доезжают до прода.
-    Пока поток A не написал поставки, честнее внятный отказ, чем ответ, по
-    которому поток B построит экран.
+    Проверяется контракт из репозитория, а не его список в тесте: копия
+    однажды разойдётся молча. Маршрут может отказать по существу — не найдено
+    задание, не хватает параметра, — но не имеет права ответить -32601:
+    заглушка под настоящим именем это то, как заглушки доезжают до прода.
     """
-    response = client.post(f"{BASE}/shipments", json={
-        "jsonrpc": "2.0", "method": "call", "id": 4,
-        "params": {"seller_external_id": seller["seller"], "idempotency_key": "x",
-                   "action": "open"}})
-    body = response.json()
-    assert body["error"]["code"] == -32601
-    assert "не реализован" in body["error"]["message"]
+    contract = yaml.safe_load(
+        (pathlib.Path(__file__).resolve().parents[1] / "contracts" / "openapi.yaml")
+        .read_text(encoding="utf-8"))
+    # Пути в контракте относительны базового адреса сервера — приставку
+    # добавляем сами, как это делает любой сгенерированный клиент.
+    paths = [BASE + path for path in contract["paths"]]
+    assert len(paths) >= 29, f"в контракте {len(paths)} маршрутов — приложение B обещает 29+"
+
+    unimplemented, missing_route = [], []
+    for path in paths:
+        # Подставляем что угодно похожее на идентификатор: маршрут обязан
+        # ответить по существу, а не «такого пути нет».
+        concrete = re.sub(r"\{[^}]+\}", str(uuid.uuid4()), path)
+        response = client.post(concrete, json={
+            "jsonrpc": "2.0", "method": "call", "id": 1,
+            "params": {"seller_external_id": seller["seller"]}})
+        if response.status_code == 404:
+            missing_route.append(path)
+            continue
+        error = response.json().get("error") or {}
+        if error.get("code") == -32601:
+            unimplemented.append(path)
+
+    assert not missing_route, f"маршрутов нет вовсе: {missing_route}"
+    assert not unimplemented, f"маршруты отвечают «ещё не реализовано»: {unimplemented}"

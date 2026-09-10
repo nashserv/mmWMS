@@ -130,18 +130,19 @@ class WmsService:
             aggregate_id=aggregate_id, sequence=sequence, occurred_at=envelope.occurred_at)
         return Emitted(envelope=envelope, sequence=sequence)
 
-    def emit_for_task(self, cursor: psycopg.Cursor, *, task_id: uuid.UUID,
-                      event_type: str, payload: dict[str, Any],
-                      correlation_id: str) -> Emitted:
-        """Событие по заданию из чужой транзакции.
+    def emit_for_aggregate(self, cursor: psycopg.Cursor, *, aggregate_id: uuid.UUID,
+                           event_type: str, payload: dict[str, Any],
+                           correlation_id: str, carry_sequence: bool = True) -> Emitted:
+        """Событие по агрегату из чужой транзакции.
 
-        Публичная обёртка над `_emit`: скан, упаковка и отмена живут в
-        `tasks.py`, но нумерация событий обязана оставаться общей и монотонной
-        в пределах задания (приложение E). Двух счётчиков на одно задание быть
-        не может.
+        Публичная обёртка над `_emit`: скан, упаковка, отмена и отгрузка живут
+        в своих модулях, но нумерация событий обязана оставаться общей и
+        монотонной в пределах агрегата (приложение E). Двух счётчиков на одно
+        задание быть не может.
         """
         return self._emit(cursor, event_type=event_type, payload=payload,
-                          correlation_id=correlation_id, aggregate_id=task_id)
+                          correlation_id=correlation_id, aggregate_id=aggregate_id,
+                          carry_sequence=carry_sequence)
 
     # -------------------------------------------------------------- резерв
 

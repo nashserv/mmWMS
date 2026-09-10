@@ -139,8 +139,8 @@ class TaskOperations:
                 repo.set_task_state(cursor, row["id"], TaskState.PICKED.value)
                 repo.record_scan(cursor, task_id=row["id"], owner_id=row["owner_id"],
                                  sku_id=row["sku_id"], result="ok")
-                self._service.emit_for_task(
-                    cursor, task_id=row["id"], event_type="wms.item.scanned.v1",
+                self._service.emit_for_aggregate(
+                    cursor, aggregate_id=row["id"], event_type="wms.item.scanned.v1",
                     payload={"task_id": str(row["id"]), "owner_id": str(row["owner_id"]),
                              "sku_id": str(row["sku_id"]), "barcode": barcode,
                              "qty": int(row["quantity"])},
@@ -170,8 +170,8 @@ class TaskOperations:
 
                 repo.set_task_state(cursor, row["id"], TaskState.PACKED.value,
                                     package_ref=_text(params.get("box_barcode")))
-                self._service.emit_for_task(
-                    cursor, task_id=row["id"], event_type="wms.packing.completed.v1",
+                self._service.emit_for_aggregate(
+                    cursor, aggregate_id=row["id"], event_type="wms.packing.completed.v1",
                     payload={"task_id": str(row["id"]), "owner_id": str(row["owner_id"]),
                              "qty": int(row["quantity"]),
                              "package_ref": _text(params.get("box_barcode"))},
@@ -258,8 +258,8 @@ class TaskOperations:
                     cancel_reason=reason if state == TaskState.CANCELLED.value else None,
                     clear_supply=release_supply, clear_assignee=True,
                     clear_reservation=state == TaskState.CANCELLED.value)
-                self._service.emit_for_task(
-                    cursor, task_id=row["id"], event_type=event,
+                self._service.emit_for_aggregate(
+                    cursor, aggregate_id=row["id"], event_type=event,
                     payload={"task_id": str(row["id"]), "owner_id": str(row["owner_id"]),
                              "wb_order_id": int(row["wb_order_id"]), "reason": reason},
                     correlation_id=idempotency or f"unwind-{row['id']}")

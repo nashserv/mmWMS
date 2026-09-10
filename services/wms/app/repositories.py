@@ -1269,3 +1269,244 @@ def account_of_supply(cursor: Cursor, wb_supply_id: str) -> dict[str, Any] | Non
         "  FROM wb_supply s JOIN wb_account a ON a.id = s.wb_account_id "
         " WHERE s.wb_supply_id = %s", (wb_supply_id,))
     return cursor.fetchone()
+
+
+# --------------------------------------------------------------- отгрузка
+
+def ensure_shipment(cursor: Cursor, *, owner_id: uuid.UUID,
+                    supply_id: uuid.UUID) -> dict[str, Any]:
+    """Отгрузка под поставку. Одна на поставку, заводится лениво."""
+    cursor.execute(
+        "SELECT id, owner_id, wb_supply_id, state, closed_at, handed_by, handed_at, "
+        "       accepted_at FROM shipment WHERE wb_supply_id = %s", (supply_id,))
+    row = cursor.fetchone()
+    if row is not None:
+        return row
+    cursor.execute(
+        "INSERT INTO shipment (id, owner_id, wb_supply_id, state) VALUES (%s, %s, %s, 'open') "
+        "RETURNING id, owner_id, wb_supply_id, state, closed_at, handed_by, handed_at, "
+        "          accepted_at",
+        (uuid.uuid4(), owner_id, supply_id))
+    row = cursor.fetchone()
+    assert row is not None
+    return row
+
+
+def supply_of_account(cursor: Cursor, account_id: uuid.UUID,
+                      wb_supply_id: str | None = None) -> dict[str, Any]:
+    if wb_supply_id:
+        cursor.execute(
+            "SELECT id, wb_account_id, wb_supply_id, state FROM wb_supply "
+            " WHERE wb_account_id = %s AND wb_supply_id = %s", (account_id, wb_supply_id))
+        row = cursor.fetchone()
+        if row is not None:
+            return row
+    return open_supply(cursor, account_id)
+
+
+def close_supply(cursor: Cursor, supply_id: uuid.UUID, state: str = "closed") -> None:
+    cursor.execute(
+        "UPDATE wb_supply SET state = %s, closed_at = COALESCE(closed_at, now()) "
+        " WHERE id = %s AND state <> %s", (state, supply_id, state))
+
+
+def supply_order_count(cursor: Cursor, supply_id: uuid.UUID) -> int:
+    cursor.execute("SELECT count(*) AS n FROM wms_task WHERE supply_id = %s", (supply_id,))
+    row = cursor.fetchone()
+    return int(row["n"]) if row else 0
+
+
+def tasks_of_supply(cursor: Cursor, supply_id: uuid.UUID) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT id, wb_order_id, owner_id, state FROM wms_task WHERE supply_id = %s "
+        " ORDER BY created_at", (supply_id,))
+    return cursor.fetchall()
+
+
+def tasks_not_in_supply(cursor: Cursor, task_ids: Sequence[uuid.UUID],
+                        supply_id: uuid.UUID) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT id, wb_order_id FROM wms_task "
+        " WHERE id = ANY(%s) AND (supply_id IS NULL OR supply_id <> %s)",
+        (list(task_ids), supply_id))
+    return cursor.fetchall()
+
+
+def tasks_without_metadata(cursor: Cursor, supply_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Задания, на которых WB откажет в передаче поставки.
+
+    Валидация `metaDetails` обязательна с релизов 2026-03/04 (приложение D).
+    Практически она означает одно: у задания должен быть штрихкод и стикер.
+    """
+    cursor.execute(
+        "SELECT t.id, t.wb_order_id FROM wms_task t "
+        "  LEFT JOIN wb_label l ON l.task_id = t.id AND l.invalidated_at IS NULL "
+        " WHERE t.supply_id = %s AND t.state NOT IN ('cancelled', 'manual_review') "
+        "   AND (t.barcode IS NULL OR l.id IS NULL)", (supply_id,))
+    return cursor.fetchall()
+
+
+def set_shipment_state(cursor: Cursor, shipment_id: uuid.UUID, state: str) -> None:
+    cursor.execute(
+        "UPDATE shipment SET state = %s, closed_at = COALESCE(closed_at, now()) "
+        " WHERE id = %s AND state NOT IN ('handed_to_wb', 'accepted_by_wb')",
+        (state, shipment_id))
+
+
+def hand_over_shipment(cursor: Cursor, shipment_id: uuid.UUID, handed_by: str) -> None:
+    """Передачу подтверждает человек, и его подпись сохраняется.
+
+    `handed_by` в схеме uuid — тот же случай, что и с `assignee`: имя
+    разворачивается в постоянный uuid (находка 7 в FINDINGS.md).
+    """
+    cursor.execute(
+        "UPDATE shipment SET state = 'handed_to_wb', handed_by = %s, handed_at = now(), "
+        "                    closed_at = COALESCE(closed_at, now()) "
+        " WHERE id = %s", (_person(handed_by), shipment_id))
+
+
+def accept_shipment(cursor: Cursor, shipment_id: uuid.UUID) -> None:
+    cursor.execute(
+        "UPDATE shipment SET state = 'accepted_by_wb', accepted_at = now() WHERE id = %s",
+        (shipment_id,))
+
+
+def tasks_ready_for_supply(cursor: Cursor, *, owner_external_id: str | None = None,
+                           limit: int = 100) -> list[dict[str, Any]]:
+    cursor.execute(
+        _TASK_VIEW + " WHERE t.state IN ('picked', 'packed', 'labeled') "
+        "   AND (%(owner)s::text IS NULL OR o.seller_external_id = %(owner)s) "
+        " ORDER BY t.deadline NULLS LAST, t.created_at LIMIT %(limit)s",
+        {"owner": owner_external_id, "limit": limit})
+    return cursor.fetchall()
+
+
+# Пространство имён для людей, названных именем, а не идентификатором identity.
+_PERSON_NAMESPACE = uuid.UUID("2f1c9a44-7b8e-4d5c-9a3f-1e6b0d8c5a72")
+
+
+def _person(value: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return uuid.uuid5(_PERSON_NAMESPACE, value)
+
+
+# ------------------------------------------------------- рабочие места
+
+def station(cursor: Cursor, station_id: uuid.UUID) -> dict[str, Any] | None:
+    cursor.execute(
+        "SELECT id, name, printer_host, printer_port, printer_model, transport, active "
+        "  FROM station WHERE id = %s", (station_id,))
+    return cursor.fetchone()
+
+
+# ------------------------------------------------------------- возвраты
+
+def upsert_return(cursor: Cursor, *, return_event_id: str, owner_id: uuid.UUID,
+                  task_id: uuid.UUID | None,
+                  reason: str | None) -> tuple[dict[str, Any], bool]:
+    cursor.execute(
+        "INSERT INTO wms_return (id, task_id, return_event_id, owner_id, state, reason) "
+        "VALUES (%s, %s, %s, %s, 'expected', %s) "
+        "ON CONFLICT (return_event_id) DO UPDATE SET reason = COALESCE(EXCLUDED.reason, "
+        "                                                              wms_return.reason) "
+        "RETURNING id, task_id, return_event_id, owner_id, state, decision, reason, "
+        "          (xmax = 0) AS created",
+        (uuid.uuid4(), task_id, return_event_id, owner_id, reason))
+    row = cursor.fetchone()
+    assert row is not None
+    return row, bool(row.pop("created"))
+
+
+def return_by_id_or_event(cursor: Cursor, value: str) -> dict[str, Any] | None:
+    """Возврат по нашему uuid или по внешнему ключу события.
+
+    Клиенты зовут маршрут и так и так: `wb-returns` знает событие, экран —
+    наш идентификатор.
+    """
+    try:
+        identifier = uuid.UUID(str(value))
+    except (ValueError, AttributeError):
+        identifier = None
+    cursor.execute(
+        "SELECT id, task_id, return_event_id, owner_id, state, decision, reason "
+        "  FROM wms_return WHERE (%s::uuid IS NOT NULL AND id = %s::uuid) "
+        "     OR return_event_id = %s",
+        (identifier, identifier, str(value)))
+    return cursor.fetchone()
+
+
+def set_return_state(cursor: Cursor, return_id: uuid.UUID, state: str) -> None:
+    cursor.execute(
+        "UPDATE wms_return SET state = %s, received_at = COALESCE(received_at, now()) "
+        " WHERE id = %s", (state, return_id))
+
+
+def decide_return(cursor: Cursor, return_id: uuid.UUID, decision: str) -> None:
+    cursor.execute(
+        "UPDATE wms_return SET state = 'decided', decision = %s, "
+        "                      received_at = COALESCE(received_at, now()) "
+        " WHERE id = %s", (decision, return_id))
+
+
+def returns_list(cursor: Cursor, *, owner_external_id: str | None = None,
+                 states: Any = None, limit: int = 100) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT r.id, r.return_event_id, r.state, r.decision, r.reason, r.received_at, "
+        "       r.created_at, o.seller_external_id, r.task_id "
+        "  FROM wms_return r JOIN owner o ON o.id = r.owner_id "
+        " WHERE (%(owner)s::text IS NULL OR o.seller_external_id = %(owner)s) "
+        "   AND (%(states)s::text[] IS NULL OR r.state = ANY(%(states)s)) "
+        " ORDER BY r.created_at DESC LIMIT %(limit)s",
+        {"owner": owner_external_id, "states": list(states) if states else None,
+         "limit": limit})
+    return [{"return_id": str(row["id"]), "return_event_id": row["return_event_id"],
+             "state": row["state"], "decision": row["decision"], "reason": row["reason"],
+             "owner_external_id": row["seller_external_id"],
+             "task_id": str(row["task_id"]) if row["task_id"] else None,
+             "received_at": row["received_at"].isoformat() if row["received_at"] else None,
+             "created_at": row["created_at"].isoformat()} for row in cursor.fetchall()]
+
+
+def mark_account_verified(cursor: Cursor, account_id: uuid.UUID, *, verified: bool) -> None:
+    """Отметка проверки кабинета.
+
+    Провалившаяся проверка не выключает кабинет молча: она ставит `AUTH_ERROR`,
+    чтобы это было видно и опросчику, и человеку.
+    """
+    cursor.execute(
+        "UPDATE wb_account SET last_verified_at = now(), "
+        "    status = CASE WHEN %(ok)s THEN 'ACTIVE' "
+        "                  WHEN status = 'ACTIVE' THEN 'AUTH_ERROR' ELSE status END "
+        "  WHERE id = %(id)s", {"id": account_id, "ok": verified})
+
+
+# Что считать собранным. `picked` сюда не входит: вещь снята с полки, но не
+# упакована, и в коробе её нет.
+ASSEMBLED_STATES = ("packed", "labeled", "shipped")
+
+
+def assembled_tasks_of_supply(cursor: Cursor, supply_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Задания поставки, которые физически собраны и готовы уехать."""
+    cursor.execute(
+        "SELECT t.id, t.wb_order_id, t.state, "
+        "       (t.barcode IS NOT NULL AND l.id IS NOT NULL) AS ready_metadata "
+        "  FROM wms_task t "
+        "  LEFT JOIN wb_label l ON l.task_id = t.id AND l.invalidated_at IS NULL "
+        " WHERE t.supply_id = %s AND t.state = ANY(%s) ORDER BY t.created_at",
+        (supply_id, list(ASSEMBLED_STATES)))
+    return cursor.fetchall()
+
+
+def unassembled_tasks_of_supply(cursor: Cursor, supply_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Задания поставки, которые ещё лежат на складе.
+
+    В поставку они попали ради стикера — WB выдаёт его только заданию в
+    поставке (раздел 6.6). Уехать они не могут: их никто не собирал.
+    """
+    cursor.execute(
+        "SELECT id, wb_order_id, state FROM wms_task "
+        " WHERE supply_id = %s AND state <> ALL(%s) AND state <> 'cancelled'",
+        (supply_id, list(ASSEMBLED_STATES)))
+    return cursor.fetchall()

@@ -22,9 +22,12 @@ from fastapi.responses import JSONResponse
 from .metrics import observe_http
 from .postgres import ConnectionPool
 from .stock_push import publisher as stock_publisher_for
-from .supplies import release_from_supply
+from .supplies import release_from_supply, verify_account
+from .labels import LabelOperations
 from .receiving import ReceivingOperations
+from .returns import ReturnOperations
 from .service import CatalogOperations, StockOperations, WmsService
+from .shipments import ShipmentOperations
 from .tasks import TaskOperations
 
 BASE_PATH = "/api/mmx/wms/v1"
@@ -90,6 +93,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     catalog = CatalogOperations(pool)
     stock = StockOperations(pool, stock_publisher.notify)
     receiving = ReceivingOperations(pool, stock_publisher.notify)
+    shipments = ShipmentOperations(pool, wms)
+    labels = LabelOperations(pool, wms)
+    returns = ReturnOperations(pool, wms, stock_publisher.notify)
     tasks = TaskOperations(pool, wms, stock_publisher.notify,
                            on_supply_release=release_from_supply(pool))
 
@@ -142,12 +148,19 @@ def create_router(pool: ConnectionPool) -> APIRouter:
         router.add_api_route(path, guarded(handler), methods=["POST"])
 
     def post_id(path: str, handler: Callable[..., Any]) -> None:
-        """Маршрут с идентификатором в пути: `/tasks/{task_id}/...`."""
-        async def endpoint(task_id: str, request: Request) -> JSONResponse:
+        """Маршрут с идентификатором в пути: `/tasks/{task_id}/...`.
+
+        Как называется параметр — не важно: у возвратов это `return_id`, у
+        кабинетов `account_id`, а обработчик один и тот же.
+        """
+        async def endpoint(request: Request) -> JSONResponse:
             started = time.monotonic()
             body = await _body(request)
+            # Идентификатор берём из пути сами: у маршрутов возвратов и
+            # кабинетов он называется иначе, а обработчик один.
+            identifier = next(iter(request.path_params.values()), "")
             try:
-                payload = handler(task_id, _params(body))
+                payload = handler(identifier, _params(body))
             except ValueError as invalid:
                 observe_http(400, time.monotonic() - started)
                 return _error(body, JSONRPC_INVALID_PARAMS, str(invalid))
@@ -225,6 +238,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     post_id("/tasks/{task_id}/pack", tasks.pack)
     post_id("/tasks/{task_id}/return-to-shelf", tasks.return_to_shelf)
     post_id("/tasks/{task_id}/cancel", tasks.cancel)
+    post_id("/tasks/{task_id}/label", labels.read)
+    post_id("/tasks/{task_id}/return", returns.expect)
+    post_id("/labels/{task_id}/print", labels.print)
 
     # ---------------------------------------------------- приёмка и хранение
 
@@ -250,16 +266,24 @@ def create_router(pool: ConnectionPool) -> APIRouter:
 
     # ------------------------------------- ещё не написано потоком A
 
-    for path, what in (
-        ("/shipments", "поставки"),
-        ("/shipments/picked", "собранные задания"),
-        ("/returns/receipt", "возвраты"),
-        ("/labels/{task_id}/print", "печать стикера"),
-        ("/tasks/{task_id}/return", "возврат по заданию"),
-        ("/returns/{return_id}/receive", "приём возврата"),
-        ("/returns/{return_id}/decision", "решение по возврату"),
-        ("/wb/accounts/{account_id}/verify", "проверка кабинета WB"),
-    ):
-        post(path, missing(what))
+    post("/shipments", shipments.handle)
+    post("/shipments/picked", shipments.picked)
+
+    # ------------------------------------------------------------- возвраты
+
+    post("/returns/receipt", returns.receipt)
+    post_id("/returns/{return_id}/receive", returns.receive)
+    post_id("/returns/{return_id}/decision", returns.decide)
+
+    def wb_account_verify(account_id: str, _params: dict[str, Any]) -> dict[str, Any]:
+        """Проверка кабинета: отвечает ли Wildberries нашим секретом.
+
+        Живого токена на стенде нет и быть не может (раздел 12), поэтому
+        проверка честно говорит, что именно она проверила, а не рисует
+        зелёную галочку.
+        """
+        return verify_account(pool, account_id)
+
+    post_id("/wb/accounts/{account_id}/verify", wb_account_verify)
 
     return router
