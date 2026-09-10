@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Секреты и окружение. Паттерн ${VAR:?set outside Git} обязателен в примерах;
+# сами значения в репозиторий не попадают никогда (раздел 12 мастера).
+.env
+*.env
+!.env.example
+
+# Дамп с боевого контура. Обезличенный — но это данные клиентов, и место им
+# на стенде, а не в истории Git.
+infrastructure/stand/dump/*
+!infrastructure/stand/dump/.gitkeep
+infrastructure/stand/env/*
+!infrastructure/stand/env/.gitkeep
+
+# Локальное
+.DS_Store
+*.log

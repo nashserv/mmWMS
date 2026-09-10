@@ -1,0 +1,102 @@
+# CI потока 0.
+#
+# Повторяет подход платформы (reference/wb-fbs-gateway-template/README.md):
+# зависимости + pytest против настоящего Postgres с применёнными по цепочке
+# миграциями, pip-audit, отдельная валидация контрактов.
+#
+# Красный CI блокирует мерж — правило 9.5.5: чинит тот, чей контракт нарушен.
+
+name: ci
+
+on:
+  push:
+    branches: [main, stream-0, stream-a, stream-b, stream-c]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  migrations:
+    name: Миграции на чистой базе
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.10-bookworm
+        env:
+          POSTGRES_DB: wms
+          POSTGRES_USER: wms
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+        options: >-
+          --health-cmd "pg_isready -U wms -d wms"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Накатить миграции по порядку
+        env:
+          DATABASE_URL: postgresql://wms:ci-only-not-a-secret@127.0.0.1:5432/wms
+          MIGRATIONS_DIR: services/wms/migrations
+        run: bash infrastructure/stand/scripts/migrate.sh
+
+      # Повторный прогон обязан не сделать ничего: миграции применяются по
+      # журналу, существующие не переписываются (правило 9.5).
+      - name: Повторный прогон идемпотентен
+        env:
+          DATABASE_URL: postgresql://wms:ci-only-not-a-secret@127.0.0.1:5432/wms
+          MIGRATIONS_DIR: services/wms/migrations
+        run: |
+          out="$(bash infrastructure/stand/scripts/migrate.sh)"
+          echo "$out"
+          echo "$out" | grep -q "миграции применены: 0"
+
+      - name: Инварианты держатся на уровне схемы
+        env:
+          PGPASSWORD: ci-only-not-a-secret
+        run: |
+          # Журнал остатков нельзя переписать, баланс нельзя тронуть напрямую
+          # (инвариант 3). Проверяем, что триггеры на месте и работают.
+          psql -h 127.0.0.1 -U wms -d wms -v ON_ERROR_STOP=1 -c "
+            SELECT 1/count(*) FROM pg_trigger
+             WHERE NOT tgisinternal
+               AND tgname IN ('stock_move_no_rewrite',
+                              'stock_move_no_truncate',
+                              'stock_move_project_balance',
+                              'stock_balance_projection_only')
+            HAVING count(*) = 4;"
+
+  contracts:
+    name: Контракты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22"}
+      - run: pip install --no-cache-dir openapi-spec-validator jsonschema pyyaml
+      - run: bash scripts/validate-contracts.sh
+
+  tests:
+    name: Тесты сервиса wms
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install --no-cache-dir -r services/wms/requirements-mock.txt pytest pip-audit
+      - name: pytest
+        working-directory: services/wms
+        env: {APP_ENV: test}
+        run: python -m pytest -q
+      - name: pip-audit
+        run: pip-audit -r services/wms/requirements.txt
+
+  secrets:
+    name: Живых токенов WB нет
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Те же ворота, что и у стенда. Репозиторий проверяется целиком:
+      # токен, доехавший до Git, уже утёк, даже если его потом удалить.
+      - run: bash infrastructure/stand/scripts/check-no-live-tokens.sh .

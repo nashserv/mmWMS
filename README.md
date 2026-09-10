@@ -11,6 +11,33 @@
    - **[docs/03-stream-b-picker-app.md](docs/03-stream-b-picker-app.md)** → ветка `stream-b`
    - **[docs/04-stream-c-billing-accounts.md](docs/04-stream-c-billing-accounts.md)** → ветка `stream-c`
 
+## Результаты потока 0 — точка старта для A, B и C
+
+Всё ниже **заморожено**: меняется только потоком 0, синхронно всем трём
+потокам (правило 9.5.2 мастера).
+
+| Что | Где |
+|---|---|
+| Схема базы `wms` | [services/wms/migrations/](services/wms/migrations/) — 7 миграций, инварианты раздела 8 держат триггеры и constraint'ы |
+| Решения по схеме и отклонения от раздела 7 | **[docs/schema-decisions.md](docs/schema-decisions.md)** — читать вместе с миграциями |
+| Контракт API | [services/wms/contracts/openapi.yaml](services/wms/contracts/openapi.yaml) — 29 маршрутов приложения B + 6 новых |
+| Каталог событий | [services/wms/contracts/asyncapi.yaml](services/wms/contracts/asyncapi.yaml) |
+| Таблица маппинга статусов | **[docs/state-mapping.md](docs/state-mapping.md)** — на неё ссылаются все три потока |
+| Mock сервиса `wms` | [services/wms/app/](services/wms/app/) — потоки B и C работают против него, пока поток A не готов |
+| Стенд | [infrastructure/stand/](infrastructure/stand/) — `docker compose up -d`, см. [README стенда](infrastructure/stand/README.md) |
+| Скрипт полного прогона | [tests/full-run/](tests/full-run/) — 16 проверок раздела 9.6 |
+| Проверка контрактов | `bash scripts/validate-contracts.sh` |
+
+Две вещи, которые стоит знать до того, как начать писать код:
+
+- **Mock обязан соответствовать контракту.** События заглушки проверяются
+  схемами из самого `asyncapi.yaml`
+  ([тест](services/wms/tests/test_contract_conformance.py)). Заглушка, шлющая
+  не ту форму, учит консьюмеры неправильному формату — это хуже её отсутствия.
+- **Красный прогон на старте — норма.** `wms` пока заглушка, поэтому шаги,
+  требующие настоящей транзакции и нагрузки, падают. Скрипт показывает, чего
+  именно ещё нет, и зеленеет по мере готовности потоков.
+
 ## Справочные материалы
 
 - **[reference/wb-fbs-gateway-template/](reference/wb-fbs-gateway-template/)** — шаблон сервиса, снятый read-only с боевого `wb-fbs-gateway` (Dockerfile, зависимости, конфиг тестов, паттерны config/metrics/secrets). Для потока 0, пункт 8. Только чтение, не собирать.
