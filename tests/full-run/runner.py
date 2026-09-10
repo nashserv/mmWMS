@@ -278,10 +278,24 @@ class TxnWatch:
     def seen(self) -> int:
         return len(self.samples)
 
+    # Порог, отделяющий разговор с сетью от промежутка между двумя операторами
+    # одной транзакции. Транзакция раздела 6.2 многошаговая по самому своему
+    # описанию — пять операторов между BEGIN и COMMIT, — и бэкенд честно сидит
+    # `idle in transaction`, пока клиент готовит следующий оператор.
+    # Наблюдатель с шагом 5 мс попадает в такие промежутки неизбежно.
+    # Вызов в Wildberries занимает около 500 мс и проходит через порог с
+    # запасом; промежуток между операторами — нет.
+    IDLE_LIMIT_MS = 50.0
+
     @property
     def idle_in_transaction(self) -> list[TxnSample]:
-        """Транзакция открыта, а бэкенд ждёт клиента — отпечаток HTTP внутри неё."""
-        return [s for s in self.samples if s.state == "idle in transaction"]
+        """Бэкенд ДОЛГО ждёт клиента с открытой транзакцией — отпечаток HTTP внутри неё.
+
+        Короткое ожидание — это соседний оператор той же транзакции, а не сеть.
+        Соседняя проверка того же шага (`max_age_ms`) устроена так же и работает.
+        """
+        return [s for s in self.samples
+                if s.state == "idle in transaction" and s.age_ms > self.IDLE_LIMIT_MS]
 
     @property
     def max_age_ms(self) -> float:

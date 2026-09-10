@@ -92,6 +92,57 @@ def bus() -> Iterator[Bus]:
     tap.stop()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def tidy_stand(wms: Wms, db: Db) -> Iterator[None]:
+    """Прогон убирает за собой — и до, и после.
+
+    Клиент прогона один и тот же между запусками (так проверяется
+    идемпотентность, инвариант 5), а вот задания копятся. Больше всех оставляет
+    нагрузочный шаг 16: около 160 штук в `reserved`, и никто их не разбирает —
+    шаги 9–11 принадлежат потоку B и на срезе `-m stream_a` не выполняются
+    вовсе.
+
+    Выдача идёт по сроку WB (`ORDER BY deadline`), поэтому на следующем запуске
+    первыми уходят вчерашние задания, а не сегодняшние: шаг 8 краснеет с
+    «задания не выданы никому», хотя выдача работает. Замер потока A: после
+    нескольких прогонов 283 задания в `reserved`, из них свободных 36.
+
+    Отмена — законная операция с причиной (инвариант 11): товар возвращается на
+    полку, и стенд остаётся в том состоянии, в каком прогон его застал. Уборка
+    до запуска нужна отдельно: она чинит уже накопленное, не дожидаясь, пока
+    все прогоны станут аккуратными.
+    """
+    _cancel_leftovers(wms, db, "до прогона")
+    yield
+    _cancel_leftovers(wms, db, "после прогона")
+
+
+def _cancel_leftovers(wms: Wms, db: Db, when: str) -> None:
+    """Снять незакрытые задания клиента прогона. Тихо: это уборка, не проверка."""
+    from scenario import SELLER
+
+    try:
+        rows = db.rows(
+            "SELECT t.id FROM wms_task t JOIN owner o ON o.id = t.owner_id "
+            " WHERE o.seller_external_id = %s "
+            "   AND t.state IN ('new', 'reserved', 'picking', 'picked') "
+            " ORDER BY t.created_at LIMIT 2000", (SELLER,))
+    except Exception:  # noqa: BLE001 — уборка не имеет права ронять прогон
+        return
+
+    cancelled = 0
+    for row in rows:
+        try:
+            wms.result(f"/tasks/{row['id']}/cancel", {
+                "cancellation_event_id": f"full-run-tidy-{row['id']}",
+                "handed_over": False})
+            cancelled += 1
+        except Exception:  # noqa: BLE001 — задание могло уйти дальше по автомату
+            continue
+    if cancelled:
+        print(f"\nуборка {when}: отменено {cancelled} незакрытых заданий прогона")
+
+
 @pytest.fixture(scope="session")
 def ctx() -> dict[str, Any]:
     """То, что шаги передают друг другу.

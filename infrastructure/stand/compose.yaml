@@ -117,6 +117,20 @@ services:
       - ../../services/wms/migrations:/migrations:ro
     entrypoint: ["/bin/bash", "/migrate.sh"]
 
+  # Рабочие места. Станций пять (раздел 4), меняются они реже, чем переезжает
+  # склад, поэтому заводятся сидом при развёртывании, а не маршрутом контракта.
+  wms-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ./seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "wms",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stations.sql"]
+
   # ------------------------------------------------------------------ сервисы
   wms:
     build:
@@ -124,6 +138,7 @@ services:
     <<: *restart
     depends_on:
       migrate: {condition: service_completed_successfully}
+      wms-seed: {condition: service_completed_successfully}
       rabbitmq: {condition: service_healthy}
       rabbitmq-init: {condition: service_completed_successfully}
     environment:

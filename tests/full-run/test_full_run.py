@@ -253,11 +253,24 @@ def test_step_04_five_wb_orders_become_tasks_and_reservations_in_one_transaction
     with TxnWatch(db) as watch:
         started = time.monotonic()
         order_ids = seed_wb_orders(data.WB_ACCOUNT, data.WB_ORDERS, barcode, deadline)
-        tasks = wait_until(
-            lambda: db.rows("SELECT id, state FROM wms_task WHERE wb_order_id = ANY(%s)",
-                            (order_ids,)) or None,
-            timeout_s=TASK_VISIBLE_S, interval_s=0.05)
+        # Ждать полный набор, а не первое появившееся задание. Пятёрка
+        # заводится за ~27 мс по 4 мс на задание, наблюдатель опрашивает раз в
+        # 50 мс — список из одной строки уже истинен, и `or None` завершал бы
+        # ожидание внутри пачки. Шаг мерил бы удачу попадания между опросами,
+        # а не «5 заданий за < 2 с». Атомарной пятёрка быть не может:
+        # одна транзакция на пять заказов держала бы блокировки строк остатка
+        # 200 мс при пределе 100 мс (инвариант 4).
+        def all_arrived() -> list[dict[str, Any]] | None:
+            found = db.rows(
+                "SELECT id, state FROM wms_task WHERE wb_order_id = ANY(%s)", (order_ids,))
+            return found if len(found) == data.WB_ORDERS else None
+
+        tasks = wait_until(all_arrived, timeout_s=TASK_VISIBLE_S, interval_s=0.05)
         elapsed = time.monotonic() - started
+        if not tasks:
+            # Досталось меньше пяти — покажем, сколько именно, а не пустоту.
+            tasks = db.rows(
+                "SELECT id, state FROM wms_task WHERE wb_order_id = ANY(%s)", (order_ids,))
 
     # Что доехало — то доехало: следующим шагам нужны эти задания, даже если
     # их меньше пяти. Неполный набор они увидят сами.
@@ -288,7 +301,8 @@ def test_step_04_five_wb_orders_become_tasks_and_reservations_in_one_transaction
         "трейс пуст: за время резерва в базе не было ни одной транзакции — "
         "проверять нечего, резерв идёт мимо Postgres")
     assert not watch.idle_in_transaction, (
-        f"{len(watch.idle_in_transaction)} раз бэкенд ждал клиента с открытой транзакцией — "
+        f"{len(watch.idle_in_transaction)} раз бэкенд ждал клиента дольше "
+        f"{TxnWatch.IDLE_LIMIT_MS:.0f} мс с открытой транзакцией — "
         f"это HTTP-вызов внутри неё (инвариант 2)")
     assert watch.max_age_ms < TXN_LIMIT_MS, (
         f"самая долгая транзакция {watch.max_age_ms:.0f} мс при пределе {TXN_LIMIT_MS:.0f} мс: "
@@ -479,8 +493,17 @@ def test_step_09_control_scan_rejects_a_foreign_barcode_and_the_session_keeps_pl
     `workstation_pick_session` на 6497 заданий из раздела 3.
     """
     pulled = need(ctx, "pulled", 8)
-    first_session = next(iter(pulled.values()))
-    task_id = first_session[0]
+    # Задание берём из пятёрки шага 4, а не первое попавшееся из произвольной
+    # сессии. В очереди рядом лежит задание шага 6 — на ZERO_STOCK_BARCODE, — и
+    # если досталось оно, «свой» штрихкод BARCODES[0] не совпадёт, шаг
+    # покраснеет не по вине рабочего места, а за ним и шаг 11, которому нужен
+    # packed_task_ids. Наблюдалось: два прогона подряд при одном и том же коде,
+    # в одном шаг 9 зелёный, в другом красный.
+    step_04 = {str(task_id) for task_id in need(ctx, "task_ids", 4)}
+    taken = [task_id for ids in pulled.values() for task_id in ids if str(task_id) in step_04]
+    assert taken, (
+        "среди выданных нет ни одного задания шага 4 — сканировать их штрихкодом нечего")
+    task_id = taken[0]
 
     rejected = wms.result(f"/tasks/{task_id}/scan", {"barcode": data.BARCODES[2]})
     assert rejected.get("status") != "picked", (
@@ -539,6 +562,30 @@ def test_step_10_print_reaches_the_device_in_under_50ms(
         f"wms отдаёт стикер за {worst:.0f} мс при пределе {PRINT_LIMIT_MS:.0f} мс — "
         f"на агента и принтер не остаётся ничего")
 
+    # Вторая половина пути. «Клик печать» на складе делается на экране рабочего
+    # места, оно и толкает байты агенту по открытому соединению (раздел 6.6).
+    # Дёргать один только wms недостаточно: он отдаёт байты, но никому их не
+    # push'ит, и агент честно отчитывается о нуле записей. Проверять надо путь
+    # целиком, иначе половина, ради которой переписана вся этикетка, не
+    # проверяется вовсе.
+    workstation_url = os.getenv("WORKSTATION_BASE_URL")
+    if not workstation_url:
+        not_ready(
+            "не задана переменная окружения WORKSTATION_BASE_URL; «клик печать» идёт "
+            "через рабочее место (раздел 6.6), и без его адреса агенту никто "
+            "не толкнёт байты")
+    try:
+        pushed = httpx.post(
+            f"{workstation_url.rstrip('/')}/api/workstation/v1/print",
+            json={"task_id": str(task_id), "station_id": str(station_id),
+                  "actor_id": "picker-1", "reprint": True,
+                  "reason": "прогон: замер записи в устройство"},
+            timeout=10.0)
+    except Exception as failure:  # noqa: BLE001
+        not_ready(f"рабочее место не отвечает по WORKSTATION_BASE_URL ({failure})")
+    assert pushed.status_code == 200, (
+        f"рабочее место не приняло печать: {pushed.status_code} / {pushed.text[:200]}")
+
     stats_url = os.getenv("PRINT_AGENT_STATS_URL")
     if not stats_url:
         not_ready(
@@ -546,7 +593,12 @@ def test_step_10_print_reaches_the_device_in_under_50ms(
             "Нужен PRINT_AGENT_STATS_URL с JSON {\"last_write_ms\": …, \"task_id\": …}; "
             "без него «до записи в устройство» измерить нечем")
     try:
-        stats = httpx.get(stats_url, timeout=5.0).json()
+        # Push агенту и ответ рабочему месту — разные стороны сокета, поэтому
+        # телеметрию ждём, а не читаем сразу: гонка здесь дала бы ложный красный.
+        stats = wait_until(
+            lambda: (lambda s: s if s.get("last_write_ms") is not None else None)(
+                httpx.get(stats_url, timeout=5.0).json()),
+            timeout_s=10.0, interval_s=0.1) or httpx.get(stats_url, timeout=5.0).json()
     except Exception as failure:  # noqa: BLE001
         not_ready(f"агент печати не отвечает по PRINT_AGENT_STATS_URL ({failure})")
     write_ms = stats.get("last_write_ms")
