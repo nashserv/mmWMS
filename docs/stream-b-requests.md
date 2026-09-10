@@ -1,0 +1,227 @@
+# Заявки потока B потоку 0
+
+Правило 9.5.1 мастера: чужие файлы не редактируются, нужно чужое — заявка в
+поток 0. Правило 9.5.2: контракт после заморозки меняется только потоком 0 с
+одновременным обновлением всех трёх потоков.
+
+Здесь перечислено всё, что поток B не может сделать сам. Каждый пункт проверен
+на стенде `127.0.0.1:8080` 10.09.2026, форма ответа снята с живого сервиса, а
+не выведена из чтения кода.
+
+Порядок — по тому, насколько пункт мешает работать.
+
+---
+
+## Заявка 1. Нет маршрута чтения расхождений — экран начальника склада слепой
+
+**Блокирует поставку потока B.**
+
+Файл `03-stream-b-picker-app.md` требует экран, на котором начальник склада
+видит расхождения, «включая `ledger_short` (клапан раздела 6.5 мастера) — не
+спрятанные, а на видном месте с адресом и количеством».
+
+Схема это поддерживает. `services/wms/migrations/005_receiving_inventory.sql`
+заводит `discrepancy(kind='ledger_short')` и даже держит под него отдельный
+индекс с прямым комментарием:
+
+```sql
+-- Экран начальника склада: сборки без остатка за смену (раздел 6.5).
+CREATE INDEX discrepancy_ledger_short_idx ON discrepancy (created_at DESC)
+    WHERE kind = 'ledger_short';
+```
+
+**Прочитать этот список нечем.** В контракте расхождения отдаёт только
+`/receipts/screen`, внутри приёмок. У `ledger_short` `receipt_id` пуст (он
+рождается на резерве, а не на приёмке, `discrepancy_has_a_source` требует
+непустым `task_id`), поэтому в `/receipts/screen` он не попадёт никогда.
+
+**Просим маршрут** `POST /discrepancies` рядом с `/receipts/screen`:
+
+```yaml
+params:
+  kinds:            [shortage|surplus|mismatch|damage|ledger_short]   # по умолчанию все
+  decisions:        [pending|accepted|rejected|written_off]           # по умолчанию pending
+  owner_external_id: ...            # необязательно
+  since:            date-time       # по умолчанию сутки
+  limit:            1..500
+result:
+  discrepancies: [Discrepancy]      # схема уже есть в контракте
+  generated_at:  date-time
+```
+
+Схема `Discrepancy` в контракте уже описана и содержит `cell_address`, `qty`,
+`decision`, `liable` — всё, что нужно экрану. Нужен только маршрут.
+
+Пока маршрута нет, блок «Сборка без остатка» на экране начальника склада
+показывает не пустой список, а текст «прочитать нечем, заявка 1». Пустой
+список без объяснения читался бы как «таких случаев не было» — то есть ровно
+как та тишина, которую чиним.
+
+---
+
+## Заявка 2. Заглушка занимает задания при `claim: false`
+
+**Блокирует работу против mock.**
+
+Контракт (`TasksPullParams.claim`):
+
+> `false` — только посмотреть: экран обновляется чаще, чем человек берёт
+> работу, и занимать при каждом обновлении нельзя.
+
+Заглушка параметр `claim` не читает вовсе (`services/wms/app/api.py`,
+`tasks_pull` → `state.pull(assignee=..., limit=...)`) и занимает задания всегда.
+Проверено:
+
+```
+POST /tasks/pull {"assignee":"peek-1","limit":2,"claim":false}
+  → задания вернулись с assignee = "peek-1", state = "picking",
+    leased_until = 2026-09-10T15:22:04
+
+POST /tasks/pull {"assignee":"peek-2","limit":2,"claim":false}
+  → вернулись ДРУГИЕ задания: первые две уже заняты
+```
+
+Последствие ровно то, ради устранения которого поток B и существует: экран,
+опрашивающий очередь раз в секунду, за минуту разложит всю очередь по
+несуществующей сессии, и сборщики не получат ничего. Симптом при этом
+выглядит как «заданий нет» — то есть неотличим от «новые заказы не падают в
+приложение».
+
+Заодно заглушка игнорирует и фильтр `states`: она всегда отдаёт только
+`reserved` без исполнителя, поэтому задания в работе (`picking`, `packed`)
+через `/tasks/pull` не видны вовсе.
+
+**Просим** читать `claim` и `states` в заглушке. Одна ветка на маршрут.
+
+Пока этого нет, рабочее место замечает нарушение по ответу (задание пришло с
+`assignee`, равным его собственному имени для чтения), поднимает флаг
+`claim_ignored`, называет его в `/api/workstation/v1/status` и на экране
+начальника склада и раздаёт занятые задания сборщикам из проекции — иначе
+смена встанет на пустом экране при полной очереди. Обход включается **только
+по факту нарушения** и исчезнет сам, как только заглушка начнёт уважать
+`claim: false`; против настоящего сервиса он не включится ни разу.
+
+---
+
+## Заявка 3. `/boxes/list` падает с 500 на любом вызове
+
+**Блокирует экран размещения.**
+
+```
+POST /boxes/list {"seller_external_id": "..."} → HTTP 500
+```
+
+В логе:
+
+```
+File "/app/app/state.py", line 530, in boxes
+    if box["state"] == "stored"
+KeyError: 'state'
+```
+
+Причина: коробки-фикстуры в `services/wms/app/fixtures.py` заведены без поля
+`state`, а `MockState.boxes()` его читает. Коробки, созданные через `/boxes`,
+поле имеют, но одной фикстурной хватает, чтобы упал весь список.
+
+**Просим** добавить `"state": "stored"` в `fixtures.BOXES` либо читать через
+`box.get("state", "stored")`.
+
+---
+
+## Заявка 4. Заглушка отвечает не по контракту на восьми маршрутах
+
+**Не блокирует, но учит неправильному формату.** Заглушка, отвечающая не той
+формой, хуже отсутствующей: клиенты потоков B и C выучивают её форму, а
+расхождение всплывает в день переключения на настоящий сервис.
+
+Снято со стенда 10.09.2026. В скобках — чего не хватает против схемы
+контракта.
+
+| Маршрут | Отдаёт | Контракт |
+|---|---|---|
+| `/tasks/{id}/pack` | `{status, task_id}` | `TaskCommandResult` (нет `owner_external_id`, `state`) |
+| `/labels/{id}/print` | `{status, task_id, format, payload, checksum}` | `LabelPrintResult` (нет `station_id` — обязательное поле) |
+| `/shipments/picked` | `{shipments: []}` | `{tasks: [TaskProjection]}` |
+| `/shipments` | игнорирует `action`: любой вызов заводит новую поставку в `open`, `handed_by` и `handed_at` остаются пустыми | `ShipmentResult` с переходом состояния; `hand_over` обязан проставить `handed_by`/`handed_at` |
+| `/receipts/screen` | `{open_receipts, cells, discrepancy_kinds}` | `{receipts, generated_at}` |
+| `/putaway/screen` | `{pending, cells}` | `{items, generated_at}` |
+| `/inventory/sheet` | `{lines: [{cell, box_barcode, ...}]}` | `{owner_external_id, lines, generated_at}`, в строке `cell_address` |
+| `/boxes`, `/boxes/list` | `{cell, barcode_product, seller_external_id}` | `BoxProjection`: `cell_address`, `product_barcode`, `owner_external_id` |
+| `/tasks/pull` → `TaskProjection` | `cell_id` (uuid), `label_id` | `placements[]` с `cell_address` и блок `label` |
+
+Отдельно про этикетку: `LabelResult.payload` по контракту — base64
+(`contentEncoding: base64`), заглушка отдаёт ZPL текстом, а `content_type`
+заполняет значением `zplv` вместо MIME-типа (`application/x-zpl`).
+
+Рабочее место понимает обе формы, но каждое такое чтение считает счётчиком
+`mmx_workstation_contract_fallbacks_total{route, field}` — на стенде он растёт
+постоянно. Когда заявка будет закрыта, счётчик обязан встать в ноль; алерт
+`WorkstationContractDrift` следит именно за этим.
+
+Про `/shipments` отдельно: пока `action` не читается, подтверждение передачи
+человеком проверить нечем — рабочее место подпись требует и отправляет
+(`handed_over_by`), но результат её применения увидеть негде. Это шаг 11
+полного прогона, `ASSERT HANDED_TO_WB требует подтверждения человеком`.
+
+**Важно для прогона.** Пункт 9 раздела 9.6 проверяет
+`packed.get("state") in ("packed", "labeled")` — против нынешней заглушки шаг
+красный не потому, что рабочее место не работает, а потому, что заглушка не
+возвращает `state`.
+
+---
+
+## Заявка 5. Нет способа узнать станции по контракту
+
+`/labels/{task_id}/print` требует `station_id`, а полный прогон (шаг 10) берёт
+его прямо из базы: `SELECT id FROM station WHERE active`. У рабочего места
+доступа к базе `wms` нет и быть не должно.
+
+Сейчас `station_id` настраивается на каждом ПК вручную (переменная агента
+`--station-id`). Это рабочий вариант, и заявка не срочная.
+
+**Просим** одно из двух — на выбор потока 0:
+
+1. маршрут `POST /stations` (чтение: `id`, `name`, `printer_transport`,
+   `active`), либо
+2. явное правило в контракте: «`station_id` настраивается на станции, сервис
+   его не перечисляет». Тогда рабочее место перестанет ждать маршрут.
+
+---
+
+## Заявка 6. Подключить рабочее место к стенду
+
+`infrastructure/` принадлежит потоку 0, поэтому compose и опрос Prometheus
+правим не мы. Готовые фрагменты лежат у нас, копировать без изменений:
+
+| Что | Откуда взять |
+|---|---|
+| Сервис `workstation` и агент печати для `compose.yaml` | `services/fbs-operator-workstation/compose.workstation.yaml` |
+| Цели опроса Prometheus | `observability/prometheus/workstation-scrape.yml` |
+| Правила алертов | `observability/prometheus/workstation-alerts.yml` (проверены `promtool check rules`) |
+| Дашборд Grafana | `observability/grafana/workstation.json` |
+| База `workstation` | уже создаётся `scripts/create-databases.sh`; миграция — `services/fbs-operator-workstation/migrations/`, накатывается тем же `migrate.sh` с `MIGRATIONS_DIR` |
+
+Плюс job в `.github/workflows/ci.yml` — тесты рабочего места:
+
+```yaml
+  workstation:
+    name: Тесты рабочего места
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install --no-cache-dir -r services/fbs-operator-workstation/requirements-bus.txt pytest
+      - name: pytest
+        working-directory: services/fbs-operator-workstation
+        env: {APP_ENV: test}
+        run: python -m pytest -q
+```
+
+И `PRINT_AGENT_STATS_URL` для шага 10 полного прогона — телеметрию записи в
+устройство отдают оба конца, любой на выбор:
+
+```
+PRINT_AGENT_STATS_URL=http://workstation:8080/agent/stats   # сервис, агрегирует все станции
+PRINT_AGENT_STATS_URL=http://workstation-agent:8091/        # сам агент станции
+```
