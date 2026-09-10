@@ -60,6 +60,11 @@ class Poller:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._adopt_lock = asyncio.Lock()
+        # Кому отдано задание в обход (см. claim_ignored). Держится здесь,
+        # потому что следующий ответ wms придёт с прежним assignee и затрёт
+        # local-выдачу — а задание, потерявшее хозяина, уйдёт второму
+        # сборщику. Двое за одной вещью — то, чего быть не должно никогда.
+        self._adopted: dict[str, str] = {}
         self.polls_ok = 0
         self.polls_failed = 0
         # wms обязан не занимать ничего при `claim: false` (контракт
@@ -143,6 +148,7 @@ class Poller:
         finally:
             metrics.POLL_DURATION.observe(time.perf_counter() - started)
 
+        self._restamp(batch.tasks)
         fresh = self._projection.apply(
             batch.tasks, available_total=batch.available_total, served_at=batch.served_at)
         await self._verify_missing()
@@ -181,9 +187,20 @@ class Poller:
                 return
             if task is None or task.state in TERMINAL_STATES:
                 self._projection.forget(task_id)
+                self._adopted.pop(task_id, None)
                 metrics.TASKS_RETIRED.inc()
             else:
+                self._restamp([task])
                 self._projection.upsert(task)
+
+    def _restamp(self, tasks: list[Any]) -> None:
+        """Вернуть заданию сборщика, которому оно уже отдано в обход."""
+        if not self._adopted:
+            return
+        for task in tasks:
+            owner = self._adopted.get(task.task_id)
+            if owner:
+                task.assignee = owner
 
     def _detect_claim_violation(self, batch: PullBatch) -> None:
         """Заметить, что сервис занял задания при чтении экрана.
@@ -220,9 +237,11 @@ class Poller:
             return []
         async with self._adopt_lock:
             free = [task for task in self._projection.all()
-                    if task.assignee == SCREEN_ASSIGNEE][:max(0, limit)]
+                    if task.assignee == SCREEN_ASSIGNEE
+                    and task.task_id not in self._adopted][:max(0, limit)]
             for task in free:
                 task.assignee = assignee
+                self._adopted[task.task_id] = assignee
                 self._projection.upsert(task)
         if free:
             logger.warning("сборщику %s отдано %d заданий из занятых экраном "

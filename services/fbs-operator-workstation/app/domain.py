@@ -242,6 +242,11 @@ class Task:
     manual_review_code: str | None = None
     diverged: bool = False
     placements: list[Placement] = field(default_factory=list)
+    # Когда задание завёл wms. Не подставляется «сейчас», если сервис его не
+    # прислал: по такому полю задержка «задание в wms → задание на экране»
+    # всегда выходила бы нулевой, то есть метрика показывала бы идеал ровно
+    # там, где мерить нечем.
+    created_at: str | None = None
     updated_at: str | None = None
 
     @property
@@ -294,6 +299,7 @@ class Task:
             "cell_address": self.cell_address,
             "box_barcode": self.box_barcode,
             "placements": [placement.as_dict() for placement in self.placements],
+            "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
 
@@ -365,5 +371,6 @@ def task_from_contract(projection: dict[str, Any], *,
         manual_review_code=_text_or_none(projection.get("manual_review_code")),
         diverged=state is TaskState.DIVERGED,
         placements=rows,
-        updated_at=_text_or_none(projection.get("updated_at")) or now(),
+        created_at=_text_or_none(projection.get("created_at")),
+        updated_at=_text_or_none(projection.get("updated_at")),
     )

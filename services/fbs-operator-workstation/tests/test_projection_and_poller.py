@@ -202,3 +202,63 @@ def test_claiming_a_batch_puts_it_in_the_projection(wms: FakeWms):
     sent = wms.route_calls("/tasks/pull")[0]
     assert sent["claim"] is True and sent["lease_seconds"] == 900
     assert projection.get("a") is not None
+
+
+def test_visible_delay_is_not_measured_against_an_invented_timestamp():
+    """Идеальный ноль там, где мерить нечем, — ложный зелёный.
+
+    Критерий раздела 10 («WB → экран меньше 5 секунд») проверяется по
+    `created_at` сервиса. Нет его — наблюдения нет, и это видно счётчиком
+    расхождения контракта.
+    """
+    from app import metrics
+    counter = metrics.CONTRACT_FALLBACKS.labels(route="/tasks/pull",
+                                                field="created_at_missing")
+    before = counter._value.get()
+    histogram = metrics.TASK_VISIBLE_DELAY._sum.get()
+
+    projection = Projection()
+    naked = task_projection("no-time")
+    naked.pop("created_at")
+    projection.apply([task_from_contract(naked)])
+
+    assert counter._value.get() > before
+    assert metrics.TASK_VISIBLE_DELAY._sum.get() == histogram, (
+        "наблюдение записано по выдуманному времени")
+
+
+def test_visible_delay_is_measured_when_the_service_reports_creation_time():
+    from datetime import datetime, timedelta, timezone
+
+    from app import metrics
+    before = metrics.TASK_VISIBLE_DELAY._sum.get()
+    born = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+    projection = Projection()
+    projection.apply([make("timed", created_at=born)])
+    assert metrics.TASK_VISIBLE_DELAY._sum.get() > before
+
+
+def test_the_workaround_never_hands_one_task_to_two_pickers(wms: FakeWms):
+    """Обход нарушения контракта не имеет права нарушить главное правило склада.
+
+    Задание, отданное сборщику в обход, обязано остаться за ним и после
+    следующего опроса: иначе двое пойдут за одной вещью.
+    """
+    claimed = task_projection("a", assignee=SCREEN_ASSIGNEE, state="picking")
+    wms.on("/tasks/pull", lambda params: pull_result(
+        claimed, leased_until="2026-09-10T10:15:00+00:00"))
+    wms.on("/tasks/a", lambda params: claimed)
+    projection = Projection()
+    poller = Poller(wms.client(), projection, interval_seconds=60, limit=50)
+    run(poller.poll_once())
+    assert poller.claim_ignored is True
+
+    first = run(poller.adopt_screen_claimed(assignee="picker-1", limit=5))
+    assert [task.task_id for task in first] == ["a"]
+
+    # Следующий опрос приносит то же задание с прежним assignee сервиса.
+    run(poller.poll_once())
+    assert projection.get("a").assignee == "picker-1", "хозяин задания не должен теряться"
+
+    second = run(poller.adopt_screen_claimed(assignee="picker-2", limit=5))
+    assert second == [], "второму сборщику то же задание не достаётся"

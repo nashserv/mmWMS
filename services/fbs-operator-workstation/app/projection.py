@@ -164,9 +164,15 @@ class Projection:
         Критерий раздела 10: меньше 5 секунд p99. Мерить нужно от создания
         задания, а не от ответа сервера, иначе меряется скорость сети, а не
         то, сколько сборщик реально ждал работу.
+
+        Сервис не прислал `created_at` — наблюдение не записывается вовсе.
+        Подставить «сейчас» значило бы получить идеальный ноль ровно там, где
+        мерить нечем: ложный зелёный опаснее отсутствующего.
         """
-        created = _parse_ts(task.updated_at)
+        created = _parse_ts(task.created_at)
         if created is None:
+            metrics.CONTRACT_FALLBACKS.labels(route="/tasks/pull",
+                                              field="created_at_missing").inc()
             return
         delay = seen_now - created.timestamp()
         if 0 <= delay <= 3600:
