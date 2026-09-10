@@ -399,14 +399,16 @@ class MockState:
                 if seller_external_id and seller != seller_external_id:
                     continue
                 reserved = self._reserved.get((seller, barcode), 0)
-                # available = good - reserved - buffer, всегда занижать
-                # (инвариант 7). Буфер у фикстур нулевой.
+                # available = good - buffer, всегда занижать (инвариант 7).
+                # Резерв не вычитается: у заглушки `good` уменьшается при
+                # резерве так же, как в проекции настоящего сервиса, и вычесть
+                # его второй раз значит занизить вдвое. Буфер у фикстур нулевой.
                 rows.append({
                     "barcode": barcode,
                     "seller_external_id": seller,
                     "good": good,
                     "reserved": reserved,
-                    "available": max(0, good - reserved),
+                    "available": max(0, good),
                 })
             return rows
 

@@ -199,9 +199,14 @@ def test_stock_publication_leaves_immediately_after_the_movement(
     assert after[0]["result"]["status"] == "ok"
 
 
-def test_published_amount_is_lowered_by_reservation_and_buffer(
+def test_published_amount_is_lowered_by_the_buffer_only(
         pool: ConnectionPool, cabinet: dict) -> None:
-    """Инвариант 7: `available = good − reserved − buffer`, всегда занижая."""
+    """Инвариант 7: `available = good − buffer`, всегда занижая.
+
+    Резерв не вычитается: движение `good → reserved` уже вывело его из `good`
+    (раздел 6.2). Тест держит именно это — вычесть резерв второй раз значит
+    занизить публикацию вдвое по активным резервам.
+    """
     with pool.connection() as connection:
         with single(connection) as cursor:
             cursor.execute(
@@ -221,8 +226,9 @@ def test_published_amount_is_lowered_by_reservation_and_buffer(
                                                  barcode=cabinet["barcode"],
                                                  sku_field=None)[0]["id"], "good")
     row = next(row for row in published if row["barcode"] == cabinet["barcode"])
-    assert row["available"] == max(0, good - 1 - 2), (
-        f"публикуем {row['available']} при good={good}, reserved=1, buffer=2")
+    assert row["available"] == max(0, good - 2), (
+        f"публикуем {row['available']} при good={good}, buffer=2: резерв уже "
+        f"вычтен движением, вычитать его второй раз нельзя")
     assert row["available"] >= 0, "в WB нельзя публиковать отрицательный остаток"
 
 

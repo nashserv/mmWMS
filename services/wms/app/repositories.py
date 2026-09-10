@@ -796,17 +796,23 @@ def label_of(cursor: Cursor, task_id: uuid.UUID) -> dict[str, Any] | None:
 
 def available_for_push(cursor: Cursor, owner_id: uuid.UUID,
                        sku_ids: Any = None) -> list[dict[str, Any]]:
-    """Строки для публикации в WB: `available = good − reserved − buffer`.
+    """Строки для публикации в WB: `available = good − buffer`.
+
+    Резерв здесь НЕ вычитается: транзакция раздела 6.2 переводит товар
+    движением `good → reserved`, то есть в проекции `stock_balance` состояние
+    `good` зарезервированного уже не содержит. Вычесть `reserved` второй раз —
+    занизить остаток вдвое по активным резервам: при 10 единицах и резерве на 3
+    в Wildberries уезжало 4 вместо 7. Занижение само по себе намеренно
+    (инвариант 7), но это уже не страховка, а потерянные продажи клиента.
 
     Отрицательное значение публикуется нулём, а не выбрасывается: строка, не
     доехавшая до Wildberries, оставит там прежнее большее число, то есть
-    продажу того, чего нет. Занижать всегда (инвариант 7).
+    продажу того, чего нет.
     """
     cursor.execute(
         "SELECT s.barcode, "
         "       GREATEST(0, "
         "           COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'good'), 0) "
-        "         - COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'reserved'), 0) "
         "         - s.buffer)::int AS available "
         "  FROM sku s "
         "  LEFT JOIN stock_balance b ON b.sku_id = s.id AND b.owner_id = s.owner_id "

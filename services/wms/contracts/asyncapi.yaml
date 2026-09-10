@@ -341,7 +341,7 @@ channels:
     address: inventory.stock.updated.v1
     title: Остаток пересчитан
     description: >-
-      Издаётся после каждого движения. `available = good - reserved - buffer`
+      Издаётся после каждого движения. `available = good - buffer`
       и всегда занижается (инвариант 6.4/7). Публикация в WB уходит немедленно,
       без таймеров, — событие лишь уведомляет портал и каталог о том, что уже сделано.
     bindings:
@@ -2025,7 +2025,7 @@ components:
         available:
           type: integer
           minimum: 0
-          description: 'good - reserved - buffer, не ниже нуля.'
+          description: 'good - buffer, не ниже нуля. Резерв уже вычтен движением good → reserved.'
         published_to_wb:
           type: boolean
           default: false

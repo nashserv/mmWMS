@@ -820,7 +820,7 @@ def test_step_15_stock_push_leaves_immediately_and_publishes_a_lowered_available
         wms: Wms, db: Db, ctx: dict[str, Any], scenario: data.Scenario) -> None:
     """Шаг 15: публикация остатка.
 
-    ASSERT вызов ушёл немедленно после движения, available = good − reserved − buffer.
+    ASSERT вызов ушёл немедленно после движения, available = good − buffer.
 
     Никаких таймеров и накопления (раздел 6.4). Ограничитель существует только
     как защита от бана Wildberries и в нормальной работе не срабатывает.
@@ -851,22 +851,22 @@ def test_step_15_stock_push_leaves_immediately_and_publishes_a_lowered_available
     assert push, ("после движения не ушла публикация остатка в WB: "
                   "остаток публикуется сразу, без таймеров (раздел 6.4)")
 
+    # Резерв в формуле не участвует: движение `good → reserved` уже вывело его
+    # из `good` (раздел 6.2). Вычесть его второй раз — занизить вдвое.
     expected = db.row(
         "SELECT COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'good'), 0) AS good, "
-        "       COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'reserved'), 0) AS reserved, "
         "       MAX(s.buffer) AS buffer "
         "  FROM stock_balance b JOIN owner o ON o.id = b.owner_id JOIN sku s ON s.id = b.sku_id "
         " WHERE o.seller_external_id = %s AND s.barcode = %s", (data.SELLER, barcode))
     assert expected, f"по {barcode} нет остатка в проекции"
-    available = max(0, int(expected["good"]) - int(expected["reserved"])
-                    - int(expected["buffer"] or 0))
+    available = max(0, int(expected["good"]) - int(expected["buffer"] or 0))
 
     published = wms.result("/catalog/stocks/bulk", {"seller_external_id": data.SELLER})
     rows = {row["barcode"]: row["available"] for row in published.get("stocks", [])}
     assert barcode in rows, f"{barcode} не попал в публикацию — непроданный товар"
     assert rows[barcode] == available, (
-        f"публикуем {rows[barcode]}, а good − reserved − buffer = {available}: "
-        f"остаток в WB всегда занижаем (инвариант 7)")
+        f"публикуем {rows[barcode]}, а good − buffer = {available}: "
+        f"остаток в WB всегда занижаем на страховой запас (инвариант 7)")
 
 
 # ============================================================= шаг 16 (A)

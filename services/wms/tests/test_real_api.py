@@ -120,7 +120,7 @@ def test_reservation_answers_by_contract(client: TestClient, seller: dict) -> No
 
 
 def test_published_stock_is_always_lowered(client: TestClient, seller: dict) -> None:
-    """Инвариант 7: в WB публикуется good − reserved − buffer, и никогда больше."""
+    """Инвариант 7: в WB публикуется good − buffer, и никогда больше."""
     call(client, "/warehouse/documents", {
         "seller_external_id": seller["seller"], "reference": unique("open"),
         "doc_type": "opening", "warehouse_code": "RUM",
@@ -135,10 +135,10 @@ def test_published_stock_is_always_lowered(client: TestClient, seller: dict) -> 
     published = call(client, "/catalog/stocks/bulk",
                      {"seller_external_id": seller["seller"]})
     rows = {row["barcode"]: row["available"] for row in published["stocks"]}
-    # good = 10 − 3 = 7 (движение good → reserved), reserved = 3, buffer = 0.
-    # Формула инварианта 7 вычитает резерв второй раз — так её проверяет шаг 15
-    # прогона, и так публикует сервис. Разбор — services/wms/FINDINGS.md, 1.
-    assert rows[seller["barcode"]] == 4, "публикуемый остаток разошёлся с инвариантом 7"
+    # good = 10 − 3 = 7 (движение good → reserved), buffer = 0. Резерв в формуле
+    # не участвует: он уже вычтен движением, и вычесть его второй раз значит
+    # опубликовать 4 при семи физически свободных (мастер 1.3, раздел 6.4).
+    assert rows[seller["barcode"]] == 7, "публикуемый остаток разошёлся с инвариантом 7"
     assert all(row["available"] >= 0 for row in published["stocks"])
 
 
