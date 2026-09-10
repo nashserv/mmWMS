@@ -51,6 +51,50 @@ class StockState(str, Enum):
     PROCESSING = "processing"
 
 
+# Какой статус Wildberries соответствует нашему состоянию задания.
+# Таблица 1 файла docs/state-mapping.md, заморожена потоком 0. Отсюда работает
+# сверка: расхождение с этой таблицей — состояние `diverged` и алерт, а не
+# тихая перезапись (инвариант 10). В боевом контуре таких расхождений 2467 из
+# 6374, и все они молчали.
+EXPECTED_WB_STATUS: dict[str, str] = {
+    TaskState.NEW.value: "new",
+    TaskState.MANUAL_REVIEW.value: "new",
+    TaskState.SHORT.value: "new",
+    TaskState.RESERVED.value: "new",
+    TaskState.PICKING.value: "new",
+    TaskState.PICKED.value: "new",
+    TaskState.PACKED.value: "new",
+    TaskState.LABELED.value: "new",
+    TaskState.IN_SUPPLY.value: "confirm",
+    TaskState.SHIPPED.value: "complete",
+    TaskState.HANDED.value: "complete",
+    TaskState.ACCEPTED.value: "complete",
+    TaskState.CANCELLED.value: "cancel",
+}
+
+# Обратное направление — так работает опросчик (таблица 2 того же файла).
+WB_STATUS_TO_STATE: dict[str, str] = {
+    "new": TaskState.RESERVED.value,
+    "confirm": TaskState.IN_SUPPLY.value,
+    "complete": TaskState.SHIPPED.value,
+    "cancel": TaskState.CANCELLED.value,
+}
+
+
+def agrees_with_wb(state: str, wb_status: str | None) -> bool:
+    """Согласуются ли наше состояние и статус Wildberries.
+
+    `diverged` согласуется с чем угодно: расхождение уже зафиксировано, и
+    заново расходиться ему некуда. Неизвестный статус WB считается
+    расхождением — незнакомое значение разбирает человек, а не догадка.
+    """
+    if state == TaskState.DIVERGED.value:
+        return True
+    if wb_status is None:
+        return True
+    return EXPECTED_WB_STATUS.get(state) == wb_status
+
+
 class ErrorCode(str, Enum):
     """Коды отказа резерва (приложение C).
 

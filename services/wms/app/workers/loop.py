@@ -20,9 +20,23 @@ log = logging.getLogger("wms.worker")
 
 
 class Worker:
-    def __init__(self, name: str, *, idle_seconds: float = 1.0) -> None:
+    """Цикл воркера с двумя видами пауз.
+
+    `idle_seconds` — пауза, когда делать было нечего. `min_interval` —
+    гарантированный промежуток между началами циклов, даже когда работа есть.
+
+    Второй нужен не для экономии: воркер, крутящийся без пауз, выбирает общий
+    на кабинет лимит Wildberries (300 запросов в минуту) и лишает вызовов
+    соседей — опрос заданий и публикацию остатка. Один раз это уже случилось:
+    сверка нашла себе работу на каждом цикле и за минуту сожгла окно, после
+    чего задания перестали доезжать вовсе.
+    """
+
+    def __init__(self, name: str, *, idle_seconds: float = 1.0,
+                 min_interval: float = 0.0) -> None:
         self.name = name
         self._idle = idle_seconds
+        self._min_interval = min_interval
         self._stop = threading.Event()
 
     def request_stop(self, *_: object) -> None:
@@ -62,12 +76,14 @@ class Worker:
                 continue
 
             backoff = self._idle
+            elapsed = time.monotonic() - started
             WORKER_PROCESSED.labels(worker=self.name).inc(max(0, processed))
             if processed:
                 log.info("воркер %s: обработано %d за %.0f мс",
-                         self.name, processed, (time.monotonic() - started) * 1000)
+                         self.name, processed, elapsed * 1000)
+                self.sleep(self._min_interval - elapsed)
             else:
-                self.sleep(self._idle)
+                self.sleep(max(self._idle, self._min_interval - elapsed))
         log.info("воркер %s остановлен", self.name)
 
 

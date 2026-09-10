@@ -1510,3 +1510,74 @@ def unassembled_tasks_of_supply(cursor: Cursor, supply_id: uuid.UUID) -> list[di
         " WHERE supply_id = %s AND state <> ALL(%s) AND state <> 'cancelled'",
         (supply_id, list(ASSEMBLED_STATES)))
     return cursor.fetchall()
+
+
+# ------------------------------------------------------------------ сверка
+
+def accounts_due_for_reconcile(cursor: Cursor, *, limit: int, older_than_seconds: float,
+                               only: Sequence[str] | None = None) -> list[dict[str, Any]]:
+    """Кабинеты, у которых давно не сверялись задания.
+
+    Режим не важен: сверка читает только `GET /api/v3/orders` и ничего не
+    пишет, поэтому работает и в shadow — там она и есть главный инструмент
+    (раздел 11, шаг 2).
+    """
+    cursor.execute(
+        "SELECT a.id, a.external_id, a.secret_ref, a.mode, a.owner_id "
+        "  FROM wb_account a "
+        " WHERE a.status IN ('ACTIVE', 'RATE_LIMITED') "
+        "   AND (%(only)s::text[] IS NULL OR a.external_id = ANY(%(only)s)) "
+        "   AND EXISTS (SELECT 1 FROM wms_task t "
+        "                WHERE t.wb_account_id = a.id "
+        "                  AND t.state NOT IN ('cancelled', 'accepted', 'diverged') "
+        "                  AND (t.last_reconciled_at IS NULL "
+        "                       OR t.last_reconciled_at < now() "
+        "                          - make_interval(secs => %(age)s))) "
+        " ORDER BY a.external_id LIMIT %(limit)s",
+        {"limit": limit, "age": float(older_than_seconds),
+         "only": list(only) if only else None})
+    return cursor.fetchall()
+
+
+def tasks_for_reconcile(cursor: Cursor, wb_order_ids: Sequence[int]) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT id, wb_order_id, state, wb_status FROM wms_task "
+        " WHERE wb_order_id = ANY(%s) AND state <> 'diverged' FOR UPDATE",
+        (list(wb_order_ids),))
+    return cursor.fetchall()
+
+
+def mark_reconciled(cursor: Cursor, task_id: uuid.UUID, *, wb_status: str | None) -> None:
+    cursor.execute(
+        "UPDATE wms_task SET last_reconciled_at = now(), wb_status = COALESCE(%s, wb_status) "
+        " WHERE id = %s", (wb_status, task_id))
+
+
+def mark_diverged(cursor: Cursor, task_id: uuid.UUID, *, wb_status: str | None) -> None:
+    """Задание останавливается и ждёт человека, а не перезаписывается.
+
+    Кто прав — неизвестно: у WB может быть отмена, которой мы не видели, а у
+    нас отгрузка, о которой WB ещё не знает. Догадка здесь дороже разбора.
+    """
+    cursor.execute(
+        "UPDATE wms_task SET state = 'diverged', wb_status = COALESCE(%s, wb_status), "
+        "                    last_reconciled_at = now(), version = version + 1 "
+        " WHERE id = %s", (wb_status, task_id))
+
+
+def divergence_report(cursor: Cursor, *, limit: int = 500) -> list[dict[str, Any]]:
+    """Отчёт расхождений по владельцу и товару — то, что читают в shadow.
+
+    Раздел 11, шаг 2: `wms` строит свою таблицу рядом с боевым контуром, и
+    ежедневный отчёт показывает, сходятся ли они.
+    """
+    cursor.execute(
+        "SELECT o.seller_external_id, s.barcode, t.state, t.wb_status, count(*) AS tasks, "
+        "       min(t.updated_at) AS oldest "
+        "  FROM wms_task t "
+        "  JOIN owner o ON o.id = t.owner_id "
+        "  LEFT JOIN sku s ON s.id = t.sku_id "
+        " WHERE t.state = 'diverged' "
+        " GROUP BY o.seller_external_id, s.barcode, t.state, t.wb_status "
+        " ORDER BY count(*) DESC LIMIT %s", (limit,))
+    return cursor.fetchall()
