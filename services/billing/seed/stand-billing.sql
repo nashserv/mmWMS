@@ -171,13 +171,14 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO billing_billable_event (event_type, service, quantity_path, active, comment) VALUES
     ('wb.supply.shipped.v1', 'shipping', 'orders', true, 'Тарифицируется на проде сегодня. orders — заказов в поставке, тарифицируемое количество (приложение E мастера).'),
     ('order.packed.v1', 'packing', NULL, true, 'Тарифицируется на проде сегодня. Одно событие — одна упаковка.'),
-    ('wb.orders.processed.v1', 'order_processing', NULL, true, 'Тарифицируется на проде сегодня. Формы payload в контракте потока 0 нет: количество считаем единицей до подтверждения потоком A.'),
-    ('wms.label.attached.v1', 'labeling', NULL, true, 'Стикеровка сегодня бесплатна (раздел 3.4). Владельца событие не несёт — пока уходит в billing_unbilled с SELLER_UNKNOWN, и это заявка потоку A на seller_external_id в payload, а не повод выключить услугу.'),
+    ('wb.orders.processed.v1', 'order_processing', 'orders', true, 'Тарифицируется на проде сегодня. Количество — orders, форма payload зафиксирована в приложении E мастера (версия 1.3). До неё считали единицей, и при пачке заказов клиент был бы недосчитан.'),
+    ('wms.label.attached.v1', 'labeling', NULL, true, 'Стикеровка сегодня бесплатна (раздел 3.4). Владелец в payload обязателен с версии 1.3 мастера — до неё строки уходили в billing_unbilled с SELLER_UNKNOWN.'),
     ('wms.return.received.v1', 'returns', NULL, true, 'Возвраты сегодня не тарифицируются (раздел 3.4).'),
     ('wms.packing.completed.v1', 'packing', NULL, false, 'Выключено: то же физическое действие, что order.packed.v1 рабочего места. Включить только вместе с выключением того — иначе двойной счёт клиенту.'),
     ('wms.picking.completed.v1', 'picking', NULL, false, 'Выключено: подбор оплачивается сборкой заказа, а не отдельно. Включить, когда владелец подтвердит сборку отдельной услугой.'),
     ('wms.item.scanned.v1', 'picking', NULL, false, 'Выключено: скан у стойки — шаг внутри подбора, а не услуга. В выработку смены он идёт, в счёт клиенту — нет.'),
-    ('inventory.movement.recorded.v1', 'receiving', NULL, false, 'Выключено: движение товара сопровождает почти всё и выставится дважды. Приёмка ждёт события завершённой приёмки от потока A — заявка в поток 0.')
+    ('wms.receipt.completed.v1', 'receiving', 'accepted_qty', true, 'Приёмка. Событие заведено в версии 1.3 мастера: до него тарифицировать её было нечем. Количество — accepted_qty, принятое ПО ФАКТУ: приёмка с недостачей оплачивается тем, что реально легло на полку.'),
+    ('inventory.movement.recorded.v1', 'receiving', NULL, false, 'Выключено: движение товара сопровождает почти всё и выставится дважды. Приёмку тарифицирует wms.receipt.completed.v1 — одно событие на документ, а не на каждую строку.')
 ON CONFLICT (event_type) DO NOTHING;
 
 COMMIT;
