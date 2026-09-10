@@ -22,7 +22,10 @@ from fastapi.responses import JSONResponse
 from .metrics import observe_http
 from .postgres import ConnectionPool
 from .stock_push import publisher as stock_publisher_for
+from .supplies import release_from_supply
+from .receiving import ReceivingOperations
 from .service import CatalogOperations, StockOperations, WmsService
+from .tasks import TaskOperations
 
 BASE_PATH = "/api/mmx/wms/v1"
 
@@ -86,6 +89,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     wms = WmsService(pool, on_stock_changed=stock_publisher.notify)
     catalog = CatalogOperations(pool)
     stock = StockOperations(pool, stock_publisher.notify)
+    receiving = ReceivingOperations(pool, stock_publisher.notify)
+    tasks = TaskOperations(pool, wms, stock_publisher.notify,
+                           on_supply_release=release_from_supply(pool))
 
     # Событий отсюда никто не отправляет намеренно. Они уже записаны в outbox
     # той же транзакцией, что и движение товара, и в шину их несёт единственный
@@ -134,6 +140,25 @@ def create_router(pool: ConnectionPool) -> APIRouter:
 
     def post(path: str, handler: Callable[[dict[str, Any]], Any]) -> None:
         router.add_api_route(path, guarded(handler), methods=["POST"])
+
+    def post_id(path: str, handler: Callable[..., Any]) -> None:
+        """Маршрут с идентификатором в пути: `/tasks/{task_id}/...`."""
+        async def endpoint(task_id: str, request: Request) -> JSONResponse:
+            started = time.monotonic()
+            body = await _body(request)
+            try:
+                payload = handler(task_id, _params(body))
+            except ValueError as invalid:
+                observe_http(400, time.monotonic() - started)
+                return _error(body, JSONRPC_INVALID_PARAMS, str(invalid))
+            except Exception as failure:                    # noqa: BLE001
+                log.exception("маршрут %s упал", path)
+                observe_http(500, time.monotonic() - started)
+                return _error(body, JSONRPC_INTERNAL, f"внутренняя ошибка: {failure}")
+            observe_http(200, time.monotonic() - started)
+            return _result(body, payload)
+
+        router.add_api_route(path, endpoint, methods=["POST"])
 
     # ------------------------------------------------------------ служебное
 
@@ -190,36 +215,50 @@ def create_router(pool: ConnectionPool) -> APIRouter:
 
     post("/wb/accounts", wb_accounts)
 
+    # ---------------------------------------------------------------- задания
+    # /tasks/pull регистрируется ДО /tasks/{task_id}: иначе параметр пути
+    # проглотит слово pull и рабочее место получит «задание с id pull».
+
+    post("/tasks/pull", tasks.pull)
+    post_id("/tasks/{task_id}", lambda task_id, _params: tasks.read(task_id))
+    post_id("/tasks/{task_id}/scan", tasks.scan)
+    post_id("/tasks/{task_id}/pack", tasks.pack)
+    post_id("/tasks/{task_id}/return-to-shelf", tasks.return_to_shelf)
+    post_id("/tasks/{task_id}/cancel", tasks.cancel)
+
+    # ---------------------------------------------------- приёмка и хранение
+
+    post("/receipts", receiving.receive)
+    post("/receipts/screen", receiving.screen)
+    post("/putaway/screen", receiving.putaway_screen)
+    post("/inventory/sheet", receiving.sheet)
+    post("/inventory/count", receiving.count)
+
+    def box_create(params: dict[str, Any]) -> dict[str, Any]:
+        """Завести коробку. Комментарий обязателен — так требует склад.
+
+        «Через месяц стоят сотни одинаковых коробок» (раздел 2.9): без пометки
+        нужную не найти, поэтому пустой комментарий отбивается здесь и в схеме.
+        """
+        return receiving.create_box(params)
+
+    post("/boxes", box_create)
+    post("/boxes/list", receiving.list_boxes)
+    post("/boxes/remove", receiving.remove_box)
+    post("/storage/lookup", receiving.lookup)
+    post("/storage/count", receiving.count_cell)
+
     # ------------------------------------- ещё не написано потоком A
 
     for path, what in (
-        ("/tasks/pull", "выдача заданий сборщикам"),
-        # Маршруты с параметром пути регистрируются здесь же: путь у них
-        # разный, а ответ пока один — «этого ещё нет».
-        ("/tasks/{task_id}", "чтение задания"),
-        ("/tasks/{task_id}/scan", "скан у стойки"),
-        ("/tasks/{task_id}/pack", "упаковка"),
-        ("/tasks/{task_id}/label", "выдача стикера"),
-        ("/tasks/{task_id}/return-to-shelf", "возврат на полку"),
-        ("/tasks/{task_id}/cancel", "отмена задания"),
-        ("/tasks/{task_id}/return", "возврат по заданию"),
-        ("/labels/{task_id}/print", "печать стикера"),
-        ("/returns/{return_id}/receive", "приём возврата"),
-        ("/returns/{return_id}/decision", "решение по возврату"),
-        ("/wb/accounts/{account_id}/verify", "проверка кабинета WB"),
-        ("/receipts", "приёмка"),
-        ("/receipts/screen", "экран приёмки"),
-        ("/putaway/screen", "экран размещения"),
-        ("/inventory/sheet", "лист инвентаризации"),
-        ("/inventory/count", "инвентаризация"),
-        ("/boxes", "коробки"),
-        ("/boxes/list", "коробки"),
-        ("/boxes/remove", "коробки"),
-        ("/storage/lookup", "поиск по складу"),
-        ("/storage/count", "пересчёт ячейки"),
         ("/shipments", "поставки"),
         ("/shipments/picked", "собранные задания"),
         ("/returns/receipt", "возвраты"),
+        ("/labels/{task_id}/print", "печать стикера"),
+        ("/tasks/{task_id}/return", "возврат по заданию"),
+        ("/returns/{return_id}/receive", "приём возврата"),
+        ("/returns/{return_id}/decision", "решение по возврату"),
+        ("/wb/accounts/{account_id}/verify", "проверка кабинета WB"),
     ):
         post(path, missing(what))
 

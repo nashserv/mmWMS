@@ -172,11 +172,17 @@ def test_a_live_token_is_refused_as_a_secret_ref(client: TestClient, seller: dic
     assert "ссылка на секрет" in body["error"]["message"]
 
 
-def test_unwritten_routes_say_so_out_loud(client: TestClient) -> None:
-    """Ненаписанный маршрут отвечает отказом, а не правдоподобной выдумкой."""
-    response = client.post(f"{BASE}/tasks/pull", json={
+def test_unwritten_routes_say_so_out_loud(client: TestClient, seller: dict) -> None:
+    """Ненаписанный маршрут отвечает отказом, а не правдоподобной выдумкой.
+
+    Заглушка под настоящим именем — это то, как заглушки доезжают до прода.
+    Пока поток A не написал поставки, честнее внятный отказ, чем ответ, по
+    которому поток B построит экран.
+    """
+    response = client.post(f"{BASE}/shipments", json={
         "jsonrpc": "2.0", "method": "call", "id": 4,
-        "params": {"assignee": "picker-1", "limit": 5}})
+        "params": {"seller_external_id": seller["seller"], "idempotency_key": "x",
+                   "action": "open"}})
     body = response.json()
     assert body["error"]["code"] == -32601
     assert "не реализован" in body["error"]["message"]

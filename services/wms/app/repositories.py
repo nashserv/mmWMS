@@ -833,3 +833,439 @@ def accounts_of_owner(cursor: Cursor, owner_id: uuid.UUID) -> list[dict[str, Any
         "  FROM wb_account WHERE owner_id = %s AND status IN ('ACTIVE', 'RATE_LIMITED') "
         " ORDER BY external_id", (owner_id,))
     return cursor.fetchall()
+
+
+# ---------------------------------------------------------------- приёмка
+
+def receipt_by_reference(cursor: Cursor, reference: str) -> dict[str, Any] | None:
+    cursor.execute(
+        "SELECT id, owner_id, reference, warehouse_id, state, created_at "
+        "  FROM receipt WHERE reference = %s", (reference,))
+    return cursor.fetchone()
+
+
+def insert_receipt(cursor: Cursor, *, owner_id: uuid.UUID, reference: str,
+                   warehouse_id: uuid.UUID, actor_id: uuid.UUID | None) -> dict[str, Any]:
+    cursor.execute(
+        "INSERT INTO receipt (id, owner_id, reference, warehouse_id, state, actor_id) "
+        "VALUES (%s, %s, %s, %s, 'counting', %s) "
+        "RETURNING id, owner_id, reference, warehouse_id, state, created_at",
+        (uuid.uuid4(), owner_id, reference, warehouse_id, actor_id))
+    row = cursor.fetchone()
+    assert row is not None
+    return row
+
+
+def insert_receipt_line(cursor: Cursor, *, receipt_id: uuid.UUID, sku_id: uuid.UUID,
+                        expected_qty: int | None, actual_qty: int | None,
+                        box_id: uuid.UUID | None, cell_id: uuid.UUID | None) -> None:
+    cursor.execute(
+        "INSERT INTO receipt_line (id, receipt_id, sku_id, expected_qty, actual_qty, "
+        "                          box_id, cell_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (uuid.uuid4(), receipt_id, sku_id, expected_qty, actual_qty, box_id, cell_id))
+
+
+def set_receipt_state(cursor: Cursor, receipt_id: uuid.UUID, state: str) -> None:
+    cursor.execute("UPDATE receipt SET state = %s WHERE id = %s", (state, receipt_id))
+
+
+def receipt_line_count(cursor: Cursor, receipt_id: uuid.UUID) -> int:
+    cursor.execute("SELECT count(*) AS n FROM receipt_line WHERE receipt_id = %s",
+                   (receipt_id,))
+    row = cursor.fetchone()
+    return int(row["n"]) if row else 0
+
+
+def discrepancies_of_receipt(cursor: Cursor, receipt_id: uuid.UUID) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT d.id, d.kind, d.qty, d.decision, d.created_at, s.barcode, c.address AS cell_address "
+        "  FROM discrepancy d JOIN sku s ON s.id = d.sku_id "
+        "  LEFT JOIN cell c ON c.id = d.cell_id "
+        " WHERE d.receipt_id = %s ORDER BY d.created_at", (receipt_id,))
+    return cursor.fetchall()
+
+
+def receipts_for_screen(cursor: Cursor, *, states: Sequence[str],
+                        owner_external_id: str | None = None, reference: str | None = None,
+                        limit: int = 50) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT r.id, r.reference, r.state, r.created_at, o.seller_external_id, "
+        "       w.code AS warehouse_code, "
+        "       (SELECT count(*) FROM receipt_line l WHERE l.receipt_id = r.id) AS lines, "
+        "       (SELECT count(*) FROM discrepancy d WHERE d.receipt_id = r.id "
+        "          AND d.decision = 'pending') AS open_discrepancies "
+        "  FROM receipt r JOIN owner o ON o.id = r.owner_id "
+        "  JOIN warehouse w ON w.id = r.warehouse_id "
+        " WHERE r.state = ANY(%(states)s) "
+        "   AND (%(owner)s::text IS NULL OR o.seller_external_id = %(owner)s) "
+        "   AND (%(reference)s::text IS NULL OR r.reference = %(reference)s) "
+        " ORDER BY r.created_at DESC LIMIT %(limit)s",
+        {"states": list(states), "owner": owner_external_id,
+         "reference": reference, "limit": limit})
+    return [{"receipt_id": str(row["id"]), "reference": row["reference"],
+             "state": row["state"], "owner_external_id": row["seller_external_id"],
+             "warehouse_code": row["warehouse_code"], "lines": int(row["lines"]),
+             "open_discrepancies": int(row["open_discrepancies"]),
+             "created_at": row["created_at"].isoformat()} for row in cursor.fetchall()]
+
+
+# ------------------------------------------------------------- размещение
+
+def putaway_queue(cursor: Cursor, *, owner_external_id: str | None = None,
+                  limit: int = 100) -> list[dict[str, Any]]:
+    """Что лежит в зоне приёмки и ждёт разноса по местам хранения."""
+    cursor.execute(
+        "SELECT s.barcode, c.address AS cell_address, bx.barcode AS box_barcode, "
+        "       b.state, b.qty AS quantity, c.route_order, o.seller_external_id "
+        "  FROM stock_balance b "
+        "  JOIN owner o ON o.id = b.owner_id "
+        "  JOIN sku s ON s.id = b.sku_id "
+        "  JOIN cell c ON c.id = b.cell_id "
+        "  JOIN zone z ON z.id = c.zone_id "
+        "  LEFT JOIN box bx ON bx.id = b.box_id "
+        " WHERE b.qty > 0 AND z.kind = 'receiving' "
+        "   AND (%(owner)s::text IS NULL OR o.seller_external_id = %(owner)s) "
+        " ORDER BY c.route_order NULLS LAST, c.address LIMIT %(limit)s",
+        {"owner": owner_external_id, "limit": limit})
+    return cursor.fetchall()
+
+
+def place_box(cursor: Cursor, box_id: uuid.UUID, cell_id: uuid.UUID) -> None:
+    cursor.execute("UPDATE box SET cell_id = %s WHERE id = %s", (cell_id, box_id))
+
+
+def move_box_contents(cursor: Cursor, *, box: dict[str, Any], target_cell: uuid.UUID,
+                      reference: str, actor_id: uuid.UUID | None) -> int:
+    """Переносит остаток коробки в другую ячейку движениями, а не правкой места.
+
+    Коробка — контейнер, ячейка — адрес (раздел 2.9). Переставить коробку и не
+    записать движение значит оставить остаток числиться там, где его нет.
+    """
+    cursor.execute(
+        "SELECT sku_id, box_id, cell_id, state, qty FROM stock_balance "
+        " WHERE owner_id = %s AND box_id = %s AND qty > 0 FOR UPDATE",
+        (box["owner_id"], box["id"]))
+    moved = 0
+    for index, row in enumerate(cursor.fetchall()):
+        if row["cell_id"] == target_cell:
+            continue
+        insert_move(
+            cursor, owner_id=box["owner_id"], sku_id=row["sku_id"], qty=int(row["qty"]),
+            cell_from=row["cell_id"], cell_to=target_cell,
+            box_from=box["id"], box_to=box["id"],
+            state_from=row["state"], state_to=row["state"],
+            reason="putaway", doc_type="putaway", doc_ref=reference, actor_id=actor_id,
+            idem_key=f"putaway:{reference}:{box['id']}:{index}")
+        moved += 1
+    return moved
+
+
+# ---------------------------------------------------------- инвентаризация
+
+def balance_at(cursor: Cursor, *, owner_id: uuid.UUID, sku_id: uuid.UUID,
+               cell_id: uuid.UUID, box_id: uuid.UUID | None, state: str = "good") -> int:
+    cursor.execute(
+        "SELECT COALESCE(SUM(qty), 0) AS qty FROM stock_balance "
+        " WHERE owner_id = %s AND sku_id = %s AND cell_id = %s AND state = %s "
+        "   AND box_id IS NOT DISTINCT FROM %s",
+        (owner_id, sku_id, cell_id, state, box_id))
+    row = cursor.fetchone()
+    return int(row["qty"]) if row else 0
+
+
+def inventory_by_reference(cursor: Cursor, reference: str) -> dict[str, Any] | None:
+    cursor.execute("SELECT id, state, scope FROM inventory_count WHERE reference = %s",
+                   (reference,))
+    return cursor.fetchone()
+
+
+def insert_inventory_count(cursor: Cursor, *, owner_id: uuid.UUID, reference: str,
+                           scope: str, actor_id: uuid.UUID | None) -> dict[str, Any]:
+    cursor.execute(
+        "INSERT INTO inventory_count (id, owner_id, reference, scope, state, actor_id) "
+        "VALUES (%s, %s, %s, %s, 'counting', %s) RETURNING id, reference, scope, state",
+        (uuid.uuid4(), owner_id, reference, scope, actor_id))
+    row = cursor.fetchone()
+    assert row is not None
+    return row
+
+
+def insert_inventory_line(cursor: Cursor, *, count_id: uuid.UUID, sku_id: uuid.UUID,
+                          cell_id: uuid.UUID | None, box_id: uuid.UUID | None,
+                          expected_qty: int | None, fact_qty: int | None) -> None:
+    cursor.execute(
+        "INSERT INTO inventory_count_line (id, count_id, sku_id, cell_id, box_id, "
+        "                                  expected_qty, fact_qty) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (uuid.uuid4(), count_id, sku_id, cell_id, box_id, expected_qty, fact_qty))
+
+
+def apply_inventory_count(cursor: Cursor, count_id: uuid.UUID) -> None:
+    cursor.execute(
+        "UPDATE inventory_count SET state = 'applied', applied_at = now() WHERE id = %s",
+        (count_id,))
+
+
+def inventory_sheet(cursor: Cursor, *, seller_external_id: str,
+                    cell_address: str | None = None,
+                    barcodes: Any = None) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT s.barcode, c.address AS cell_address, bx.barcode AS box_barcode, "
+        "       b.state, b.qty AS expected_qty, c.route_order "
+        "  FROM stock_balance b "
+        "  JOIN owner o ON o.id = b.owner_id "
+        "  JOIN sku s ON s.id = b.sku_id "
+        "  JOIN cell c ON c.id = b.cell_id "
+        "  LEFT JOIN box bx ON bx.id = b.box_id "
+        " WHERE o.seller_external_id = %(seller)s AND b.qty <> 0 "
+        "   AND (%(cell)s::text IS NULL OR c.address = %(cell)s) "
+        "   AND (%(barcodes)s::text[] IS NULL OR s.barcode = ANY(%(barcodes)s)) "
+        " ORDER BY c.route_order NULLS LAST, c.address, s.barcode",
+        {"seller": seller_external_id, "cell": cell_address,
+         "barcodes": list(barcodes) if barcodes else None})
+    return cursor.fetchall()
+
+
+# ------------------------------------------------------------------ коробки
+
+def boxes_of(cursor: Cursor, *, owner_external_id: str | None = None,
+             cell_address: str | None = None, barcode: str | None = None,
+             limit: int = 200) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT bx.barcode, bx.comment, bx.quantity, bx.counted, bx.state, bx.sequence, "
+        "       bx.total_boxes, bx.created_at, c.address AS cell_address, "
+        "       o.seller_external_id, s.barcode AS sku_barcode "
+        "  FROM box bx JOIN owner o ON o.id = bx.owner_id "
+        "  LEFT JOIN cell c ON c.id = bx.cell_id "
+        "  LEFT JOIN sku s ON s.id = bx.sku_id "
+        " WHERE (%(owner)s::text IS NULL OR o.seller_external_id = %(owner)s) "
+        "   AND (%(cell)s::text IS NULL OR c.address = %(cell)s) "
+        "   AND (%(barcode)s::text IS NULL OR bx.barcode = %(barcode)s) "
+        " ORDER BY bx.created_at DESC LIMIT %(limit)s",
+        {"owner": owner_external_id, "cell": cell_address, "barcode": barcode,
+         "limit": limit})
+    return cursor.fetchall()
+
+
+def remove_box(cursor: Cursor, barcode: str) -> bool:
+    cursor.execute(
+        "UPDATE box SET state = 'removed' WHERE barcode = %s AND state = 'stored'",
+        (barcode,))
+    return cursor.rowcount > 0
+
+
+# ------------------------------------------------------- выдача заданий
+
+# Проекция задания вместе со всем, что нужно строке листа подбора: сборщик
+# должен видеть адрес и готовность стикера, а не досбирать это вторым запросом.
+_TASK_VIEW = (
+    "SELECT t.id, t.wb_order_id, t.wb_order_uid, t.owner_id, t.sku_id, t.barcode, "
+    "       t.quantity, t.deadline, t.state, t.wb_status, t.reservation_id, "
+    "       t.package_ref, t.supply_id, t.assignee, t.claimed_at, t.claim_expires_at, "
+    "       t.cancel_reason, t.manual_review_code, t.manual_review_reason, "
+    "       t.last_reconciled_at, t.created_at, t.updated_at, t.version, "
+    "       o.seller_external_id, a.external_id AS account_external_id, "
+    "       s.seller_sku, s.name AS sku_name, "
+    "       l.format AS label_format, l.version AS label_version, "
+    "       l.checksum AS label_checksum, l.fetched_at AS label_fetched_at, "
+    "       l.invalidated_at AS label_invalidated_at, "
+    "       c.address AS cell_address, bx.barcode AS box_barcode "
+    "  FROM wms_task t "
+    "  JOIN owner o ON o.id = t.owner_id "
+    "  JOIN wb_account a ON a.id = t.wb_account_id "
+    "  LEFT JOIN sku s ON s.id = t.sku_id "
+    "  LEFT JOIN wb_label l ON l.task_id = t.id "
+    "  LEFT JOIN reservation r ON r.id = t.reservation_id "
+    "  LEFT JOIN cell c ON c.id = r.cell_id "
+    "  LEFT JOIN box bx ON bx.id = r.box_id ")
+
+
+def task_view(cursor: Cursor, task_id: uuid.UUID, *,
+              for_update: bool = False) -> dict[str, Any] | None:
+    cursor.execute(_TASK_VIEW + " WHERE t.id = %s"
+                   + (" FOR UPDATE OF t" if for_update else ""), (task_id,))
+    return cursor.fetchone()
+
+
+def release_expired_claims(cursor: Cursor) -> int:
+    """Возвращает в очередь задания за сборщиками, которые не вернулись.
+
+    Без этого задание, выданное ушедшему со смены человеку, не потеряно только
+    на бумаге: очередь его больше не видит, и никто за ним не пойдёт.
+    """
+    cursor.execute(
+        "UPDATE wms_task SET assignee = NULL, claimed_at = NULL, claim_expires_at = NULL "
+        " WHERE assignee IS NOT NULL AND claim_expires_at < now() "
+        "   AND state IN ('reserved', 'picking')")
+    return cursor.rowcount
+
+
+def claim_tasks(cursor: Cursor, *, assignee: str, limit: int, states: Sequence[str],
+                owner_external_ids: Sequence[str] | None, lease_seconds: int,
+                claim: bool = True) -> list[dict[str, Any]]:
+    """Выдача заданий сборщику: `FOR UPDATE SKIP LOCKED`, порядок по сроку WB.
+
+    `claim = False` — только посмотреть: экран обновляется чаще, чем человек
+    берёт работу, и занимать задание при каждом обновлении нельзя.
+    """
+    selection = (
+        "SELECT t.id FROM wms_task t JOIN owner o ON o.id = t.owner_id "
+        " WHERE t.state = ANY(%(states)s) AND t.assignee IS NULL "
+        "   AND (%(owners)s::text[] IS NULL OR o.seller_external_id = ANY(%(owners)s)) "
+        " ORDER BY t.deadline NULLS LAST, t.created_at "
+        " LIMIT %(limit)s FOR UPDATE OF t SKIP LOCKED")
+    arguments = {"states": list(states), "limit": limit,
+                 "owners": list(owner_external_ids) if owner_external_ids else None,
+                 "assignee": assignee, "lease": lease_seconds}
+
+    if not claim:
+        cursor.execute(f"WITH picked AS ({selection}) " + _TASK_VIEW
+                       + " JOIN picked p ON p.id = t.id "
+                         " ORDER BY t.deadline NULLS LAST, t.created_at", arguments)
+        return cursor.fetchall()
+
+    cursor.execute(
+        f"WITH picked AS ({selection}), "
+        "     taken AS ("
+        "         UPDATE wms_task t SET assignee = %(assignee)s, claimed_at = now(), "
+        "                claim_expires_at = now() + make_interval(secs => %(lease)s) "
+        "           FROM picked p WHERE t.id = p.id RETURNING t.id) "
+        + _TASK_VIEW + " JOIN taken k ON k.id = t.id "
+        " ORDER BY t.deadline NULLS LAST, t.created_at", arguments)
+    return cursor.fetchall()
+
+
+def available_for_pull(cursor: Cursor, *, states: Sequence[str],
+                       owner_external_ids: Sequence[str] | None) -> int:
+    cursor.execute(
+        "SELECT count(*) AS n FROM wms_task t JOIN owner o ON o.id = t.owner_id "
+        " WHERE t.state = ANY(%(states)s) AND t.assignee IS NULL "
+        "   AND (%(owners)s::text[] IS NULL OR o.seller_external_id = ANY(%(owners)s))",
+        {"states": list(states),
+         "owners": list(owner_external_ids) if owner_external_ids else None})
+    row = cursor.fetchone()
+    return int(row["n"]) if row else 0
+
+
+def placements_for_task(cursor: Cursor, task_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Откуда брать товар. Отсортировано по маршруту обхода — змейкой по стеллажам."""
+    cursor.execute(
+        "SELECT s.barcode, c.address AS cell_address, bx.barcode AS box_barcode, "
+        "       b.state, b.qty AS quantity, c.route_order "
+        "  FROM wms_task t "
+        "  JOIN stock_balance b ON b.owner_id = t.owner_id AND b.sku_id = t.sku_id "
+        "  JOIN sku s ON s.id = b.sku_id "
+        "  JOIN cell c ON c.id = b.cell_id "
+        "  LEFT JOIN box bx ON bx.id = b.box_id "
+        " WHERE t.id = %s AND b.qty > 0 AND b.state IN ('good', 'reserved') "
+        " ORDER BY c.route_order NULLS LAST, c.address", (task_id,))
+    return [{"barcode": row["barcode"], "cell_address": row["cell_address"],
+             "box_barcode": row["box_barcode"], "state": row["state"],
+             "quantity": max(0, int(row["quantity"])), "route_order": row["route_order"]}
+            for row in cursor.fetchall()]
+
+
+def set_task_state(cursor: Cursor, task_id: uuid.UUID, state: str, *,
+                   cancel_reason: str | None = None, package_ref: str | None = None,
+                   clear_supply: bool = False, clear_assignee: bool = False,
+                   clear_reservation: bool = False) -> None:
+    cursor.execute(
+        "UPDATE wms_task SET state = %(state)s, version = version + 1, "
+        "    cancel_reason = COALESCE(%(reason)s, cancel_reason), "
+        "    package_ref = COALESCE(%(package)s, package_ref), "
+        "    supply_id = CASE WHEN %(clear_supply)s THEN NULL ELSE supply_id END, "
+        "    assignee = CASE WHEN %(clear_assignee)s THEN NULL ELSE assignee END, "
+        "    claimed_at = CASE WHEN %(clear_assignee)s THEN NULL ELSE claimed_at END, "
+        "    claim_expires_at = CASE WHEN %(clear_assignee)s "
+        "                            THEN NULL ELSE claim_expires_at END, "
+        "    reservation_id = CASE WHEN %(clear_reservation)s THEN NULL ELSE reservation_id END "
+        "  WHERE id = %(id)s",
+        {"id": task_id, "state": state, "reason": cancel_reason, "package": package_ref,
+         "clear_supply": clear_supply, "clear_assignee": clear_assignee,
+         "clear_reservation": clear_reservation})
+
+
+def record_scan(cursor: Cursor, *, task_id: uuid.UUID, owner_id: uuid.UUID,
+                sku_id: uuid.UUID | None, result: str) -> None:
+    """Сохраняет скан у стойки, включая отклонённый.
+
+    Отклонённый скан обязан остаться: по нему видно, что именно человек взял
+    не то (раздел 4, главный рубеж качества).
+    """
+    if sku_id is None:
+        return
+    cursor.execute(
+        "UPDATE pick_line SET scanned_at = now(), scan_result = %s WHERE task_id = %s",
+        (result, task_id))
+    if cursor.rowcount:
+        return
+    # Строки листа подбора ещё нет — сессию заводит поток B, а скан уже
+    # случился. Заводим одиночную строку, чтобы факт не потерялся.
+    cursor.execute(
+        "INSERT INTO pick_session (id, actor_id, state) VALUES (%s, %s, 'picking') "
+        "RETURNING id", (uuid.uuid4(), uuid.uuid4()))
+    session = cursor.fetchone()
+    assert session is not None
+    cursor.execute(
+        "SELECT cell_id, box_id, qty FROM reservation "
+        " WHERE task_id = %s ORDER BY created_at DESC LIMIT 1", (task_id,))
+    reservation = cursor.fetchone() or {"cell_id": None, "box_id": None, "qty": 1}
+    cursor.execute(
+        "INSERT INTO pick_line (id, session_id, task_id, owner_id, sku_id, cell_id, box_id, "
+        "                       qty, scanned_at, scan_result) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), %s) "
+        "ON CONFLICT (task_id) DO UPDATE SET scanned_at = now(), scan_result = EXCLUDED.scan_result",
+        (uuid.uuid4(), session["id"], task_id, owner_id, sku_id, reservation["cell_id"],
+         reservation["box_id"], max(1, int(reservation["qty"])), result))
+
+
+def supply_reference(cursor: Cursor, supply_id: uuid.UUID,
+                     wb_order_id: int) -> tuple[str, int] | None:
+    """Чем поставка называется у Wildberries — для освобождения заказа из неё."""
+    cursor.execute("SELECT wb_supply_id FROM wb_supply WHERE id = %s", (supply_id,))
+    row = cursor.fetchone()
+    if row is None or not row["wb_supply_id"]:
+        return None
+    return str(row["wb_supply_id"]), wb_order_id
+
+
+def box_contents(cursor: Cursor, box_id: uuid.UUID) -> list[dict[str, Any]]:
+    cursor.execute(
+        "SELECT sku_id, state, qty FROM stock_balance WHERE box_id = %s AND qty <> 0",
+        (box_id,))
+    return cursor.fetchall()
+
+
+def storage_lookup(cursor: Cursor, *, owner_external_id: str | None = None,
+                   barcode: str | None = None, cell_address: str | None = None,
+                   box_barcode: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    """Где лежит товар и что лежит в ячейке — одним запросом на оба вопроса."""
+    cursor.execute(
+        "SELECT s.barcode, c.address AS cell_address, bx.barcode AS box_barcode, "
+        "       b.state, b.qty, c.route_order, o.seller_external_id "
+        "  FROM stock_balance b "
+        "  JOIN owner o ON o.id = b.owner_id "
+        "  JOIN sku s ON s.id = b.sku_id "
+        "  JOIN cell c ON c.id = b.cell_id "
+        "  LEFT JOIN box bx ON bx.id = b.box_id "
+        " WHERE b.qty <> 0 "
+        "   AND (%(owner)s::text IS NULL OR o.seller_external_id = %(owner)s) "
+        "   AND (%(barcode)s::text IS NULL OR s.barcode = %(barcode)s) "
+        "   AND (%(cell)s::text IS NULL OR c.address = %(cell)s) "
+        "   AND (%(box)s::text IS NULL OR bx.barcode = %(box)s) "
+        " ORDER BY c.route_order NULLS LAST, c.address, s.barcode LIMIT %(limit)s",
+        {"owner": owner_external_id, "barcode": barcode, "cell": cell_address,
+         "box": box_barcode, "limit": limit})
+    return [{"barcode": row["barcode"], "cell_address": row["cell_address"],
+             "box_barcode": row["box_barcode"], "state": row["state"],
+             "quantity": max(0, int(row["qty"])), "route_order": row["route_order"],
+             "owner_external_id": row["seller_external_id"]}
+            for row in cursor.fetchall()]
+
+
+def account_of_supply(cursor: Cursor, wb_supply_id: str) -> dict[str, Any] | None:
+    cursor.execute(
+        "SELECT a.id, a.external_id, a.secret_ref, a.mode, a.status, a.wb_warehouse_id "
+        "  FROM wb_supply s JOIN wb_account a ON a.id = s.wb_account_id "
+        " WHERE s.wb_supply_id = %s", (wb_supply_id,))
+    return cursor.fetchone()
