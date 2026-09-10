@@ -1,0 +1,104 @@
+"""Метрики Prometheus сервиса wms.
+
+Лейблы ограниченные и несекретные — как в шаблоне wb-fbs-gateway. Ни владелец,
+ни штрихкод, ни номер заказа в лейблы не попадают: это неограниченная
+кардинальность и утечка данных клиента в общий дашборд.
+
+Набор метрик закрывает критерии раздела 10 мастера.
+"""
+from __future__ import annotations
+
+import time
+from contextlib import contextmanager
+from typing import Any, Iterator
+
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+
+from .domain import TaskState
+
+SERVICE = "wms"
+
+HTTP_REQUESTS = Counter(
+    "mmx_http_requests_total",
+    "HTTP requests completed by MM Express services.",
+    ("service", "status"),
+)
+HTTP_DURATION = Histogram(
+    "mmx_http_request_duration_seconds",
+    "HTTP request duration in seconds.",
+    ("service",),
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+)
+SERVICE_PROCESS_UP = Gauge("mmx_service_process_up", "Process availability.", ("service",))
+SERVICE_READY = Gauge("mmx_service_ready", "Dependency-aware service readiness.", ("service",))
+
+WMS_TASKS = Gauge("mmx_wms_tasks", "Tasks by state.", ("state",))
+
+# Критерий раздела 10: нажатие «печать» → движение головки < 300 мс.
+# Корзины подобраны вокруг цели, иначе по гистограмме не увидеть промах.
+LABEL_PRINT_DURATION = Histogram(
+    "mmx_wms_label_print_duration_seconds",
+    "Time from print request to handing bytes to the printer agent.",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.2, 0.3, 0.5, 1, 2, 5),
+)
+LABELS_READY = Gauge("mmx_wms_labels_ready", "Labels fetched and waiting locally.")
+
+# Инвариант 12: сборка без остатка обязана быть счётной.
+STOCK_SHORTFALL = Counter(
+    "mmx_wms_stock_shortfall_total",
+    "Reservations created against stock the ledger does not have.",
+)
+
+# Инвариант 4: удержание блокировки под 100 мс, и это измеряется.
+LOCK_HOLD_DURATION = Histogram(
+    "mmx_wms_lock_hold_seconds",
+    "Row lock hold time inside the reservation transaction.",
+    ("operation",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1),
+)
+
+# Инвариант 14: молчащий воркер считается сломанным. Ноль по этой метрике —
+# повод для алерта, а не для спокойствия.
+WORKER_PROCESSED = Counter(
+    "mmx_wms_worker_processed_total",
+    "Units processed by background workers.",
+    ("worker",),
+)
+
+# Инвариант 10: расхождение с WB — состояние и алерт.
+TASKS_DIVERGED = Gauge("mmx_wms_tasks_diverged", "Tasks whose state disagrees with WB.")
+
+
+def observe_http(status_code: int, elapsed_seconds: float) -> None:
+    HTTP_REQUESTS.labels(service=SERVICE, status=str(status_code)).inc()
+    HTTP_DURATION.labels(service=SERVICE).observe(max(0.0, elapsed_seconds))
+
+
+@contextmanager
+def track_lock(operation: str) -> Iterator[None]:
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        LOCK_HOLD_DURATION.labels(operation=operation).observe(time.monotonic() - started)
+
+
+def refresh_runtime_metrics(state: Any) -> None:
+    SERVICE_PROCESS_UP.labels(service=SERVICE).set(1)
+    try:
+        SERVICE_READY.labels(service=SERVICE).set(1 if state.ready() else 0)
+        snapshot = state.snapshot()
+    except Exception:
+        SERVICE_READY.labels(service=SERVICE).set(0)
+        return
+
+    by_state = snapshot.get("tasks_by_state", {})
+    for task_state in TaskState:
+        WMS_TASKS.labels(state=task_state.value).set(by_state.get(task_state.value, 0))
+    LABELS_READY.set(snapshot.get("labels_ready", 0))
+    TASKS_DIVERGED.set(by_state.get(TaskState.DIVERGED.value, 0))
+
+
+def prometheus_payload(state: Any) -> tuple[bytes, str]:
+    refresh_runtime_metrics(state)
+    return generate_latest(), CONTENT_TYPE_LATEST
