@@ -263,7 +263,9 @@ def walk_every_route(walk: Walk) -> None:
             "correlation_id": f"conf-corr-{tag}-1"})["task_id"]
         _put_label(task_id)
 
-    walk.post("/tasks/pull", params={"assignee": "conf-picker", "limit": 5, "claim": False})
+    # Чтение не занимает — исполнителя не шлём вовсе (контракт требует его
+    # только при claim: true).
+    walk.post("/tasks/pull", params={"limit": 5, "claim": False})
     walk.post("/tasks/{taskId}", path=f"/tasks/{task_id}")
     walk.post("/tasks/{taskId}/scan", path=f"/tasks/{task_id}/scan", params={"barcode": barcode})
     walk.post("/tasks/{taskId}/pack", path=f"/tasks/{task_id}/pack", params={
@@ -367,21 +369,24 @@ def test_the_stub_respects_claim_false(client: TestClient) -> None:
                        "quantity": 1, "wb_order_id": order,
                        "correlation_id": f"peek-{order}"}})
 
-    def pull(assignee: str, claim: bool) -> list[str]:
+    def pull(assignee: str | None, claim: bool) -> list[str]:
+        params: dict[str, Any] = {"limit": 2, "claim": claim}
+        if assignee:
+            params["assignee"] = assignee
         body = client.post(f"{BASE}/tasks/pull", json={
             "jsonrpc": "2.0", "method": "call", "id": 1,
-            "params": {"assignee": assignee, "limit": 2, "claim": claim}}).json()["result"]
+            "params": params}).json()["result"]
         return [item["task"]["task_id"] for item in body["tasks"]]
 
-    first = pull("peek-1", claim=False)
-    second = pull("peek-2", claim=False)
+    first = pull(None, claim=False)
+    second = pull(None, claim=False)
     assert first, "чтение без занятия не вернуло ничего"
     assert first == second, (
         f"чтение заняло задания: peek-1 увидел {first}, peek-2 уже другие {second}")
 
-    taken = pull("worker-1", claim=True)
+    taken = pull("bbbbbbbb-0000-4000-8000-000000000001", claim=True)
     assert taken == first, "занятие обязано отдавать те же задания, что и чтение"
-    after = pull("peek-3", claim=False)
+    after = pull(None, claim=False)
     assert set(after).isdisjoint(taken), (
         f"занятые задания продолжают показываться свободными: {after} против {taken}")
 
@@ -391,7 +396,7 @@ def test_the_stub_respects_the_states_filter(client: TestClient) -> None:
     order = walk_state_setup(client)
     in_work = client.post(f"{BASE}/tasks/pull", json={
         "jsonrpc": "2.0", "method": "call", "id": 1,
-        "params": {"assignee": "screen-1", "limit": 50, "claim": False,
+        "params": {"limit": 50, "claim": False,
                    "states": ["picking"]}}).json()["result"]["tasks"]
     ids = [item["task"]["task_id"] for item in in_work]
     assert order in ids, (
@@ -407,5 +412,6 @@ def walk_state_setup(client: TestClient) -> str:
                    "correlation_id": "states-7301"}}).json()["result"]["task_id"]
     client.post(f"{BASE}/tasks/pull", json={
         "jsonrpc": "2.0", "method": "call", "id": 1,
-        "params": {"assignee": "worker-9", "limit": 50, "claim": True}})
+        "params": {"assignee": "bbbbbbbb-0000-4000-8000-000000000009",
+                   "limit": 50, "claim": True}})
     return task_id

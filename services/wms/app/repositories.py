@@ -1207,7 +1207,7 @@ def release_expired_claims(cursor: Cursor) -> int:
     return cursor.rowcount
 
 
-def claim_tasks(cursor: Cursor, *, assignee: str, limit: int, states: Sequence[str],
+def claim_tasks(cursor: Cursor, *, assignee: Any, limit: int, states: Sequence[str],
                 owner_external_ids: Sequence[str] | None, lease_seconds: int,
                 claim: bool = True) -> list[dict[str, Any]]:
     """Выдача заданий сборщику: `FOR UPDATE SKIP LOCKED`, порядок по сроку WB.

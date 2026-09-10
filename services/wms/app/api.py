@@ -471,6 +471,8 @@ async def tasks_pull(request: Request) -> JSONResponse:
     available_before = state.available_for_pull()
     # claim и states читаются, а не игнорируются: заявка 2 потока B.
     claim = params.get("claim")
+    if (True if claim is None else bool(claim)) and not params.get("assignee"):
+        raise ValueError("assignee обязателен при claim: задание выдаётся человеку")
     tasks = state.pull(
         assignee=params.get("assignee"), limit=limit,
         claim=True if claim is None else bool(claim),

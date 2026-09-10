@@ -29,8 +29,11 @@ logger = logging.getLogger("workstation.puller")
 
 WORKER = "task_poller"
 
-# Имя, под которым рабочее место представляется wms при чтении очереди.
-# Не сборщик: этот вызов ничего не занимает, он только смотрит.
+# Имя, под которым рабочее место когда-то представлялось wms при чтении
+# очереди. Больше не отправляется: контракт требует `assignee` только при
+# `claim: true`, а чтение ничего не занимает. Значение осталось затем, чтобы
+# отличать задания, занятые прежними версиями экрана, — на стенде такие ещё
+# лежат в базе.
 SCREEN_ASSIGNEE = "workstation-screen"
 
 # Сколько задание должно не приходить в ответе, прежде чем его перепроверят
@@ -134,7 +137,7 @@ class Poller:
         previous = {task.task_id: task for task in self._projection.all()}
         try:
             batch = await self._client.tasks_pull(
-                assignee=SCREEN_ASSIGNEE, limit=self._limit, claim=False,
+                limit=self._limit, claim=False,
                 states=SCREEN_STATES, previous=previous)
         except WmsUnavailable as error:
             metrics.POLLS.labels(outcome="unavailable").inc()

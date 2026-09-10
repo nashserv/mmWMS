@@ -277,7 +277,7 @@ class WmsClient:
 
     # ------------------------------------------------------------ задания
 
-    async def tasks_pull(self, *, assignee: str, limit: int, claim: bool = False,
+    async def tasks_pull(self, *, assignee: str | None = None, limit: int, claim: bool = False,
                          lease_seconds: int | None = None,
                          owner_external_ids: Iterable[str] | None = None,
                          states: Iterable[str] | None = None,
@@ -293,9 +293,14 @@ class WmsClient:
         человек берёт работу, и занимать при каждом обновлении нельзя.
         """
         params: dict[str, Any] = {
-            "assignee": assignee, "limit": int(limit), "claim": bool(claim),
+            "limit": int(limit), "claim": bool(claim),
             "include_extended": bool(include_extended),
         }
+        # Исполнитель едет только при занятии. Чтение ничего не занимает — и
+        # придумывать экрану имя пользователя не надо: `assignee` это
+        # идентификатор человека из `identity` (раздел 12), а экран не человек.
+        if assignee:
+            params["assignee"] = assignee
         if claim and lease_seconds:
             params["lease_seconds"] = int(lease_seconds)
         if owner_external_ids:

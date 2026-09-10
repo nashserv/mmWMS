@@ -2444,14 +2444,24 @@ components:
 
     TasksPullParams:
       type: object
-      required: [assignee, limit]
+      required: [limit]
       additionalProperties: false
       properties:
         assignee:
           type: string
-          minLength: 1
-          maxLength: 128
-          description: Сборщик или приёмщик, за которым закрепляются задания.
+          format: uuid
+          description: |
+            Сборщик или приёмщик, за которым закрепляются задания —
+            идентификатор пользователя из `identity`, единственного источника
+            пользователей и ролей (раздел 12). В схеме `wms_task.assignee` это
+            `uuid`, и контракт теперь говорит то же самое: до версии 1.3 он
+            разрешал любую строку до 128 символов, и по значению `picker-1`,
+            лежащему в базе, человека было не найти.
+
+            **Обязателен при `claim: true`, не нужен при `claim: false`.**
+            Чтение ничего не занимает: экран, опрашивающий очередь раз в
+            секунду, — не человек, и выдумывать ему имя пользователя было
+            незачем. Раньше поле требовалось всегда, и приходилось.
         station_id:
           type: string
           format: uuid

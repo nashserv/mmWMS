@@ -489,7 +489,7 @@ def test_step_08_five_parallel_sessions_never_hand_one_task_to_two_pickers(
         finally:
             client.close()
 
-    threads = [threading.Thread(target=pull, args=(f"picker-{n}",)) for n in range(1, 6)]
+    threads = [threading.Thread(target=pull, args=(picker,)) for picker in data.PICKERS]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -618,7 +618,7 @@ def test_step_10_print_reaches_the_device_in_under_50ms(
         pushed = httpx.post(
             f"{workstation_url.rstrip('/')}/api/workstation/v1/print",
             json={"task_id": str(task_id), "station_id": str(station_id),
-                  "actor_id": "picker-1", "reprint": True,
+                  "actor_id": data.PICKERS[0], "reprint": True,
                   "reason": "прогон: замер записи в устройство"},
             timeout=10.0)
     except Exception as failure:  # noqa: BLE001
@@ -843,7 +843,7 @@ def test_step_14_tasks_keep_arriving_through_tasks_pull_with_the_broker_down(
 
         pulled = wait_until(
             lambda: [item for item in wms.result(
-                "/tasks/pull", {"assignee": "picker-no-bus", "limit": 50, "claim": True}
+                "/tasks/pull", {"assignee": data.PICKER_NO_BUS, "limit": 50, "claim": True}
             ).get("tasks", [])
                 if str(item.get("task", {}).get("task_id")) == str(task["id"])] or None,
             timeout_s=TASK_VISIBLE_S, interval_s=0.2)

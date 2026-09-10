@@ -63,10 +63,13 @@ class TaskOperations:
 
     def pull(self, params: dict[str, Any]) -> dict[str, Any]:
         assignee = str(params.get("assignee") or "").strip()
-        if not assignee:
-            raise ValueError("assignee обязателен: задание выдаётся человеку, а не в воздух")
+        claim = bool(params.get("claim", True))
+        if claim and not assignee:
+            # Занять задание можно только за человеком. А прочитать очередь —
+            # за никем: экран обновляется чаще, чем человек берёт работу, и
+            # выдумывать ему имя пользователя незачем.
+            raise ValueError("assignee обязателен при claim: задание выдаётся человеку")
         limit = max(1, min(int(params.get("limit") or 10), 500))
-        claim = params.get("claim", True)
         lease = max(30, min(int(params.get("lease_seconds") or DEFAULT_LEASE_SECONDS), 3600))
         states = params.get("states") or [TaskState.RESERVED.value]
         owners = params.get("owner_external_ids") or None
@@ -79,7 +82,8 @@ class TaskOperations:
                     # сборщиками, — иначе задание не потеряно только на бумаге.
                     released = repo.release_expired_claims(cursor)
                     rows = repo.claim_tasks(
-                        cursor, assignee=assignee_id(assignee), limit=limit, states=states,
+                        cursor, assignee=assignee_id(assignee) if assignee else None,
+                        limit=limit, states=states,
                         owner_external_ids=owners, lease_seconds=lease, claim=bool(claim))
                     available = repo.available_for_pull(cursor, states=states,
                                                         owner_external_ids=owners)
