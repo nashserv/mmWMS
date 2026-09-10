@@ -1,0 +1,346 @@
+"""Поставки Wildberries: собрать, закрыть, передать, подтвердить.
+
+Здесь живёт различие, из-за которого в боевом контуре подтверждённых передач
+меньше одного процента (раздел 10). `complete` у Wildberries приёмку **не
+доказывает** (раздел 2.12), поэтому:
+
+  * `hand_over` ставит `handed_to_wb` и требует подписи живого человека —
+    схема не даёт перевести поставку в это состояние без неё;
+  * `reconcile` ставит `accepted_by_wb` по результату сверки с WB.
+
+Это два разных факта, и мешать их нельзя: первый говорит «мы отдали», второй —
+«они взяли».
+
+Все вызовы в Wildberries уходят вне транзакции (инвариант 2): транзакция здесь
+только записывает решение, а разговор с WB идёт до или после неё.
+"""
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any
+
+from . import rate_limit, repositories as repo
+from .domain import now
+from .postgres import ConnectionPool, single, transaction
+from .secrets import SecretUnavailable
+from .service import WmsService
+from .wb import SUPPLY_ORDERS_BATCH, WbClient, WbError, writes_allowed
+
+log = logging.getLogger("wms.shipments")
+
+ACTIONS = ("open", "add_orders", "close", "deliver", "hand_over", "reconcile")
+
+
+class ShipmentOperations:
+    def __init__(self, pool: ConnectionPool, service: WmsService) -> None:
+        self._pool = pool
+        self._service = service
+
+    def handle(self, params: dict[str, Any]) -> dict[str, Any]:
+        action = str(params.get("action") or "").strip()
+        if action not in ACTIONS:
+            raise ValueError(f"action: одно из {', '.join(ACTIONS)}")
+        seller = str(params.get("seller_external_id") or "").strip()
+        if not seller:
+            raise ValueError("seller_external_id обязателен")
+        if not _text(params.get("idempotency_key")):
+            raise ValueError("idempotency_key обязателен: это ключ идемпотентности")
+        return getattr(self, f"_{action}")(seller, params)
+
+    # ----------------------------------------------------------- открытие
+
+    def _open(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Открывает поставку кабинета. Одна открытая на кабинет (приложение D)."""
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                owner, account = self._owner_and_account(cursor, seller)
+                supply = repo.open_supply(cursor, account["id"])
+                shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
+                                                supply_id=supply["id"])
+        if not supply["wb_supply_id"] and writes_allowed(account["mode"]):
+            wb_supply_id = self._create_in_wb(account, supply["id"])
+            supply["wb_supply_id"] = wb_supply_id
+        return self._view(shipment, supply, seller, orders=0)
+
+    def _create_in_wb(self, account: dict[str, Any], supply_id: uuid.UUID) -> str | None:
+        """Создаёт поставку в WB — вне транзакции, как и любой вызов наружу."""
+        try:
+            with WbClient(account_external_id=account["external_id"],
+                          secret_ref=account["secret_ref"]) as client:
+                wb_supply_id = client.create_supply()
+        except (WbError, SecretUnavailable) as failure:
+            log.warning("кабинет %s: поставка не создана в WB (%s)",
+                        account["external_id"], failure)
+            return None
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                repo.bind_supply_to_wb(cursor, supply_id, wb_supply_id)
+        return wb_supply_id
+
+    # ------------------------------------------------------------ наполнение
+
+    def _add_orders(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
+        task_ids = [_uuid(value) for value in (params.get("task_ids") or [])]
+        if not task_ids:
+            raise ValueError("task_ids обязательны")
+        if len(task_ids) > SUPPLY_ORDERS_BATCH:
+            raise ValueError(f"не более {SUPPLY_ORDERS_BATCH} заданий за вызов (приложение D)")
+
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                owner, account = self._owner_and_account(cursor, seller)
+                supply = repo.open_supply(cursor, account["id"])
+                shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
+                                                supply_id=supply["id"])
+                fresh = repo.tasks_not_in_supply(cursor, task_ids, supply["id"])
+                repo.attach_tasks_to_supply(cursor, task_ids, supply["id"])
+                orders = repo.supply_order_count(cursor, supply["id"])
+
+        if fresh and supply["wb_supply_id"] and writes_allowed(account["mode"]):
+            self._push_orders(account, supply["wb_supply_id"],
+                              [int(row["wb_order_id"]) for row in fresh])
+        return self._view(shipment, supply, seller, orders=orders)
+
+    def _push_orders(self, account: dict[str, Any], wb_supply_id: str,
+                     order_ids: list[int]) -> None:
+        try:
+            with WbClient(account_external_id=account["external_id"],
+                          secret_ref=account["secret_ref"]) as client:
+                for chunk in _chunks(order_ids, SUPPLY_ORDERS_BATCH):
+                    client.add_orders(wb_supply_id, chunk)
+        except (WbError, SecretUnavailable) as failure:
+            log.warning("кабинет %s: заказы не добавлены в поставку (%s)",
+                        account["external_id"], failure)
+
+    # ------------------------------------------------ закрытие и передача
+
+    def _close(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                owner, account = self._owner_and_account(cursor, seller)
+                supply = repo.supply_of_account(cursor, account["id"],
+                                                _text(params.get("wb_supply_id")))
+                shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
+                                                supply_id=supply["id"])
+                repo.close_supply(cursor, supply["id"])
+                repo.set_shipment_state(cursor, shipment["id"], "closed")
+                orders = repo.supply_order_count(cursor, supply["id"])
+                shipment["state"], shipment["closed_at"] = "closed", now()
+        return self._view(shipment, supply, seller, orders=orders)
+
+    def _deliver(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Передать поставку в WB.
+
+        Уезжает то, что физически собрано. Накопительная поставка кабинета
+        (раздел 6.6) держит и задания, которым стикер уже вытянут, но которые
+        ещё лежат на полке: стикер выдаётся только заданию в поставке, поэтому
+        они попадают туда сразу после резерва. Везти их нельзя — их никто не
+        собирал, — и в момент передачи они освобождаются из поставки и ждут
+        следующей. Это ровно то, для чего у WB есть `release_from_supply`.
+
+        `orders` в событии — число уехавших заданий: на нём стоит счёт клиенту
+        (приложение E), и приписать туда несобранное значит выставить счёт за
+        то, чего не везли.
+
+        С релизов 2026-03/04 перед `deliver` обязательна валидация
+        `metaDetails` (приложение D). Практически она означает: у уезжающего
+        задания есть штрихкод и действующий стикер.
+        """
+        left_behind: list[int] = []
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                owner, account = self._owner_and_account(cursor, seller)
+                supply = repo.supply_of_account(cursor, account["id"],
+                                                _text(params.get("wb_supply_id")))
+                shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
+                                                supply_id=supply["id"])
+                assembled = repo.assembled_tasks_of_supply(cursor, supply["id"])
+                if not assembled:
+                    raise ValueError(
+                        "в поставке нет ни одного собранного задания: везти нечего")
+
+                incomplete = [task for task in assembled if not task["ready_metadata"]]
+                if incomplete:
+                    raise ValueError(
+                        f"валидация metaDetails не пройдена: {len(incomplete)} заданий "
+                        f"без стикера или штрихкода — WB откажет в передаче")
+
+                # Несобранное возвращается в очередь: следующая поставка его
+                # заберёт, а эта уедет только с тем, что лежит в коробе.
+                waiting = repo.unassembled_tasks_of_supply(cursor, supply["id"])
+                for task in waiting:
+                    repo.set_task_state(cursor, task["id"], task["state"], clear_supply=True)
+                    left_behind.append(int(task["wb_order_id"]))
+
+                for task in assembled:
+                    repo.set_task_state(cursor, task["id"], "shipped")
+                repo.close_supply(cursor, supply["id"], state="delivered")
+                repo.set_shipment_state(cursor, shipment["id"], "closed")
+                orders = len(assembled)
+
+                # Тарифицируемое событие: на `orders` встаёт счёт клиенту
+                # (приложение E). Пишется в ту же транзакцию, что и отгрузка.
+                self._service.emit_for_aggregate(
+                    cursor, aggregate_id=shipment["id"],
+                    event_type="wb.supply.shipped.v1",
+                    payload={"supply": supply["wb_supply_id"] or str(supply["id"]),
+                             "seller_id": seller, "orders": orders,
+                             "accepted_at": None,
+                             "name": f"Поставка {supply['wb_supply_id'] or supply['id']}"},
+                    correlation_id=str(params.get("idempotency_key")))
+                shipment["state"] = "closed"
+
+        if supply["wb_supply_id"] and writes_allowed(account["mode"]):
+            self._release_left_behind(account, supply["wb_supply_id"], left_behind)
+            self._deliver_in_wb(account, supply["wb_supply_id"])
+        return self._view(shipment, supply, seller, orders=orders)
+
+    def _release_left_behind(self, account: dict[str, Any], wb_supply_id: str,
+                             order_ids: list[int]) -> None:
+        """Освобождает из поставки то, что осталось на складе.
+
+        Иначе WB ждёт эти заказы в машине, а их там нет: поставка приедет
+        неполной, и разбирать это будет уже клиент.
+        """
+        if not order_ids:
+            return
+        try:
+            with WbClient(account_external_id=account["external_id"],
+                          secret_ref=account["secret_ref"]) as client:
+                for order_id in order_ids:
+                    client.release_from_supply(wb_supply_id, order_id)
+        except (WbError, SecretUnavailable) as failure:
+            log.warning("кабинет %s: %d заданий не освобождены из поставки (%s)",
+                        account["external_id"], len(order_ids), failure)
+
+    def _deliver_in_wb(self, account: dict[str, Any], wb_supply_id: str) -> None:
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                permitted = bool(rate_limit.take(cursor, account["id"]))
+        if not permitted:
+            log.info("кабинет %s: окно лимита выбрано, передача поставки подождёт",
+                     account["external_id"])
+            return
+        try:
+            with WbClient(account_external_id=account["external_id"],
+                          secret_ref=account["secret_ref"]) as client:
+                client.deliver(wb_supply_id)
+        except WbError as failure:
+            if failure.conflict:
+                # 409 у WB значит «уже передана». Сверка разберётся, повторять
+                # не надо: 409 стоит десять обычных вызовов (приложение D).
+                log.info("поставка %s уже передана", wb_supply_id)
+                return
+            log.warning("поставка %s не передана (%s)", wb_supply_id, failure)
+        except SecretUnavailable as failure:
+            log.warning("поставка %s не передана (%s)", wb_supply_id, failure)
+
+    def _hand_over(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
+        """`HANDED_TO_WB` ставит только живой человек.
+
+        Статус `complete` у Wildberries приёмку не доказывает (раздел 2.12).
+        Без подписи состояние не меняется — и схема этого тоже не даст.
+        """
+        handed_by = _text(params.get("handed_over_by"))
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                owner, account = self._owner_and_account(cursor, seller)
+                supply = repo.supply_of_account(cursor, account["id"],
+                                                _text(params.get("wb_supply_id")))
+                shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
+                                                supply_id=supply["id"])
+                orders = repo.supply_order_count(cursor, supply["id"])
+                if not handed_by:
+                    # Не ошибка протокола, а отказ по существу: поставка
+                    # остаётся в прежнем состоянии, и клиент видит это по нему.
+                    # Схема ответа закрыта (additionalProperties: false), лишнего
+                    # поля с объяснением в неё не добавить.
+                    return self._view(shipment, supply, seller, orders=orders)
+                repo.hand_over_shipment(cursor, shipment["id"], handed_by)
+                for task in repo.tasks_of_supply(cursor, supply["id"]):
+                    repo.set_task_state(cursor, task["id"], "handed")
+                shipment.update({"state": "handed_to_wb", "handed_by": handed_by,
+                                 "handed_at": now()})
+        return self._view(shipment, supply, seller, orders=orders)
+
+    def _reconcile(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
+        """`ACCEPTED_BY_WB` — только по сверке с WB, а не по нашему статусу."""
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                owner, account = self._owner_and_account(cursor, seller)
+                supply = repo.supply_of_account(cursor, account["id"],
+                                                _text(params.get("wb_supply_id")))
+                shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
+                                                supply_id=supply["id"])
+                orders = repo.supply_order_count(cursor, supply["id"])
+                repo.accept_shipment(cursor, shipment["id"])
+                for task in repo.tasks_of_supply(cursor, supply["id"]):
+                    repo.set_task_state(cursor, task["id"], "accepted")
+                shipment.update({"state": "accepted_by_wb", "accepted_at": now()})
+        return self._view(shipment, supply, seller, orders=orders)
+
+    # ------------------------------------------------------------ служебное
+
+    def picked(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Собранные задания, ждущие поставки."""
+        limit = min(int(params.get("limit") or 100), 500)
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                rows = repo.tasks_ready_for_supply(
+                    cursor, owner_external_id=_text(params.get("seller_external_id")),
+                    limit=limit)
+        from .tasks import _projection
+        return {"tasks": [_projection(row) for row in rows], "next_cursor": None}
+
+    def _owner_and_account(self, cursor: Any, seller: str) -> tuple[dict, dict]:
+        owner = repo.find_owner(cursor, seller)
+        if owner is None:
+            raise ValueError(f"продавец {seller!r} не заведён")
+        account = repo.sole_account_of_owner(cursor, owner["id"])
+        if account is None:
+            accounts = repo.accounts_of_owner(cursor, owner["id"])
+            if not accounts:
+                raise ValueError(f"у продавца {seller!r} нет кабинета Wildberries")
+            account = accounts[0]
+        return owner, account
+
+    @staticmethod
+    def _view(shipment: dict[str, Any], supply: dict[str, Any], seller: str, *,
+              orders: int) -> dict[str, Any]:
+        return {
+            "shipment_id": str(shipment["id"]),
+            "owner_external_id": seller,
+            "wb_supply_id": supply.get("wb_supply_id"),
+            "state": shipment["state"],
+            "handed_by": shipment.get("handed_by"),
+            "handed_at": _isoformat(shipment.get("handed_at")),
+            "orders": orders,
+            "closed_at": _isoformat(shipment.get("closed_at")),
+            "accepted_at": _isoformat(shipment.get("accepted_at")),
+            "duplicate": False,
+        }
+
+
+def _chunks(values: list[int], size: int) -> list[list[int]]:
+    return [values[index:index + size] for index in range(0, len(values), size)]
+
+
+def _uuid(value: Any) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError):
+        raise ValueError(f"{value!r} не похоже на идентификатор задания") from None
+
+
+def _text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _isoformat(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)

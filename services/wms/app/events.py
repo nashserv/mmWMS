@@ -32,6 +32,15 @@ class SecretLeak(RuntimeError):
     """В payload попало похожее на секрет. Публикация не состоится."""
 
 
+class BrokerUnavailable(RuntimeError):
+    """Шина недоступна. Значимо только для публикатора outbox."""
+
+
+# Сколько последних событий держать в памяти публикатора. Это окно для тестов
+# стенда, а не хранилище: долговечность даёт таблица outbox.
+_MEMORY_LIMIT = 1000
+
+
 def assert_no_secrets(payload: Any, path: str = "payload") -> None:
     """Обходит payload целиком: и ключи, и значения.
 
@@ -58,6 +67,7 @@ class EventPublisher:
         self._published: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._connection: Any = None
+        self._channel: Any = None
 
     @property
     def published(self) -> list[dict[str, Any]]:
@@ -68,36 +78,67 @@ class EventPublisher:
         with self._lock:
             self._published.clear()
 
-    def publish(self, envelope: EventEnvelope) -> dict[str, Any]:
+    def publish(self, envelope: EventEnvelope, *,
+                require_broker: bool = False) -> dict[str, Any]:
+        """Отправляет событие. `require_broker` — «молчание считать провалом».
+
+        По умолчанию падение брокера проглатывается: склад от шины не зависит
+        (раздел 6.1), и уронить резерв из-за недоступного RabbitMQ было бы
+        ровно той бедой, которую чиним.
+
+        Публикатор outbox зовёт с `require_broker=True`: он отмечает строку
+        опубликованной, и «отправил, кажется» здесь означало бы потерянное
+        событие с отметкой об успехе.
+        """
         validate_event_type(envelope.type)
         body = envelope.as_dict()
         assert_no_secrets(body["payload"])
 
         with self._lock:
             self._published.append(body)
+            if len(self._published) > _MEMORY_LIMIT:
+                # Память публикатора — окно для тестов стенда, а не журнал.
+                # Без ограничения долгоживущий воркер съел бы её целиком.
+                del self._published[:-_MEMORY_LIMIT]
 
-        self._try_broker(envelope.type, body)
+        self._try_broker(envelope.type, body, require_broker=require_broker)
         return body
 
-    def _try_broker(self, routing_key: str, body: dict[str, Any]) -> None:
+    def _try_broker(self, routing_key: str, body: dict[str, Any], *,
+                    require_broker: bool = False) -> None:
         if not self._url:
+            if require_broker:
+                raise BrokerUnavailable("RABBITMQ_URL не задан")
             return
         try:
             import pika  # локальный импорт: без брокера mock обязан работать
         except ImportError:
+            if require_broker:
+                raise BrokerUnavailable("нет клиента pika")
             return
         try:
             if self._connection is None or self._connection.is_closed:
                 self._connection = pika.BlockingConnection(pika.URLParameters(self._url))
-            channel = self._connection.channel()
-            channel.exchange_declare(exchange=EXCHANGE, exchange_type="topic", durable=True)
+                self._channel = None
+            if self._channel is None or self._channel.is_closed:
+                # Канал переиспользуется, а не создаётся на каждое событие:
+                # публикатор outbox шлёт их тысячами, а лимит каналов на
+                # соединение у RabbitMQ конечен — новый канал на событие
+                # исчерпал бы его за одну смену.
+                self._channel = self._connection.channel()
+                self._channel.exchange_declare(
+                    exchange=EXCHANGE, exchange_type="topic", durable=True)
+            channel = self._channel
             channel.basic_publish(
                 exchange=EXCHANGE,
                 routing_key=routing_key,
                 body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                 properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
             )
-        except Exception:
+        except Exception as failure:
             # Склад не зависит от шины (раздел 6.1). Событие уже в памяти;
             # молчаливая потеря брокера не имеет права уронить операцию.
             self._connection = None
+            self._channel = None
+            if require_broker:
+                raise BrokerUnavailable(str(failure)) from None

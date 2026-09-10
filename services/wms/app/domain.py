@@ -51,6 +51,50 @@ class StockState(str, Enum):
     PROCESSING = "processing"
 
 
+# Какой статус Wildberries соответствует нашему состоянию задания.
+# Таблица 1 файла docs/state-mapping.md, заморожена потоком 0. Отсюда работает
+# сверка: расхождение с этой таблицей — состояние `diverged` и алерт, а не
+# тихая перезапись (инвариант 10). В боевом контуре таких расхождений 2467 из
+# 6374, и все они молчали.
+EXPECTED_WB_STATUS: dict[str, str] = {
+    TaskState.NEW.value: "new",
+    TaskState.MANUAL_REVIEW.value: "new",
+    TaskState.SHORT.value: "new",
+    TaskState.RESERVED.value: "new",
+    TaskState.PICKING.value: "new",
+    TaskState.PICKED.value: "new",
+    TaskState.PACKED.value: "new",
+    TaskState.LABELED.value: "new",
+    TaskState.IN_SUPPLY.value: "confirm",
+    TaskState.SHIPPED.value: "complete",
+    TaskState.HANDED.value: "complete",
+    TaskState.ACCEPTED.value: "complete",
+    TaskState.CANCELLED.value: "cancel",
+}
+
+# Обратное направление — так работает опросчик (таблица 2 того же файла).
+WB_STATUS_TO_STATE: dict[str, str] = {
+    "new": TaskState.RESERVED.value,
+    "confirm": TaskState.IN_SUPPLY.value,
+    "complete": TaskState.SHIPPED.value,
+    "cancel": TaskState.CANCELLED.value,
+}
+
+
+def agrees_with_wb(state: str, wb_status: str | None) -> bool:
+    """Согласуются ли наше состояние и статус Wildberries.
+
+    `diverged` согласуется с чем угодно: расхождение уже зафиксировано, и
+    заново расходиться ему некуда. Неизвестный статус WB считается
+    расхождением — незнакомое значение разбирает человек, а не догадка.
+    """
+    if state == TaskState.DIVERGED.value:
+        return True
+    if wb_status is None:
+        return True
+    return EXPECTED_WB_STATUS.get(state) == wb_status
+
+
 class ErrorCode(str, Enum):
     """Коды отказа резерва (приложение C).
 
@@ -101,6 +145,18 @@ INVENTORY_EVENT_TYPES = frozenset({
     "inventory.stock.updated.v1",
 })
 
+# События Wildberries, которые издаёт wms после поглощения шлюза (раздел 6.3).
+# Их нет в списке WMS_EVENT_TYPES приложения E — тот перечисляет только
+# события склада, — но каналы для них описаны в самом asyncapi.yaml, и
+# `wb.supply.shipped.v1` тарифицируется потоком C (раздел 3.4). Без этого
+# набора публикация такого события упиралась бы в собственную же валидацию.
+WB_EVENT_TYPES = frozenset({
+    "wb.fbs.order.synced.v1",
+    "wb.fbs.order.updated.v1",
+    "wb.supply.shipped.v1",
+    "wb.fbs.return.detected.v1",
+})
+
 
 class EventTypeNotAllowed(ValueError):
     """Попытка отправить событие, которого нет в каталоге."""
@@ -134,6 +190,6 @@ class EventEnvelope:
 
 
 def validate_event_type(event_type: str) -> str:
-    if event_type not in WMS_EVENT_TYPES | INVENTORY_EVENT_TYPES:
+    if event_type not in WMS_EVENT_TYPES | INVENTORY_EVENT_TYPES | WB_EVENT_TYPES:
         raise EventTypeNotAllowed(f"событие {event_type!r} отсутствует в каталоге")
     return event_type

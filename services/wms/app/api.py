@@ -10,14 +10,15 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import fixtures
-from .config import app_environment, trusted_hosts
+from .config import app_environment, mock_mode, trusted_hosts
 from .domain import ErrorCode, EventEnvelope, TaskState, now, uid
 from .events import EventPublisher
 from .state import MockState
@@ -588,43 +589,89 @@ async def wb_account_verify(account_id: str, request: Request) -> JSONResponse:
                           "scopes": ["marketplace"]})
 
 
+def _pool_lifespan(*closers: Any) -> Any:
+    """Lifespan приложения: отпустить пул соединений и остановить конвейер публикаций."""
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            for close in closers:
+                close()
+
+    return lifespan
+
+
 def create_app() -> FastAPI:
     # Падаем на старте, а не на первом запросе: сервис без объявленного
     # окружения не должен считаться поднявшимся.
     environment = app_environment()
+    # Заглушка обязана заявлять о себе явно (WMS_MOCK). Настоящий сервис
+    # поднимается только при явно выключенном флаге: молчаливое превращение
+    # mock в «почти настоящий сервис» — это то, как заглушки доезжают до прода.
+    mocked = mock_mode()
 
     app = FastAPI(
-        title="MM-Express WMS (mock)",
+        title="MM-Express WMS (mock)" if mocked else "MM-Express WMS",
         version="0.1.0",
-        description="Заглушка потока 0. Контракт настоящий, логика фиктивная.",
+        description=("Заглушка потока 0. Контракт настоящий, логика фиктивная."
+                     if mocked else
+                     "Сервис склада: своя база, своя транзакция, свой Wildberries."),
     )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts(environment))
-    app.include_router(router)
+
+    if mocked:
+        app.include_router(router)
+        readiness: Any = lambda: True
+        metrics_source: Any = state
+    else:
+        # Импорт здесь, а не наверху: заглушке база не нужна вовсе, и требовать
+        # DATABASE_URL ради её запуска — значит держать потоки B и C заложниками
+        # чужой инфраструктуры (правило 9.5.4).
+        from .postgres import pool, reset_pool
+        from .routes import create_router
+        from .runtime import RuntimeMetrics
+        from .stock_push import reset_publisher
+
+        connections = pool()
+        app.include_router(create_router(connections))
+        readiness = connections.healthy
+        metrics_source = RuntimeMetrics(connections)
+
+        # Закрытие пула вешается на lifespan приложения: соединения обязаны
+        # отпуститься при остановке, иначе Postgres какое-то время держит
+        # backend'ы уже мёртвого контейнера.
+        app.router.lifespan_context = _pool_lifespan(reset_pool, reset_publisher)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/readyz")
-    async def readyz() -> dict[str, str]:
-        return {"status": "ready"}
+    async def readyz() -> JSONResponse:
+        # Готовность — это доступность зависимостей, а не «процесс жив».
+        # Мониторинг, следящий за портом, а не за работой, — раздел 3.5.
+        ready = bool(readiness())
+        return JSONResponse({"status": "ready" if ready else "not-ready"},
+                            status_code=200 if ready else 503)
 
     @app.get("/metrics")
     async def metrics() -> PlainTextResponse:
         from .metrics import prometheus_payload
-        payload, content_type = prometheus_payload(state)
+        payload, content_type = prometheus_payload(metrics_source)
         return PlainTextResponse(payload.decode("utf-8"), media_type=content_type)
 
-    @app.get("/__mock__/events")
-    async def mock_events() -> dict[str, Any]:
-        """Служебное окно в опубликованные события — только для тестов стенда."""
-        return {"events": publisher.published}
+    if mocked:
+        @app.get("/__mock__/events")
+        async def mock_events() -> dict[str, Any]:
+            """Служебное окно в опубликованные события — только для тестов стенда."""
+            return {"events": publisher.published}
 
-    @app.post("/__mock__/reset")
-    async def mock_reset() -> dict[str, str]:
-        state.reset()
-        publisher.clear()
-        return {"status": "reset"}
+        @app.post("/__mock__/reset")
+        async def mock_reset() -> dict[str, str]:
+            state.reset()
+            publisher.clear()
+            return {"status": "reset"}
 
     return app
 
