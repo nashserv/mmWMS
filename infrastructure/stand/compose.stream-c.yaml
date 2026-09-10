@@ -1,0 +1,109 @@
+# Наложение потока C: деньги и кабинеты.
+#
+# Отдельным файлом, а не правкой compose.yaml, по двум причинам.
+# Первая — правило 9.5.1: compose.yaml принадлежит потоку 0, чужие файлы не
+# редактируются. Вторая практическая: потоки A и B добавляют свои сервисы
+# одновременно, и три агента, дописывающие один файл, гарантированно получают
+# конфликт при мерже.
+#
+# README стенда (раздел «Сервисы платформы») описывает порядок подключения:
+# скопировать сервис в services/, направить WMS_ADAPTER на mock wms. Здесь это
+# и сделано — WMS_BASE_URL смотрит на http://wms:8080, контракт
+# /api/mmx/wms/v1/* сохранён потоком 0 ровно ради этого.
+#
+# Запуск:
+#   cd infrastructure/stand
+#   docker compose -f compose.yaml -f compose.stream-c.yaml up -d
+#
+# Когда интегратор сольёт потоки в main, содержимое этого файла переезжает в
+# compose.yaml одним движением — заявкой в поток 0.
+
+name: mmx-stand
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-billing-env: &billing-env
+  APP_ENV: development
+  DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+  MMX_EVENTS_EXCHANGE: mmx.events
+  MMX_TENANT_ID: mm-express
+  # Контракт wms (приложение B). До готовности потока A на этом адресе стоит
+  # mock потока 0 — правило 9.5.4, никто никого не ждёт.
+  WMS_BASE_URL: http://wms:8080
+  # Кабинет, приехавший событием, а не онбордингом, тарифицируется и помечается
+  # needs_onboarding (см. app/service.py). Выключить — значит терять выручку молча.
+  BILLING_AUTO_ONBOARD: "true"
+  TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+
+services:
+
+  # --------------------------------------------------------------- миграции
+  billing-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      # Скрипт потока 0 переиспользуется как есть: существующие миграции не
+      # переписываются, применение идёт по журналу (правило 9.5).
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/billing/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Сид стенда: партнёры, кабинеты и тарифы поверх тех же продавцов, что уже
+  # посеяны в базе wms (reference/stand-seed). Идемпотентен — ON CONFLICT DO
+  # NOTHING, повторный запуск ничего не меняет.
+  billing-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      billing-migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ../../services/billing/seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "billing",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stand-billing.sql"]
+
+  # ---------------------------------------------------------------- сервисы
+  billing:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+    environment:
+      <<: *billing-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8082:8080"]
+
+  # Инвариант 14: молчащий воркер считается сломанным. Поэтому у консьюмера
+  # свой /metrics — он обязан уметь доказать, что работает, а не просто быть Up.
+  billing-inbox-consumer:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+      rabbitmq-init: {condition: service_completed_successfully}
+    environment:
+      <<: *billing-env
+      METRICS_PORT: "8081"
+    command: ["python", "-m", "app.consumer"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/metrics', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    ports: ["127.0.0.1:8083:8081"]

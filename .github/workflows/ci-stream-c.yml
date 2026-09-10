@@ -1,0 +1,93 @@
+# CI потока C: деньги и кабинеты.
+#
+# Отдельный файл, а не правка ci.yml потока 0 — правило 9.5.1, чужие файлы не
+# редактируются. Когда интегратор сольёт потоки, эти шаги переезжают в общий
+# workflow заявкой в поток 0.
+#
+# Половина правил биллинга живёт в схеме — история закреплений без наложений,
+# net_amount, раскладка комиссии. Поэтому тесты идут против настоящего Postgres
+# с применёнными миграциями, как в CI платформы.
+
+name: ci-stream-c
+
+on:
+  push:
+    branches: [stream-c]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  billing:
+    name: Биллинг — миграции и тесты
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.10-bookworm
+        env:
+          POSTGRES_DB: billing
+          POSTGRES_USER: billing
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+        options: >-
+          --health-cmd "pg_isready -U billing -d billing"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+
+      - name: Миграции на чистой базе
+        env:
+          DATABASE_URL: postgresql://billing:ci-only-not-a-secret@127.0.0.1:5432/billing
+          MIGRATIONS_DIR: services/billing/migrations
+        run: bash infrastructure/stand/scripts/migrate.sh
+
+      - name: Повторный прогон идемпотентен
+        env:
+          DATABASE_URL: postgresql://billing:ci-only-not-a-secret@127.0.0.1:5432/billing
+          MIGRATIONS_DIR: services/billing/migrations
+        run: |
+          out="$(bash infrastructure/stand/scripts/migrate.sh)"
+          echo "$out"
+          echo "$out" | grep -q "миграции применены: 0"
+
+      - name: Инварианты держатся на уровне схемы
+        env:
+          PGPASSWORD: ci-only-not-a-secret
+        run: |
+          # История закреплений без наложений, раскладка комиссии не больше
+          # наценки, цикл в дереве менеджеров отбит. Всё это — база, не код.
+          psql -h 127.0.0.1 -U billing -d billing -v ON_ERROR_STOP=1 -c "
+            SELECT 1/count(*) FROM pg_constraint
+             WHERE conname IN ('cabinet_assignment_no_overlap',
+                               'price_layer_default_no_overlap',
+                               'billing_tariff_version_no_overlap',
+                               'billing_accrual_partner_within_amount')
+            HAVING count(*) = 4;"
+          psql -h 127.0.0.1 -U billing -d billing -v ON_ERROR_STOP=1 -c "
+            SELECT 1/count(*) FROM pg_trigger
+             WHERE NOT tgisinternal
+               AND tgname IN ('partner_no_cycle',
+                              'billing_commission_matches_accrual',
+                              'billing_invoice_payout_follows_payment')
+            HAVING count(*) = 3;"
+
+      - name: Сид стенда воспроизводим
+        run: |
+          # Генератор читает сид потока 0 и обязан давать тот же файл: иначе
+          # идентификаторы кабинетов разъедутся между потоками.
+          python services/billing/seed/build-stand-seed.py
+          git diff --exit-code services/billing/seed/stand-billing.sql
+
+      - run: pip install --no-cache-dir -r services/billing/requirements.txt pytest pip-audit
+
+      - name: pytest
+        working-directory: services/billing
+        env:
+          APP_ENV: test
+          BILLING_TEST_DATABASE_URL: postgresql://billing:ci-only-not-a-secret@127.0.0.1:5432/billing
+        run: python -m pytest -q
+
+      - name: pip-audit
+        run: pip-audit -r services/billing/requirements.txt
