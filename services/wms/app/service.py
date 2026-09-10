@@ -23,7 +23,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import psycopg
 
@@ -67,6 +67,10 @@ class ReservationOutcome:
     # Повтор той же команды. Наружу в контракт не идёт — нужен метрикам и логу,
     # чтобы отличать «сделали» от «уже было сделано» (инвариант 5).
     duplicate: bool = False
+    # Чей остаток и по какому товару изменился. Наружу не идёт: это адрес для
+    # публикации остатка в WB, которая уходит ПОСЛЕ коммита (раздел 6.4).
+    owner_id: uuid.UUID | None = None
+    moved_sku_ids: set[uuid.UUID] = field(default_factory=set)
 
     def as_result(self) -> dict[str, Any]:
         """Ответ по схеме ReservationResult. additionalProperties: false."""
@@ -83,9 +87,15 @@ class ReservationOutcome:
 class WmsService:
     """Операции склада поверх одного пула соединений."""
 
-    def __init__(self, pool: ConnectionPool, *, tenant_id: str = TENANT_ID) -> None:
+    def __init__(self, pool: ConnectionPool, *, tenant_id: str = TENANT_ID,
+                 on_stock_changed: Callable[[uuid.UUID, set[uuid.UUID]], None] | None = None
+                 ) -> None:
         self._pool = pool
         self._tenant_id = tenant_id
+        # Кого позвать, когда остаток изменился. Зовётся строго после коммита:
+        # внутри транзакции нет и не может быть ни одного вызова наружу
+        # (инвариант 2), а публикация в WB — это вызов на полсекунды.
+        self._on_stock_changed = on_stock_changed
 
     # ------------------------------------------------------------- события
 
@@ -130,7 +140,10 @@ class WmsService:
                 with self._pool.connection() as connection:
                     with transaction(connection) as cursor:
                         with track_lock("reserve"):
-                            return self._reserve_once(cursor, params)
+                            outcome = self._reserve_once(cursor, params)
+                # Транзакция закоммичена — только теперь можно наружу.
+                self._announce_stock(outcome)
+                return outcome
             except psycopg.Error as error:
                 if not is_retryable(error):
                     raise
@@ -314,7 +327,8 @@ class WmsService:
 
         return ReservationOutcome(
             status="reserved", task_id=str(task["id"]), owner_external_id=seller,
-            reservation_id=str(reservation_id), ledger_short=remaining > 0, events=events)
+            reservation_id=str(reservation_id), ledger_short=remaining > 0, events=events,
+            owner_id=owner["id"], moved_sku_ids={sku["id"]})
 
     # ---------------------------------------------------------- отказы
 
@@ -394,6 +408,24 @@ class WmsService:
         return ReservationOutcome(
             status="rejected", task_id=str(task["id"]), owner_external_id=seller,
             error_code=task["manual_review_code"], duplicate=True)
+
+
+    def _announce_stock(self, outcome: ReservationOutcome) -> None:
+        """Остаток изменился — публикация уходит немедленно (раздел 6.4).
+
+        Ни таймеров, ни накопления: изменение уезжает сразу, а конвейер на
+        стороне публикатора существует только потому, что HTTP занимает время.
+        """
+        if self._on_stock_changed is None or not outcome.moved_sku_ids:
+            return
+        if outcome.owner_id is None:
+            return
+        try:
+            self._on_stock_changed(outcome.owner_id, outcome.moved_sku_ids)
+        except Exception:
+            # Публикация остатка не имеет права уронить резерв: задание уже
+            # заведено, товар уже удержан, и это важнее.
+            pass
 
 
 def _was_ledger_short(cursor: psycopg.Cursor, reservation_id: uuid.UUID) -> bool:
@@ -558,8 +590,21 @@ class CatalogOperations:
 class StockOperations:
     """Приход, размещение и публикуемый остаток."""
 
-    def __init__(self, pool: ConnectionPool) -> None:
+    def __init__(self, pool: ConnectionPool,
+                 on_stock_changed: Callable[[uuid.UUID, set[uuid.UUID]], None] | None = None
+                 ) -> None:
         self._pool = pool
+        self._on_stock_changed = on_stock_changed
+
+    def _announce(self, owner_id: uuid.UUID, sku_ids: set[uuid.UUID]) -> None:
+        if self._on_stock_changed is None or not sku_ids:
+            return
+        try:
+            self._on_stock_changed(owner_id, sku_ids)
+        except Exception:
+            # Товар уже принят и записан в журнал. Непрошедшая публикация —
+            # повод для метрики, а не для отката приёмки.
+            pass
 
     def apply_document(self, params: dict[str, Any]) -> dict[str, Any]:
         """Складской документ: строки едут прямо в журнал (инвариант 3).
@@ -581,6 +626,7 @@ class StockOperations:
             with transaction(connection) as cursor:
                 owner, _ = repo.upsert_owner(cursor, seller)
                 written = 0
+                touched: set[uuid.UUID] = set()
                 for index, line in enumerate(lines):
                     barcode = str(line.get("barcode") or "").strip()
                     quantity = int(line.get("quantity") or 0)
@@ -606,9 +652,13 @@ class StockOperations:
                         idem_key=f"{doc_type}:{reference}:{index}")
                     if move is not None:
                         written += 1
-                return {"reference": reference, "owner_external_id": seller,
-                        "state": "applied", "moves": written,
-                        "duplicate": written == 0}
+                        touched.add(sku["id"])
+                    owner_id = owner["id"]
+        # Транзакция закрыта — остаток можно публиковать (инвариант 2).
+        self._announce(owner_id, touched)
+        return {"reference": reference, "owner_external_id": seller,
+                "state": "applied", "moves": written,
+                "duplicate": written == 0}
 
     def placements(self, params: dict[str, Any]) -> dict[str, Any]:
         """Где и в каком состоянии лежит товар — проекция `stock_balance`."""

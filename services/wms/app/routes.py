@@ -19,9 +19,9 @@ from typing import Any, Callable
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from .events import EventPublisher
 from .metrics import observe_http
 from .postgres import ConnectionPool
+from .stock_push import publisher as stock_publisher_for
 from .service import CatalogOperations, StockOperations, WmsService
 
 BASE_PATH = "/api/mmx/wms/v1"
@@ -70,12 +70,22 @@ async def _body(request: Request) -> Any:
         return {}
 
 
-def create_router(pool: ConnectionPool, publisher: EventPublisher) -> APIRouter:
-    """Собирает маршруты вокруг одного пула соединений."""
+def create_router(pool: ConnectionPool) -> APIRouter:
+    """Собирает маршруты вокруг одного пула соединений.
+
+    Публикатора событий здесь нет намеренно: события пишутся в outbox той же
+    транзакцией, что и движение товара, а в шину их несёт отдельный воркер
+    (app/workers/outbox_publisher.py). Маршрут о шине не знает вовсе — склад
+    от неё не зависит (раздел 6.1).
+    """
     router = APIRouter(prefix=BASE_PATH)
-    wms = WmsService(pool)
+    # Остаток публикуется в Wildberries сразу после движения, без таймеров
+    # (раздел 6.4). Публикатор получает уведомление уже после коммита —
+    # внутри транзакции вызовов наружу нет и быть не может (инвариант 2).
+    stock_publisher = stock_publisher_for(pool)
+    wms = WmsService(pool, on_stock_changed=stock_publisher.notify)
     catalog = CatalogOperations(pool)
-    stock = StockOperations(pool)
+    stock = StockOperations(pool, stock_publisher.notify)
 
     # Событий отсюда никто не отправляет намеренно. Они уже записаны в outbox
     # той же транзакцией, что и движение товара, и в шину их несёт единственный

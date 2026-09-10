@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from .config import LOCAL_ENVIRONMENTS, app_environment
 from .rate_limit import Pace
 from .secrets import SecretProvider, provider
 
@@ -285,3 +286,26 @@ def _sticker_bytes(payload: str, sticker_format: str) -> bytes:
         except Exception:
             return payload.encode("utf-8")
     return payload.encode("utf-8")
+
+
+def writes_allowed(mode: str) -> bool:
+    """Можно ли писать в Wildberries для кабинета в этом режиме.
+
+    `shadow` означает «только `GET /api/v3/orders`, ни одной записи»: ни
+    стикеров, ни поставок, ни публикации остатков (раздел 11, шаг 2). Смысл
+    запрета — живой токен отправит настоящие команды в кабинет клиента:
+    создаст поставку, переведёт задание в собранное, перезапишет остатки.
+    Необратимо, и узнает об этом клиент, а не мы.
+
+    Исключение ровно одно и требует двух независимых условий сразу:
+    окружение локальное (test/local/development) И адрес Wildberries не задан,
+    то есть отвечает симулятор стенда. На стенде живых кабинетов нет по
+    построению — это проверяется воротами token-guard при каждом подъёме, —
+    и запрещать там запись значит запрещать проверять цикл целиком.
+
+    В staging и prod `shadow` абсолютен: одного условия для записи мало,
+    а обоих там не бывает.
+    """
+    if (mode or "").strip().lower() == "live":
+        return True
+    return app_environment() in LOCAL_ENVIRONMENTS and not os.getenv("WB_API_URL", "").strip()

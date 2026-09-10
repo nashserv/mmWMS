@@ -689,3 +689,147 @@ def finish_sync_with_cursor(cursor: Cursor, account_id: uuid.UUID, *, cursor_val
         "  WHERE id = %(account)s",
         {"account": account_id, "cursor": str(cursor_value),
          "next": float(next_in_seconds), "status": status})
+
+
+# ------------------------------------------------- стикеры и поставки
+
+def tasks_awaiting_labels(cursor: Cursor, *, limit: int = 100,
+                          only_accounts: Sequence[str] | None = None,
+                          modes: Sequence[str] = ("live",)) -> list[dict[str, Any]]:
+    """Задания, у которых ещё нет действующего стикера.
+
+    Порядок по сроку WB, а не по времени создания: если стикеров успевает
+    выехать не всё, первыми обязаны получить их те задания, которые раньше
+    везти.
+
+    Режимы кабинета фильтруются вызывающим: запрос стикера — это запись в WB
+    (он кладёт заказ в поставку), а в shadow писать нельзя. Что считать
+    разрешённым, решает `wb.writes_allowed`, а не этот запрос.
+    """
+    cursor.execute(
+        "SELECT t.id, t.wb_order_id, t.wb_account_id, t.owner_id, t.supply_id, "
+        "       a.external_id AS account_external_id, a.secret_ref "
+        "  FROM wms_task t "
+        "  JOIN wb_account a ON a.id = t.wb_account_id "
+        "  LEFT JOIN wb_label l ON l.task_id = t.id AND l.invalidated_at IS NULL "
+        " WHERE t.state IN ('reserved', 'picking', 'picked') "
+        "   AND l.id IS NULL "
+        "   AND a.mode = ANY(%(modes)s) AND a.status = 'ACTIVE' "
+        "   AND (%(only)s::text[] IS NULL OR a.external_id = ANY(%(only)s)) "
+        " ORDER BY t.deadline NULLS LAST, t.created_at "
+        " LIMIT %(limit)s",
+        {"limit": limit, "only": list(only_accounts) if only_accounts else None,
+         "modes": list(modes)})
+    return cursor.fetchall()
+
+
+def open_supply(cursor: Cursor, account_id: uuid.UUID) -> dict[str, Any]:
+    """Накопительная поставка кабинета. Одна открытая на кабинет.
+
+    Открывается лениво и живёт локально до первого обращения к WB: пока в неё
+    нечего класть, создавать поставку в Wildberries незачем.
+    """
+    cursor.execute(
+        "INSERT INTO wb_supply (id, wb_account_id, state) VALUES (%s, %s, 'open') "
+        "ON CONFLICT (wb_account_id) WHERE state = 'open' DO NOTHING "
+        "RETURNING id, wb_account_id, wb_supply_id, state",
+        (uuid.uuid4(), account_id))
+    row = cursor.fetchone()
+    if row is not None:
+        return row
+    cursor.execute(
+        "SELECT id, wb_account_id, wb_supply_id, state FROM wb_supply "
+        " WHERE wb_account_id = %s AND state = 'open'", (account_id,))
+    row = cursor.fetchone()
+    assert row is not None
+    return row
+
+
+def bind_supply_to_wb(cursor: Cursor, supply_id: uuid.UUID, wb_supply_id: str) -> None:
+    cursor.execute("UPDATE wb_supply SET wb_supply_id = %s WHERE id = %s AND wb_supply_id IS NULL",
+                   (wb_supply_id, supply_id))
+
+
+def attach_tasks_to_supply(cursor: Cursor, task_ids: Sequence[uuid.UUID],
+                           supply_id: uuid.UUID) -> None:
+    cursor.execute("UPDATE wms_task SET supply_id = %s WHERE id = ANY(%s) AND supply_id IS NULL",
+                   (supply_id, list(task_ids)))
+
+
+def save_label(cursor: Cursor, *, task_id: uuid.UUID, payload: bytes, checksum: str,
+               label_format: str) -> dict[str, Any] | None:
+    """Кладёт стикер рядом с заданием и связывает их.
+
+    Версия растёт при перевыпуске: у отменённого и заново собранного задания
+    стикер другой, и печатать старый нельзя.
+    """
+    cursor.execute(
+        "INSERT INTO wb_label (id, task_id, format, payload, checksum) "
+        "VALUES (%(id)s, %(task)s, %(format)s, %(payload)s, %(checksum)s) "
+        "ON CONFLICT (task_id) DO UPDATE SET "
+        "    format = EXCLUDED.format, payload = EXCLUDED.payload, "
+        "    checksum = EXCLUDED.checksum, fetched_at = now(), "
+        "    invalidated_at = NULL, version = wb_label.version + 1 "
+        "RETURNING id, task_id, format, checksum, version, fetched_at",
+        {"id": uuid.uuid4(), "task": task_id, "format": label_format,
+         "payload": payload, "checksum": checksum})
+    label = cursor.fetchone()
+    if label is not None:
+        cursor.execute("UPDATE wms_task SET label_id = %s WHERE id = %s",
+                       (label["id"], task_id))
+    return label
+
+
+def invalidate_label(cursor: Cursor, task_id: uuid.UUID) -> None:
+    """Стикер отменённого задания больше не действителен (раздел 6.6)."""
+    cursor.execute(
+        "UPDATE wb_label SET invalidated_at = now() "
+        " WHERE task_id = %s AND invalidated_at IS NULL", (task_id,))
+
+
+def label_of(cursor: Cursor, task_id: uuid.UUID) -> dict[str, Any] | None:
+    cursor.execute(
+        "SELECT id, task_id, format, payload, checksum, version, fetched_at, invalidated_at "
+        "  FROM wb_label WHERE task_id = %s", (task_id,))
+    return cursor.fetchone()
+
+
+def available_for_push(cursor: Cursor, owner_id: uuid.UUID,
+                       sku_ids: Any = None) -> list[dict[str, Any]]:
+    """Строки для публикации в WB: `available = good − reserved − buffer`.
+
+    Отрицательное значение публикуется нулём, а не выбрасывается: строка, не
+    доехавшая до Wildberries, оставит там прежнее большее число, то есть
+    продажу того, чего нет. Занижать всегда (инвариант 7).
+    """
+    cursor.execute(
+        "SELECT s.barcode, "
+        "       GREATEST(0, "
+        "           COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'good'), 0) "
+        "         - COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'reserved'), 0) "
+        "         - s.buffer)::int AS available "
+        "  FROM sku s "
+        "  LEFT JOIN stock_balance b ON b.sku_id = s.id AND b.owner_id = s.owner_id "
+        " WHERE s.owner_id = %(owner)s "
+        "   AND (%(skus)s::uuid[] IS NULL OR s.id = ANY(%(skus)s)) "
+        "   AND s.barcode IS NOT NULL AND length(btrim(s.barcode)) > 0 "
+        " GROUP BY s.id, s.barcode, s.buffer ORDER BY s.barcode",
+        {"owner": owner_id, "skus": list(sku_ids) if sku_ids else None})
+    return cursor.fetchall()
+
+
+def record_stock_push(cursor: Cursor, *, account_id: uuid.UUID, rows: int,
+                      result: dict[str, Any]) -> None:
+    """Журнал публикаций: когда мы последний раз сказали WB про этот кабинет."""
+    cursor.execute(
+        "INSERT INTO wb_stock_push (id, account_id, rows, result) VALUES (%s, %s, %s, %s)",
+        (uuid.uuid4(), account_id, rows, json.dumps(result, ensure_ascii=False)))
+
+
+def accounts_of_owner(cursor: Cursor, owner_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Кабинеты владельца, годные для публикации остатка."""
+    cursor.execute(
+        "SELECT id, owner_id, external_id, secret_ref, mode, status, wb_warehouse_id "
+        "  FROM wb_account WHERE owner_id = %s AND status IN ('ACTIVE', 'RATE_LIMITED') "
+        " ORDER BY external_id", (owner_id,))
+    return cursor.fetchall()

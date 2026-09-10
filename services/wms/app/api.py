@@ -589,14 +589,15 @@ async def wb_account_verify(account_id: str, request: Request) -> JSONResponse:
                           "scopes": ["marketplace"]})
 
 
-def _pool_lifespan(close: Any) -> Any:
-    """Lifespan приложения: единственное, что нужно закрыть, — пул соединений."""
+def _pool_lifespan(*closers: Any) -> Any:
+    """Lifespan приложения: отпустить пул соединений и остановить конвейер публикаций."""
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            close()
+            for close in closers:
+                close()
 
     return lifespan
 
@@ -630,16 +631,17 @@ def create_app() -> FastAPI:
         from .postgres import pool, reset_pool
         from .routes import create_router
         from .runtime import RuntimeMetrics
+        from .stock_push import reset_publisher
 
         connections = pool()
-        app.include_router(create_router(connections, publisher))
+        app.include_router(create_router(connections))
         readiness = connections.healthy
         metrics_source = RuntimeMetrics(connections)
 
         # Закрытие пула вешается на lifespan приложения: соединения обязаны
         # отпуститься при остановке, иначе Postgres какое-то время держит
         # backend'ы уже мёртвого контейнера.
-        app.router.lifespan_context = _pool_lifespan(reset_pool)
+        app.router.lifespan_context = _pool_lifespan(reset_pool, reset_publisher)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

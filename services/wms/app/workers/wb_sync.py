@@ -28,6 +28,7 @@ from ..metrics import WB_SYNC_LAST_SUCCESS, WB_SYNC_LAG
 from ..postgres import ConnectionPool, pool as shared_pool, single
 from ..secrets import SecretUnavailable
 from ..service import WmsService
+from ..stock_push import publisher as stock_publisher
 from ..wb import WbClient, WbError, WbOrder
 from .loop import Worker, configure_logging
 
@@ -55,7 +56,10 @@ class WbSyncWorker:
     def __init__(self, pool: ConnectionPool, *, service: WmsService | None = None,
                  only_accounts: Sequence[str] | None = None) -> None:
         self._pool = pool
-        self._service = service or WmsService(pool)
+        # Резерв уводит товар из good — значит, доступный остаток изменился и
+        # его надо опубликовать. Немедленно, без таймеров (раздел 6.4).
+        self._service = service or WmsService(
+            pool, on_stock_changed=stock_publisher(pool).notify)
         # Список кабинетов, которые опрашивает этот воркер. Пустой — все.
         # Переключение на новую WMS идёт по одному кабинету (раздел 11, шаг 6):
         # первый клиент едет отдельным воркером, остальные остаются на боевом
