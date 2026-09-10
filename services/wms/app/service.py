@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -31,7 +32,7 @@ from . import repositories as repo
 from .domain import ErrorCode, EventEnvelope, TaskState
 from .events import assert_no_secrets
 from .metrics import STOCK_SHORTFALL, track_lock
-from .postgres import ConnectionPool, is_retryable, transaction
+from .postgres import ConnectionPool, is_retryable, single, transaction
 
 TENANT_ID = os.getenv("MMX_TENANT_ID", "mm-express")
 
@@ -518,6 +519,53 @@ class CatalogOperations:
                         " ORDER BY s.barcode LIMIT 1000")
                 return [_product_view(row) for row in cursor.fetchall()]
 
+    def wb_cards(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Карточки Wildberries — через `wms`, как требует раздел 6.8.
+
+        Токен категории «Контент» держит `wms` (раздел 12), поэтому ходить в
+        Content API каталогу больше нечем и незачем. Здесь закрыта та сторона,
+        которая от `wms` зависит; переключение самого `product-catalog` —
+        отдельная задача: его исходников в этом репозитории нет, они лежат на
+        боевом сервере, а боевой контур — только чтение.
+
+        Флаг `mapped` отвечает на единственный вопрос, ради которого каталог
+        сюда и ходит: заведена ли карточка у нас. Немаппленный товар — это
+        `manual_review` с кодом, а не остаток (инвариант 6).
+        """
+        from .wb import WbClient
+
+        seller = str(params.get("seller_external_id") or "").strip()
+        if not seller:
+            raise ValueError("seller_external_id обязателен")
+        limit = min(int(params.get("limit") or 100), 500)
+        wanted = {str(b).strip() for b in (params.get("barcodes") or []) if str(b).strip()}
+        cursor_value = int(params.get("cursor") or 0)
+
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                owner = repo.find_owner(cursor, seller)
+                if owner is None:
+                    raise ValueError(f"клиент {seller!r} не заведён")
+                accounts = repo.accounts_of_owner(cursor, owner["id"])
+                known = repo.known_barcodes(cursor, owner["id"])
+
+        if not accounts:
+            # Кабинета нет — карточек взять неоткуда, и выдумывать их нельзя.
+            return {"seller_external_id": seller, "cards": [], "next_cursor": None,
+                    "generated_at": _now_iso()}
+
+        account = accounts[0]
+        with WbClient(account_external_id=account["external_id"],
+                      secret_ref=account["secret_ref"]) as client:
+            rows, next_cursor = client.cards(cursor=cursor_value, limit=limit)
+
+        cards = [{**row, "mapped": row["barcode"] in known}
+                 for row in rows
+                 if not wanted or row["barcode"] in wanted]
+        return {"seller_external_id": seller, "cards": cards,
+                "next_cursor": str(next_cursor) if len(rows) == limit else None,
+                "generated_at": _now_iso()}
+
     def ensure_product(self, params: dict[str, Any]) -> dict[str, Any]:
         """Заводит товар у владельца.
 
@@ -536,8 +584,9 @@ class CatalogOperations:
                     cursor, owner["id"], barcode,
                     seller_sku=_text(params.get("seller_sku")),
                     name=_text(params.get("name")), buffer=params.get("buffer"))
-                return {"product_id": str(sku["id"]), "sku_id": str(sku["id"]),
-                        "barcode": barcode, "seller_external_id": seller,
+                # Форма — CatalogProductEnsureResult: карточка внутри
+                # `product`, а не россыпью полей.
+                return {"product": _product_view(dict(sku) | {"seller_external_id": seller}),
                         "created": created}
 
     def upsert_wb_account(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -674,6 +723,66 @@ class StockOperations:
                 "state": "applied", "moves": written,
                 "duplicate": written == 0}
 
+    def count_by_state(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Сколько этого товара у клиента и в каких состояниях.
+
+        Это чтение, а не пересчёт: контракт (`StorageCountResult`) требует
+        здесь итог по состояниям. Пересчёт ячейки живёт в `/inventory/count`
+        со `scope: partial` — у строки там есть `cell_address`, и отдельного
+        маршрута для него контракт не заводит.
+        """
+        seller = str(params.get("seller_external_id") or "").strip()
+        barcode = str(params.get("barcode") or "").strip()
+        if not seller or not barcode:
+            raise ValueError("seller_external_id и barcode обязательны")
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                cursor.execute(
+                    "SELECT b.state, SUM(b.qty)::int AS qty "
+                    "  FROM stock_balance b "
+                    "  JOIN owner o ON o.id = b.owner_id "
+                    "  JOIN sku s ON s.id = b.sku_id "
+                    " WHERE o.seller_external_id = %s AND s.barcode = %s "
+                    " GROUP BY b.state", (seller, barcode))
+                by_state = {row["state"]: int(row["qty"]) for row in cursor.fetchall()
+                            if int(row["qty"]) != 0}
+        return {"owner_external_id": seller, "barcode": barcode,
+                "total": sum(by_state.values()), "by_state": by_state,
+                "available": by_state.get("good", 0)}
+
+    def movements(self, params: dict[str, Any]) -> dict[str, Any]:
+        """История движений по товару за период — для ЛК клиента.
+
+        Файл 04 требует её прямым текстом, а прочитать `stock_move` за период
+        было нечем: приложение B знало только текущий остаток. Экран остатка
+        показывал коробки и ячейки, а историю подменять выдумкой не стали.
+
+        Листание курсором, а не смещением: журнал дописывается во время
+        листания, и страница со смещением показала бы одну строку дважды.
+        """
+        seller = str(params.get("seller_external_id") or "").strip()
+        if not seller:
+            raise ValueError("seller_external_id обязателен")
+        limit = min(int(params.get("limit") or 100), 500)
+        since = _text_or_none(params.get("since")) or _days_ago(30)
+
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                owner = repo.find_owner(cursor, seller)
+                if owner is None:
+                    raise ValueError(f"клиент {seller!r} не заведён")
+                # Берём на строку больше запрошенного: так видно, есть ли
+                # следующая страница, без второго запроса «а сколько всего».
+                rows = repo.movements_of(
+                    cursor, owner_id=owner["id"],
+                    barcode=_text_or_none(params.get("barcode")),
+                    since=since, until=_text_or_none(params.get("until")),
+                    cursor_id=_int_or_none(params.get("cursor")),
+                    limit=limit + 1)
+        next_cursor = rows[limit - 1]["movement_id"] if len(rows) > limit else None
+        return {"seller_external_id": seller, "movements": rows[:limit],
+                "next_cursor": next_cursor, "generated_at": _now_iso()}
+
     def placements(self, params: dict[str, Any]) -> dict[str, Any]:
         """Где и в каком состоянии лежит товар — проекция `stock_balance`."""
         seller = str(params.get("seller_external_id") or "").strip()
@@ -744,6 +853,34 @@ class StockOperations:
                 return rows, dropped
 
 
+def _now_iso() -> str:
+    """Момент сборки ответа: экран обязан знать, насколько свежее то, что видит."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _days_ago(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _text_or_none(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _uuid_or_none(value: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 def _owner_view(row: dict[str, Any]) -> dict[str, Any]:
     return {"owner_id": str(row["id"]), "seller_external_id": row["seller_external_id"],
             "name": row["name"], "inn": row["inn"], "active": row["active"],
@@ -751,10 +888,15 @@ def _owner_view(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _product_view(row: dict[str, Any]) -> dict[str, Any]:
+    """Карточка товара в форме контракта (`Product`).
+
+    Владелец зовётся `owner_external_id`: у схемы `additionalProperties: false`,
+    и `seller_external_id` клиент просто не увидит.
+    """
     return {"sku_id": str(row["id"]), "barcode": row["barcode"],
             "seller_sku": row["seller_sku"], "name": row["name"],
             "buffer": int(row["buffer"] or 0),
-            "seller_external_id": row.get("seller_external_id")}
+            "owner_external_id": row.get("seller_external_id")}
 
 
 def _account_view(row: dict[str, Any], seller: str | None) -> dict[str, Any]:

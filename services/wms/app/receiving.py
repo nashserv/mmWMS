@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from . import repositories as repo
@@ -26,10 +27,14 @@ SURPLUS = "surplus"
 
 
 class ReceivingOperations:
-    def __init__(self, pool: ConnectionPool,
+    def __init__(self, pool: ConnectionPool, service: Any = None,
                  on_stock_changed: Callable[[uuid.UUID, set[uuid.UUID]], None] | None = None
                  ) -> None:
         self._pool = pool
+        # Эмиттер событий. Приёмка — физическое действие, значит движение,
+        # событие и начисление (инвариант 13); до версии 1.3 мастера события
+        # для неё не существовало, и приёмку было нечем тарифицировать.
+        self._service = service
         self._on_stock_changed = on_stock_changed
 
     # ------------------------------------------------------------- приёмка
@@ -69,7 +74,7 @@ class ReceivingOperations:
                     cursor, owner_id=owner["id"], reference=reference,
                     warehouse_id=warehouse["id"], actor_id=actor)
 
-                accepted, counted_all, discrepancies = 0, True, []
+                accepted, accepted_qty, counted_all, discrepancies = 0, 0, True, []
                 for index, line in enumerate(lines):
                     barcode = str(line.get("barcode") or "").strip()
                     if not barcode:
@@ -111,6 +116,7 @@ class ReceivingOperations:
                             doc_ref=reference, actor_id=actor,
                             idem_key=f"receipt:{reference}:{index}")
                         touched.add(sku["id"])
+                        accepted_qty += actual
                     accepted += 1
 
                     if expected is not None and actual != expected:
@@ -129,6 +135,32 @@ class ReceivingOperations:
 
                 state = "accepted" if counted_all else "counting"
                 repo.set_receipt_state(cursor, receipt["id"], state)
+
+                # Событие приёмки — той же транзакцией, что и движения
+                # (инвариант 13, приложение E: sequence инкрементируется вместе
+                # с движением). Количество — принятое ПО ФАКТУ, не ожидавшееся:
+                # приёмка с недостачей тарифицируется по тому, что реально
+                # легло на полку. Незакрытую приёмку (`counting`, часть строк
+                # не пересчитана) не эмитим — она ещё не завершена, а счёт по
+                # ней выставился бы дважды, когда её досчитают.
+                if self._service is not None and state == "accepted":
+                    self._service.emit_for_aggregate(
+                        cursor, aggregate_id=receipt["id"],
+                        event_type="wms.receipt.completed.v1",
+                        payload={
+                            "receipt_id": str(receipt["id"]),
+                            "owner_id": str(owner["id"]),
+                            "seller_external_id": seller,
+                            "doc_ref": reference,
+                            "accepted_qty": accepted_qty,
+                            "lines_count": accepted,
+                            "discrepancies_count": len(discrepancies),
+                            "warehouse_code": warehouse_code,
+                            "occurred_at": _isoformat(receipt["created_at"]),
+                            "actor_id": str(actor) if actor else None,
+                        },
+                        correlation_id=reference)
+
                 result = {
                     "receipt_id": str(receipt["id"]), "reference": reference,
                     "owner_external_id": seller, "owner_created": owner_created,
@@ -164,7 +196,33 @@ class ReceivingOperations:
                 rows = repo.receipts_for_screen(
                     cursor, states=states, owner_external_id=params.get("owner_external_id"),
                     reference=_text(params.get("reference")), limit=limit)
-        return {"receipts": rows}
+        return {"receipts": rows, "generated_at": _now_iso()}
+
+    def discrepancies(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Расхождения вне контекста приёмки — экран начальника склада.
+
+        `ledger_short` (клапан раздела 6.5) рождается на резерве, `receipt_id`
+        у него пуст, и в `/receipts/screen` он не попадёт никогда. Прочитать
+        его было нечем вовсе: схема заводит под него отдельный индекс с прямым
+        комментарием про этот экран, а маршрута к нему не существовало.
+
+        Пустой список здесь значит «таких случаев не было» — и это обязано
+        быть правдой, а не следствием отсутствия маршрута (инвариант 12).
+        """
+        limit = min(int(params.get("limit") or 100), 500)
+        kinds = params.get("kinds") or None
+        # По умолчанию — нерешённые: экран показывает работу, а не архив.
+        decisions = params.get("decisions") or ["pending"]
+        since = _text(params.get("since")) or _hours_ago(24)
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                rows = repo.discrepancies_for_screen(
+                    cursor, kinds=kinds, decisions=decisions,
+                    owner_external_id=_text(params.get("owner_external_id")),
+                    task_id=_uuid_or_none(params.get("task_id")),
+                    receipt_id=_uuid_or_none(params.get("receipt_id")),
+                    since=since, limit=limit)
+        return {"discrepancies": rows, "generated_at": _now_iso()}
 
     # ---------------------------------------------------------- размещение
 
@@ -175,7 +233,9 @@ class ReceivingOperations:
             with single(connection) as cursor:
                 rows = repo.putaway_queue(
                     cursor, owner_external_id=params.get("owner_external_id"), limit=limit)
-        return {"placements": rows}
+        # Контракт зовёт это `items`, и `additionalProperties: false` не оставляет
+        # места синониму: `placements` клиент просто не увидит.
+        return {"items": rows, "generated_at": _now_iso()}
 
     def move_box(self, params: dict[str, Any]) -> dict[str, Any]:
         """Переставить коробку в другую ячейку.
@@ -213,7 +273,11 @@ class ReceivingOperations:
                     cursor, seller_external_id=seller,
                     cell_address=_text(params.get("cell_address")),
                     barcodes=params.get("barcodes"))
-        return {"owner_external_id": seller, "lines": rows}
+        # Строка листа — InventorySheetLine: `state` контракт не знает,
+        # лист показывает ожидаемое количество, а не раскладку по состояниям.
+        return {"owner_external_id": seller, "generated_at": _now_iso(),
+                "lines": [{key: value for key, value in row.items() if key != "state"}
+                          for row in rows]}
 
     def count(self, params: dict[str, Any]) -> dict[str, Any]:
         """Применить пересчёт: излишки приходуются, недостачи списываются.
@@ -240,7 +304,7 @@ class ReceivingOperations:
                 if existing is not None:
                     return {"count_id": str(existing["id"]), "reference": reference,
                             "owner_external_id": seller, "state": existing["state"],
-                            "adjustments": [], "duplicate": True}
+                            "moves": 0, "discrepancies": [], "duplicate": True}
 
                 owner = repo.find_owner(cursor, seller)
                 if owner is None:
@@ -294,9 +358,13 @@ class ReceivingOperations:
                         "expected_qty": expected, "fact_qty": fact, "delta": delta})
 
                 repo.apply_inventory_count(cursor, count["id"])
+                # Форма — InventoryCountResult. Подробности расхождений
+                # читаются по /discrepancies: событие не способ доставки,
+                # и ответ команды тоже (раздел 6.1).
                 result = {"count_id": str(count["id"]), "reference": reference,
                           "owner_external_id": seller, "state": "applied",
-                          "adjustments": adjustments, "duplicate": False}
+                          "applied_at": _now_iso(), "moves": len(adjustments),
+                          "discrepancies": [], "duplicate": False}
 
         if owner_id is not None:
             self._announce(owner_id, touched)
@@ -338,9 +406,15 @@ class ReceivingOperations:
                     sku_id=sku["id"] if sku else None,
                     cell_id=cell["id"] if cell else None, comment=comment,
                     created_by=_uuid_or_none(params.get("actor_id")))
-        return {"box_barcode": box["barcode"], "owner_external_id": seller,
-                "cell_address": params.get("cell_address"), "comment": box["comment"],
-                "state": box["state"]}
+        # Форма — BoxResult: коробка внутри `box`, штрихкод зовётся `barcode`.
+        return {"box": {
+            "box_id": str(box["id"]) if box.get("id") else None,
+            "barcode": box["barcode"], "owner_external_id": seller,
+            "product_barcode": _text(params.get("product_barcode")),
+            "cell_address": params.get("cell_address"),
+            "quantity": int(params.get("quantity") or 0),
+            "counted": bool(params.get("counted", False)),
+            "comment": box["comment"], "state": box["state"]}, "created": True}
 
     def list_boxes(self, params: dict[str, Any]) -> dict[str, Any]:
         with self._pool.connection() as connection:
@@ -351,8 +425,8 @@ class ReceivingOperations:
                     barcode=_text(params.get("box_barcode")),
                     limit=min(int(params.get("limit") or 200), 500))
         return {"boxes": [{
-            "box_barcode": row["barcode"], "owner_external_id": row["seller_external_id"],
-            "cell_address": row["cell_address"], "barcode": row["sku_barcode"],
+            "barcode": row["barcode"], "owner_external_id": row["seller_external_id"],
+            "cell_address": row["cell_address"], "product_barcode": row["sku_barcode"],
             "quantity": int(row["quantity"]), "counted": row["counted"],
             "comment": row["comment"], "sequence": row["sequence"],
             "total_boxes": row["total_boxes"], "state": row["state"],
@@ -364,9 +438,11 @@ class ReceivingOperations:
         Коробка с товаром, помеченная убранной, — это потерянный остаток:
         по учёту он лежит там, где коробки уже нет.
         """
-        barcode = str(params.get("box_barcode") or "").strip()
+        # Контракт зовёт параметр `barcode` (BoxRemoveParams); `box_barcode`
+        # принимается тоже — так его слали до сверки с контрактом.
+        barcode = str(params.get("barcode") or params.get("box_barcode") or "").strip()
         if not barcode:
-            raise ValueError("box_barcode обязателен")
+            raise ValueError("barcode обязателен")
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
                 box = repo.find_box(cursor, barcode)
@@ -378,7 +454,15 @@ class ReceivingOperations:
                         f"в коробке {barcode!r} ещё лежит товар ({len(left)} позиций): "
                         f"сначала переставьте или спишите его")
                 removed = repo.remove_box(cursor, barcode)
-        return {"box_barcode": barcode, "state": "removed", "duplicate": not removed}
+        # Форма — BoxResult: коробка внутри `box`, как и при заведении.
+        return {"box": {
+            "box_id": str(box["id"]) if box.get("id") else None,
+            "barcode": barcode,
+            "owner_external_id": box.get("seller_external_id") or "",
+            "quantity": int(box.get("quantity") or 0),
+            "counted": bool(box.get("counted", False)),
+            "comment": box.get("comment") or "—",
+            "state": "removed"}, "created": not removed}
 
     # ------------------------------------------------------------- хранение
 
@@ -392,7 +476,14 @@ class ReceivingOperations:
                     cell_address=_text(params.get("cell_address")),
                     box_barcode=_text(params.get("box_barcode")),
                     limit=min(int(params.get("limit") or 200), 500))
-        return {"rows": rows}
+        # Форма — StorageLookupResult: `placements`, а не `rows`. Владелец
+        # едет один раз наверху, а не в каждой строке: у StockPlacement его нет.
+        owner = _text(params.get("seller_external_id")) or (
+            rows[0].get("seller_external_id") if rows else "") or ""
+        return {"owner_external_id": owner,
+                "placements": [{key: value for key, value in row.items()
+                                if key not in ("seller_external_id", "owner_external_id")}
+                               for row in rows]}
 
     def count_cell(self, params: dict[str, Any]) -> dict[str, Any]:
         """Пересчёт одной ячейки — частный случай инвентаризации.
@@ -424,6 +515,15 @@ class ReceivingOperations:
             # Товар уже принят и записан в журнал. Непрошедшая публикация —
             # повод для метрики, а не для отката приёмки.
             log.warning("остаток принят, но не опубликован", exc_info=False)
+
+
+def _now_iso() -> str:
+    """Момент сборки ответа. Экран обязан знать, насколько свежее то, что видит."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hours_ago(hours: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
 
 def _text(value: Any) -> str | None:

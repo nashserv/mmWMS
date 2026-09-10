@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import logging
 from typing import Any, Callable
 
@@ -93,7 +95,11 @@ def verify_account(pool: ConnectionPool, account_id: str) -> dict[str, Any]:
     with pool.connection() as connection:
         with single(connection) as cursor:
             repo.mark_account_verified(cursor, account["id"], verified=verified)
+    # Форма — WbAccountVerifyResult. Итог проверки читается из `status` и
+    # `checks`; отдельного `verified` контракт не знает, а `mode` кабинета
+    # отдаётся списком в /wb/accounts.
     return {"account_id": str(account["id"]), "external_id": account["external_id"],
-            "verified": verified, "mode": account["mode"],
+            "owner_external_id": account.get("seller_external_id"),
             "status": "ACTIVE" if verified else account["status"],
-            "scopes": account.get("scopes") or [], "checks": checks}
+            "scopes": account.get("scopes") or [], "checks": checks,
+            "verified_at": datetime.now(timezone.utc).isoformat()}

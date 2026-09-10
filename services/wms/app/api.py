@@ -21,6 +21,7 @@ from . import fixtures
 from .config import app_environment, mock_mode, trusted_hosts
 from .domain import ErrorCode, EventEnvelope, TaskState, now, uid
 from .events import EventPublisher
+from . import state as state_module
 from .state import MockState
 
 BASE_PATH = "/api/mmx/wms/v1"
@@ -67,9 +68,110 @@ def _emit(event_type: str, payload: dict[str, Any], correlation_id: str) -> None
 
 # ---------------------------------------------------------------- служебное
 
+def _product_view(product: dict[str, Any], seller: Any) -> dict[str, Any]:
+    """Карточка товара в форме контракта (`Product`)."""
+    row: dict[str, Any] = {
+        "owner_external_id": str(seller or product.get("seller_external_id") or ""),
+        "barcode": product["barcode"],
+        "sku_id": product.get("sku_id"),
+    }
+    for source, target in (("seller_sku", "seller_sku"), ("name", "name")):
+        if product.get(source) is not None:
+            row[target] = product[source]
+    row["buffer"] = int(product.get("buffer") or 0)
+    return row
+
+
+def _task_command(task: dict[str, Any] | None, task_id: str) -> dict[str, Any]:
+    """Ответ команды над заданием (`TaskCommandResult`).
+
+    `state` обязателен по контракту, и без него рабочее место не может
+    показать, чем кончилась команда: шаг 9 полного прогона краснел не потому,
+    что упаковка не работает, а потому, что заглушка не возвращала состояние.
+    `status` контрактом не предусмотрен вовсе.
+    """
+    task = task or {}
+    row = {
+        "task_id": task_id,
+        "owner_external_id": task.get("seller_external_id") or task.get("owner_external_id") or "",
+        "state": task.get("state") or "unknown",
+    }
+    if task.get("cancel_reason"):
+        row["cancel_reason"] = task["cancel_reason"]
+    return row
+
+
+def _box_view(box: dict[str, Any]) -> dict[str, Any]:
+    """Коробка в форме контракта (`BoxProjection`).
+
+    Внутренний `cell_id` наружу не отдаётся: у клиента наших uuid нет, он
+    адресует ячейку адресом (`cell_address`).
+    """
+    row = {key: value for key, value in box.items() if key != "cell_id"}
+    row.setdefault("state", "stored")
+    row.setdefault("counted", False)
+    row.setdefault("comment", "—")
+    row.setdefault("quantity", 0)
+    return row
+
+
+def _owner_of_label(task_id: str) -> str:
+    """Владелец задания. Пустым он быть не может: печать чужого стикера
+    отправит вещь другому покупателю (приложение C)."""
+    task = state.task(task_id) or {}
+    return str(task.get("seller_external_id") or "unknown-owner")
+
+
+def _wb_account_view(account: dict[str, Any]) -> dict[str, Any]:
+    """Кабинет WB в форме контракта (`WbAccount`).
+
+    Значение токена здесь не появляется никогда — только `secret_ref`, ссылка
+    на секрет (инвариант 15, раздел 12).
+    """
+    row = {key: value for key, value in account.items() if key != "seller_external_id"}
+    row["owner_external_id"] = account.get("seller_external_id") or ""
+    return row
+
+
+def _return_view(item: dict[str, Any]) -> dict[str, Any]:
+    """Возврат в форме контракта (`ReturnResult`)."""
+    return {
+        "return_id": item["return_id"],
+        "owner_external_id": item.get("seller_external_id") or "",
+        "task_id": item.get("task_id"),
+        "state": item.get("state") or "expected",
+        "decision": item.get("decision"),
+    }
+
+
+def _count_view(params: dict[str, Any], count: dict[str, Any]) -> dict[str, Any]:
+    """Инвентаризация в форме контракта (`InventoryCountResult`)."""
+    return {
+        "count_id": count["count_id"],
+        "reference": count["reference"],
+        "owner_external_id": str(params.get("seller_external_id") or ""),
+        "state": count["state"],
+        "applied_at": now(),
+        "moves": len(count.get("lines") or []),
+        "discrepancies": [],
+        "duplicate": False,
+    }
+
+
+def _stock_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Строка публикуемого остатка (`StockRow`): только штрихкод и available.
+
+    `good` и `reserved` наружу не отдаются: контракт их не знает, а клиент,
+    выучивший их у заглушки, не найдёт у настоящего сервиса.
+    """
+    return {"barcode": row["barcode"], "available": int(row["available"])}
+
+
 @router.post("/health")
 async def health(request: Request) -> JSONResponse:
-    return _result(await _body(request), {"status": "ok", "mock": True})
+    # Форма — HealthResult. Признак заглушки едет в `checks`, а не отдельным
+    # полем: у схемы `additionalProperties: false`.
+    return _result(await _body(request), {"status": "ok", "checks": {"mock": "true"}})
 
 
 # ---------------------------------------------------------------- справочники
@@ -85,19 +187,38 @@ async def sellers(request: Request) -> JSONResponse:
     body = await _body(request)
     params = _params(body)
     seller = params.get("seller_external_id")
-    created = None
-    if seller:
-        created = state.register_owner(
-            str(seller), name=params.get("name"), inn=params.get("inn"),
-            allow_ledger_short=params.get("allow_ledger_short"))
-    return _result(body, {"sellers": state.owners(), "seller": created})
+    if not seller:
+        raise ValueError("seller_external_id обязателен")
+    # `created` — про заведение владельца, а не про то, что параметр передали:
+    # повторный вызов обязан вернуть того же владельца и `created: false`
+    # (инвариант 5). Заново присвоенный owner_id обесценил бы все уже
+    # выпущенные события.
+    existed = state.owner(str(seller)) is not None
+    created = state.register_owner(
+        str(seller), name=params.get("name"), inn=params.get("inn"),
+        allow_ledger_short=params.get("allow_ledger_short"))
+    # Форма — SellerResult: один владелец, а не список. Список владельцев
+    # контрактом не предусмотрен вовсе, и синониму места нет
+    # (`additionalProperties: false`).
+    owner = created
+    return _result(body, {
+        "owner_external_id": owner["seller_external_id"],
+        "owner_id": owner.get("owner_id"),
+        "name": owner.get("name") or owner["seller_external_id"],
+        "inn": owner.get("inn"),
+        "active": bool(owner.get("active", True)),
+        "allow_ledger_short": bool(owner.get("allow_ledger_short", True)),
+        "created": not existed,
+    })
 
 
 @router.post("/catalog/products")
 async def catalog_products(request: Request) -> JSONResponse:
     body = await _body(request)
     seller = _params(body).get("seller_external_id")
-    return _result(body, {"products": state.products(seller)})
+    return _result(body, {
+        "products": [_product_view(row, row.get("seller_external_id"))
+                     for row in state.products(seller)]})
 
 
 @router.post("/catalog/products/ensure")
@@ -114,16 +235,17 @@ async def catalog_products_ensure(request: Request) -> JSONResponse:
     state.register_owner(seller)
     product, created = state.register_product(
         seller, barcode, seller_sku=params.get("seller_sku"), name=params.get("name"))
-    return _result(body, {
-        "product_id": product["sku_id"], "sku_id": product["sku_id"],
-        "barcode": barcode, "seller_external_id": seller, "created": created,
-    })
+    # Форма — CatalogProductEnsureResult: карточка внутри `product`.
+    return _result(body, {"product": _product_view(product, seller), "created": created})
 
 
 @router.post("/catalog/stocks")
 async def catalog_stocks(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"stocks": state.stocks_for(_params(body).get("seller_external_id"))})
+    seller = _params(body).get("seller_external_id")
+    return _result(body, {
+        "owner_external_id": seller,
+        "stocks": [_stock_row(row) for row in state.stocks_for(seller)]})
 
 
 @router.post("/catalog/stocks/bulk")
@@ -132,9 +254,10 @@ async def catalog_stocks_bulk(request: Request) -> JSONResponse:
     rows = state.stocks_for(_params(body).get("seller_external_id"))
     # Строки без штрихкода или с нецелым/отрицательным available отбрасываются
     # (приложение C). Заниженный остаток — норма, отрицательный — нет.
-    clean = [r for r in rows
+    clean = [_stock_row(r) for r in rows
              if r.get("barcode") and isinstance(r.get("available"), int) and r["available"] >= 0]
-    return _result(body, {"stocks": clean})
+    return _result(body, {"stocks": clean,
+                          "owner_external_id": _params(body).get("seller_external_id")})
 
 
 # ---------------------------------------------------------------- склад
@@ -160,25 +283,96 @@ async def warehouse_documents(request: Request) -> JSONResponse:
         seller_external_id=seller, reference=str(reference),
         doc_type=str(params.get("doc_type", "adjustment")),
         lines=lines, comment=params.get("comment"))
-    return _result(body, document)
+    # Форма — WarehouseDocumentResult. Внутренние поля документа наружу не
+    # едут: клиенту важно, что документ применён и сколько движений он дал.
+    return _result(body, {
+        "reference": document["reference"],
+        "owner_external_id": seller,
+        "state": document["state"],
+        "moves": len(document.get("lines") or []),
+        "duplicate": False})
 
 
 @router.post("/warehouse/stock")
 async def warehouse_stock(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"stock": state.stocks_for(_params(body).get("seller_external_id"))})
+    # Форма — WarehouseStockResult: `rows` из StockPlacement, а не `stock`.
+    seller = _params(body).get("seller_external_id")
+    return _result(body, {
+        "owner_external_id": seller,
+        "rows": state.placements_for(seller)})
+
+
+@router.post("/warehouse/movements")
+async def warehouse_movements(request: Request) -> JSONResponse:
+    """История движений по товару за период — файл 04 требует её от ЛК клиента.
+
+    Заглушка ведёт журнал в памяти теми же движениями, что и настоящий сервис
+    пишет в `stock_move`: клиент, написанный против неё, не переучивается.
+    """
+    body = await _body(request)
+    params = _params(body)
+    seller = str(params.get("seller_external_id", ""))
+    limit = min(int(params.get("limit") or 100), 500)
+    rows = state.movements(seller_external_id=seller,
+                           barcode=params.get("barcode"), limit=limit + 1)
+    return _result(body, {
+        "seller_external_id": seller,
+        "movements": rows[:limit],
+        "next_cursor": rows[limit - 1]["movement_id"] if len(rows) > limit else None,
+        "generated_at": now(),
+    })
+
+
+@router.post("/catalog/wb-cards")
+async def catalog_wb_cards(request: Request) -> JSONResponse:
+    """Карточки Wildberries через `wms` (раздел 6.8).
+
+    Токен категории «Контент» держит `wms` (раздел 12), поэтому ходить в
+    Content API каталогу больше нечем.
+    """
+    body = await _body(request)
+    params = _params(body)
+    seller = str(params.get("seller_external_id", ""))
+    wanted = [str(b) for b in (params.get("barcodes") or [])]
+    return _result(body, {
+        "seller_external_id": seller,
+        "cards": state.wb_cards(seller_external_id=seller, barcodes=wanted),
+        "next_cursor": None,
+        "generated_at": now(),
+    })
 
 
 @router.post("/storage/lookup")
 async def storage_lookup(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"placements": state.lookup(_params(body).get("barcode"))})
+    params = _params(body)
+    seller = params.get("seller_external_id")
+    return _result(body, {
+        "owner_external_id": seller,
+        "placements": [row for row in state.placements_for(seller)
+                       if not params.get("barcode") or row["barcode"] == params["barcode"]]})
 
 
 @router.post("/storage/count")
 async def storage_count(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"counted": True, "reference": _params(body).get("reference")})
+    # Форма — StorageCountResult: сколько и в каких состояниях лежит товар.
+    # `{"counted": true}` контракт не знает вовсе.
+    params = _params(body)
+    seller = str(params.get("seller_external_id") or "")
+    barcode = str(params.get("barcode") or "")
+    rows = [r for r in state.placements_for(seller)
+            if not barcode or r["barcode"] == barcode]
+    by_state: dict[str, int] = {}
+    for row in rows:
+        by_state[row["state"]] = by_state.get(row["state"], 0) + int(row["quantity"])
+    return _result(body, {
+        "owner_external_id": seller,
+        "barcode": barcode or (rows[0]["barcode"] if rows else ""),
+        "total": sum(by_state.values()),
+        "by_state": by_state,
+        "available": by_state.get("good", 0)})
 
 
 # ---------------------------------------------------------------- резерв
@@ -275,12 +469,21 @@ async def tasks_pull(request: Request) -> JSONResponse:
     params = _params(body)
     limit = int(params.get("limit", 10))
     available_before = state.available_for_pull()
-    tasks = state.pull(assignee=params.get("assignee"), limit=limit)
+    # claim и states читаются, а не игнорируются: заявка 2 потока B.
+    claim = params.get("claim")
+    tasks = state.pull(
+        assignee=params.get("assignee"), limit=limit,
+        claim=True if claim is None else bool(claim),
+        states=params.get("states"),
+        owner_external_ids=params.get("owner_external_ids"))
     # Форма ответа — по схеме TasksPullResult: каждое задание приходит вместе
     # со сроком своего лизинга, чтобы рабочее место знало, когда задание
     # вернётся в очередь, если сборщик пропал.
     return _result(body, {
-        "tasks": [{"task": task, "leased_until": task["claim_expires_at"]} for task in tasks],
+        "tasks": [{"task": state_module._task_projection(task),
+                   "leased_until": task.get("claim_expires_at"),
+                   "placements": state_module.task_placements(task)}
+                  for task in tasks],
         "served_at": now(),
         "available_total": max(0, available_before - len(tasks)),
     })
@@ -289,7 +492,10 @@ async def tasks_pull(request: Request) -> JSONResponse:
 @router.post("/tasks/{task_id}")
 async def task_read(task_id: str, request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, state.task(task_id))
+    task = state.task(task_id)
+    if task is None:
+        raise ValueError(f"задание {task_id} не найдено")
+    return _result(body, state_module._task_projection(task))
 
 
 @router.post("/tasks/{task_id}/scan")
@@ -335,7 +541,7 @@ async def task_pack(task_id: str, request: Request) -> JSONResponse:
         "qty": int(task.get("quantity", 1)), "actor_id": STAND_ACTOR_ID,
         "sequence": state.next_sequence(task_id),
     }, str(_params(body).get("correlation_id") or uid()))
-    return _result(body, {"status": "packed", "task_id": task_id})
+    return _result(body, _task_command(state.task(task_id), task_id))
 
 
 @router.post("/tasks/{task_id}/label")
@@ -362,7 +568,7 @@ async def task_return_to_shelf(task_id: str, request: Request) -> JSONResponse:
         "qty": int(task.get("quantity", 1)), "reason": "returned_to_shelf",
         "sequence": state.next_sequence(task_id),
     }, str(_params(body).get("correlation_id") or uid()))
-    return _result(body, {"status": "returned_to_shelf", "task_id": task_id})
+    return _result(body, _task_command(state.task(task_id), task_id))
 
 
 @router.post("/tasks/{task_id}/cancel")
@@ -383,8 +589,12 @@ async def task_cancel(task_id: str, request: Request) -> JSONResponse:
         "handed_over": bool(params.get("handed_over", False)),
         "sequence": state.next_sequence(task_id),
     }, str(params.get("correlation_id") or uid()))
-    return _result(body, {"status": "cancelled", "task_id": task_id,
-                          "label_invalidated": True, "released_from_supply": True})
+    return _result(body, {
+        **_task_command(state.task(task_id), task_id),
+        # Причина обязательна и в схеме, и в контракте (инвариант 11): в бою у
+        # всех 2645 отмен она была NULL, и разобрать их стало нечем.
+        "cancel_reason": reason,
+        "label_invalidated": True, "released_from_supply": True, "stock_released": True})
 
 
 @router.post("/tasks/{task_id}/return")
@@ -413,34 +623,59 @@ async def receipts(request: Request) -> JSONResponse:
         reference=str(params.get("reference", uid())),
         lines=params.get("lines") or [],
         seller_name=params.get("seller_name"), seller_inn=params.get("seller_inn"))
-    return _result(body, receipt)
+    # Форма — ReceiptResult: строки наружу не едут, их читают экраном.
+    return _result(body, {
+        "receipt_id": receipt["receipt_id"],
+        "reference": receipt["reference"],
+        "owner_external_id": receipt["owner_external_id"],
+        "state": receipt["state"],
+        "lines_accepted": len(receipt.get("lines") or []),
+        "discrepancies": receipt.get("discrepancies") or [],
+        "duplicate": False})
 
 
 @router.post("/receipts/screen")
 async def receipts_screen(request: Request) -> JSONResponse:
+    """Форма — ReceiptsScreenResult: `receipts` и `generated_at`.
+
+    Не `open_receipts`/`cells`/`discrepancy_kinds`: у схемы
+    `additionalProperties: false`, и своих имён клиент просто не увидит.
+    """
     body = await _body(request)
-    return _result(body, {
-        "open_receipts": state.open_receipts(),
-        "cells": state.cells(),
-        "discrepancy_kinds": ["shortage", "surplus", "mismatch", "damage"],
-    })
+    return _result(body, {"receipts": state.open_receipts(), "generated_at": now()})
 
 
 @router.post("/putaway/screen")
 async def putaway_screen(request: Request) -> JSONResponse:
+    """Форма — PutawayScreenResult: `items` и `generated_at`."""
     body = await _body(request)
+    return _result(body, {"items": state.pending_putaway(), "generated_at": now()})
+
+
+@router.post("/discrepancies")
+async def discrepancies(request: Request) -> JSONResponse:
+    """Расхождения вне контекста приёмки — экран начальника склада.
+
+    Пустой список означает «таких случаев не было», и это обязано быть
+    правдой, а не следствием отсутствия маршрута (инвариант 12).
+    """
+    body = await _body(request)
+    params = _params(body)
     return _result(body, {
-        "pending": state.pending_putaway(),
-        # Порядок обхода — то, по чему сортируется лист подбора (раздел 4).
-        "cells": sorted(state.cells(), key=lambda c: (c["route_order"] is None,
-                                                     c["route_order"] or 0)),
+        "discrepancies": state.discrepancies(
+            owner_external_id=params.get("owner_external_id"),
+            kinds=params.get("kinds"),
+            decisions=params.get("decisions")),
+        "generated_at": now(),
     })
 
 
 @router.post("/inventory/sheet")
 async def inventory_sheet(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"lines": state.inventory_sheet(
+    return _result(body, {"owner_external_id": _params(body).get("seller_external_id"),
+                          "generated_at": now(),
+                          "lines": state.inventory_sheet(
         _params(body).get("seller_external_id"))})
 
 
@@ -448,11 +683,11 @@ async def inventory_sheet(request: Request) -> JSONResponse:
 async def inventory_count(request: Request) -> JSONResponse:
     body = await _body(request)
     params = _params(body)
-    return _result(body, state.inventory_count(
+    return _result(body, _count_view(params, state.inventory_count(
         seller_external_id=str(params.get("seller_external_id", "")),
         reference=str(params.get("reference", uid())),
         scope=str(params.get("scope", "partial")),
-        lines=params.get("lines") or []))
+        lines=params.get("lines") or [])))
 
 
 # ---------------------------------------------------------------- коробки
@@ -465,19 +700,27 @@ async def boxes_create(request: Request) -> JSONResponse:
     # коробок, и без него коробку не найти (раздел 2.9).
     if not str(params.get("comment") or "").strip():
         return _result(body, {"status": "rejected", "error_code": "BOX_COMMENT_REQUIRED"})
-    return _result(body, state.create_box(params))
+    # Форма — BoxResult: коробка внутри `box`.
+    return _result(body, {"box": _box_view(state.create_box(params)), "created": True})
 
 
 @router.post("/boxes/list")
 async def boxes_list(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"boxes": state.boxes(_params(body).get("seller_external_id"))})
+    return _result(body, {
+        "boxes": [_box_view(box)
+                  for box in state.boxes(_params(body).get("seller_external_id"))]})
 
 
 @router.post("/boxes/remove")
 async def boxes_remove(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, state.remove_box(str(_params(body).get("barcode", ""))))
+    barcode = str(_params(body).get("barcode", ""))
+    state.remove_box(barcode)
+    removed = state.box(barcode)
+    if removed is None:
+        raise ValueError(f"коробка {barcode!r} не заведена")
+    return _result(body, {"box": _box_view(removed), "created": False})
 
 
 # ---------------------------------------------------------------- отгрузка
@@ -491,7 +734,10 @@ async def shipments(request: Request) -> JSONResponse:
 @router.post("/shipments/picked")
 async def shipments_picked(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"shipments": state.shipments()})
+    # Форма — ShipmentsPickedResult: собранные ЗАДАНИЯ, готовые к отгрузке,
+    # а не список поставок. Клиент ждёт TaskProjection.
+    return _result(body, {"tasks": state.picked_tasks(
+        _params(body).get("seller_external_id"))})
 
 
 # ---------------------------------------------------------------- возвраты
@@ -505,7 +751,11 @@ async def returns_receive(return_id: str, request: Request) -> JSONResponse:
         "return_id": return_id, "owner_id": item.get("owner_id"),
         "qty": int(item.get("qty", 1)),
     }, str(_params(body).get("correlation_id") or uid()))
-    return _result(body, {"return_id": return_id, "state": "received"})
+    return _result(body, {
+        "return_id": return_id,
+        "owner_external_id": item.get("seller_external_id") or "",
+        "task_id": item.get("task_id"),
+        "state": "received"})
 
 
 @router.post("/returns/{return_id}/decision")
@@ -523,13 +773,24 @@ async def returns_decision(return_id: str, request: Request) -> JSONResponse:
         # закреплено за решением контрактом, а не выбирается на месте.
         "state_to": "good" if resellable else "defect",
     }, str(_params(body).get("correlation_id") or uid()))
-    return _result(body, {"return_id": return_id, "state": "decided", "decision": decision})
+    return _result(body, {
+        "return_id": return_id,
+        "owner_external_id": item.get("seller_external_id") or "",
+        "task_id": item.get("task_id"),
+        "state": "decided", "decision": decision})
 
 
 @router.post("/returns/receipt")
 async def returns_receipt(request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"returns": state.returns()})
+    # Форма — ReturnsReceiptResult: приёмка возвратов документом.
+    params = _params(body)
+    return _result(body, {
+        "reference": str(params.get("reference") or uid()),
+        "returns": [_return_view(item) for item in state.returns()],
+        # Сколько строк не удалось привязать к заданию. Ноль не гарантирован:
+        # возврат может приехать раньше, чем WB отдаст связь.
+        "unmatched": 0, "duplicate": False})
 
 
 # ---------------------------------------------------------------- печать и WB
@@ -546,14 +807,36 @@ async def label_print(task_id: str, request: Request) -> JSONResponse:
     label = state.label(task_id)
     if not label:
         return _result(body, {"status": "rejected", "error_code": "LABEL_NOT_READY"})
+    params = _params(body)
+    task = state.task(task_id) or {}
     _emit("wms.label.attached.v1", {
-        "task_id": task_id, "label_id": label["id"], "format": label["content_type"],
+        "task_id": task_id, "label_id": label["id"],
+        # Владелец обязателен: стикеровка тарифицируется (раздел 3.4), и без
+        # него биллингу некому её выставить — строка повисает в отчёте с
+        # причиной SELLER_UNKNOWN.
+        "owner_id": task.get("owner_id") or state.owner_id_of(
+            str(task.get("seller_external_id") or "")),
+        "format": label["format"],
         "checksum": label["checksum"], "version": label["version"],
         "sequence": state.next_sequence(task_id),
-    }, str(_params(body).get("correlation_id") or uid()))
-    return _result(body, {"status": "sent_to_agent", "task_id": task_id,
-                          "format": label["content_type"], "payload": label["payload"],
-                          "checksum": label["checksum"]})
+    }, str(params.get("correlation_id") or uid()))
+    # Форма — LabelPrintResult. `station_id` обязателен: принтер на каждом
+    # рабочем месте свой, и перепутать станцию значит напечатать чужой стикер.
+    return _result(body, {
+        "task_id": task_id,
+        # Владелец обязан быть непустым: напечатанный чужой стикер отправит
+        # вещь другому покупателю (приложение C).
+        "owner_external_id": task.get("seller_external_id") or _owner_of_label(task_id),
+        "format": label["format"],
+        "content_type": label["content_type"],
+        "payload": label["payload"],
+        "checksum": label["checksum"],
+        "version": label["version"],
+        "station_id": str(params.get("station_id") or ""),
+        "printer_transport": "agent",
+        "reprint": bool(params.get("reprint", False)),
+        "duplicate": False,
+    })
 
 
 @router.post("/wb/accounts")
@@ -578,14 +861,25 @@ async def wb_accounts(request: Request) -> JSONResponse:
         created = was_created
         if params.get("seller_external_id"):
             state.register_owner(str(params["seller_external_id"]))
-    return _result(body, {"accounts": state.wb_accounts(), "created": created})
+    return _result(body, {"accounts": [_wb_account_view(a) for a in state.wb_accounts()],
+                          "created": bool(created)})
 
 
 @router.post("/wb/accounts/{account_id}/verify")
 async def wb_account_verify(account_id: str, request: Request) -> JSONResponse:
     body = await _body(request)
-    return _result(body, {"account_id": account_id, "verified": True,
-                          "mode": "shadow", "status": "ACTIVE",
+    return _result(body, {"account_id": account_id, "verified_at": now(),
+                          # Что именно проверено. Живого токена на стенде нет
+                          # и быть не может (раздел 12), поэтому проверяется
+                          # ссылка на секрет, а не сам секрет.
+                          "checks": [
+                              {"name": "token_valid", "passed": True,
+                               "detail": "ссылка на секрет на месте"},
+                              {"name": "scope_marketplace", "passed": True},
+                              {"name": "rate_limit", "passed": True,
+                               "detail": "300 запросов в минуту, окно свободно"},
+                          ],
+                          "status": "ACTIVE",
                           "scopes": ["marketplace"]})
 
 

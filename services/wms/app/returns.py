@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import repositories as repo
@@ -75,6 +76,10 @@ class ReturnOperations:
                         correlation_id=str(return_id))
                     row["state"] = "received"
         return {"return_id": str(row["id"]), "state": row["state"],
+                # Владелец обязателен: возврат чужого товара не бывает
+                # безымянным (инвариант 6).
+                "owner_external_id": _owner_external_id(row),
+                "task_id": str(row["task_id"]) if row.get("task_id") else None,
                 "duplicate": row["state"] != "received"}
 
     def decide(self, return_id: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -126,6 +131,8 @@ class ReturnOperations:
         if owner_id is not None and touched and self._on_stock_changed is not None:
             self._on_stock_changed(owner_id, touched)
         return {"return_id": str(row["id"]), "state": "decided", "decision": decision,
+                "owner_external_id": _owner_external_id(row),
+                "task_id": str(row["task_id"]) if row.get("task_id") else None,
                 "duplicate": False}
 
     def receipt(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -136,7 +143,20 @@ class ReturnOperations:
                 rows = repo.returns_list(
                     cursor, owner_external_id=_text(params.get("seller_external_id")),
                     states=params.get("states"), limit=limit)
-        return {"returns": rows}
+        # Форма — ReturnsReceiptResult: документ приёмки возвратов.
+        return {
+            "reference": _text(params.get("reference")) or f"returns:{_now_iso()}",
+            "returns": [{
+                "return_id": row["return_id"],
+                "owner_external_id": row.get("owner_external_id")
+                                     or row.get("seller_external_id") or "",
+                "task_id": row.get("task_id"),
+                "state": row["state"], "decision": row.get("decision"),
+                "received_at": _isoformat(row.get("received_at"))} for row in rows],
+            # Сколько строк не удалось привязать к заданию. Ноль не гарантирован:
+            # возврат может приехать раньше, чем WB отдаст связь.
+            "unmatched": sum(1 for row in rows if not row.get("task_id")),
+            "duplicate": False}
 
     def _owner(self, cursor: Any, params: dict[str, Any]) -> uuid.UUID:
         seller = _text(params.get("seller_external_id"))
@@ -151,6 +171,23 @@ def _uuid(value: Any) -> uuid.UUID:
         return uuid.UUID(str(value))
     except (ValueError, AttributeError):
         raise ValueError(f"{value!r} не похоже на идентификатор") from None
+
+
+def _owner_external_id(row: dict[str, Any]) -> str:
+    """Внешний идентификатор владельца возврата.
+
+    Обязателен по контракту: возврат чужого товара не бывает безымянным
+    (инвариант 6).
+    """
+    return str(row.get("seller_external_id") or row.get("owner_external_id") or "")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _isoformat(value: Any) -> str | None:
+    return value.isoformat() if hasattr(value, "isoformat") else value
 
 
 def _text(value: Any) -> str | None:

@@ -40,6 +40,11 @@ class Simulator:
             self._orders: list[dict[str, Any]] = []
             self._supplies: dict[str, dict[str, Any]] = {}
             self._stocks: dict[str, dict[str, int]] = {}
+            # Карточки Content API. Раздел 6.8: каталог берёт их через wms,
+            # а токен держит wms (раздел 12), поэтому ходить в Content API
+            # каталогу больше нечем.
+            self._cards: dict[str, list[dict[str, Any]]] = {}
+            self._next_nm_id = 170000001
             self._calls: dict[str, list[float]] = {}
             self._next_order_id = 900001
             self._next_supply = 1
@@ -55,6 +60,39 @@ class Simulator:
             window.append(now)
             self._calls[account] = window
             return True
+
+    def cards(self, account: str, cursor: int = 0,
+              limit: int = 100) -> tuple[list[dict[str, Any]], int]:
+        """Карточки кабинета страницей. Content API отдаёт их курсором."""
+        with self._lock:
+            rows = self._cards.get(account, [])
+            page = rows[cursor:cursor + limit]
+            return page, cursor + len(page)
+
+    def seed_cards(self, account: str, barcodes: list[str]) -> list[dict[str, Any]]:
+        """Ручка стенда: у настоящего Content API её нет."""
+        with self._lock:
+            known = {row["barcode"] for row in self._cards.get(account, [])}
+            created = []
+            for barcode in barcodes:
+                if barcode in known:
+                    continue
+                card = {
+                    "nmID": self._next_nm_id,
+                    "vendorCode": f"art-{barcode[-6:]}",
+                    "title": f"Товар {barcode[-4:]}",
+                    "brand": "Тестовый бренд",
+                    "subjectName": "Одежда",
+                    # У Wildberries штрихкод лежит в size.skus (раздел 3.2):
+                    # у одной карточки несколько размеров, и вещь на полке
+                    # определяет именно штрихкод, а не артикул.
+                    "sizes": [{"skus": [barcode]}],
+                    "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                self._next_nm_id += 1
+                self._cards.setdefault(account, []).append(card)
+                created.append(card)
+            return created
 
     def seed_orders(self, account: str, count: int, barcode: str,
                     deadline: str | None = None) -> list[dict[str, Any]]:
@@ -252,6 +290,34 @@ async def seed_orders(request: Request) -> Any:
         barcode=str(body.get("barcode", "2000000000011")),
         deadline=body.get("deadline"))
     return {"created": len(created), "orders": created}
+
+
+@app.post("/content/v2/get/cards/list")
+async def cards_list(request: Request) -> Any:
+    """Карточки кабинета. Форма ответа — как у Content API Wildberries.
+
+    Токен категории «Контент» (приложение D). На стенде не проверяется: живых
+    токенов здесь нет вовсе (раздел 12).
+    """
+    account = _account(request)
+    if (limited := _rate_limited(account)) is not None:
+        return limited
+    body = await request.json()
+    settings = (body.get("settings") or {}).get("cursor") or {}
+    limit = min(int(settings.get("limit") or 100), 1000)
+    offset = int(settings.get("offset") or 0)
+    rows, cursor = simulator.cards(account, offset, limit)
+    return {"cards": rows, "cursor": {"offset": cursor, "total": len(rows)}}
+
+
+# Ручка стенда: у настоящего Content API её нет.
+@app.post("/__stand__/seed-cards")
+async def seed_cards(request: Request) -> Any:
+    body = await request.json()
+    created = simulator.seed_cards(
+        account=str(body.get("account", "default")),
+        barcodes=[str(b) for b in (body.get("barcodes") or [])])
+    return {"created": len(created), "cards": created}
 
 
 @app.post("/__stand__/reset")

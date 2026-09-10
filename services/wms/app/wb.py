@@ -176,6 +176,41 @@ class WbClient:
         rows = body.get("orders") or []
         return [WbOrder.from_wb(row) for row in rows], int(body.get("next", cursor))
 
+    # ------------------------------------------------------------- карточки
+
+    def cards(self, *, cursor: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
+        """`POST /content/v2/get/cards/list` — карточки кабинета страницей.
+
+        Раздел 6.8: карточки Wildberries `product-catalog` берёт через `wms`,
+        не через отдельный шлюз. Токен категории «Контент» держит `wms`
+        (раздел 12), поэтому ходить в Content API каталогу больше нечем.
+
+        Штрихкод у Wildberries лежит в `sizes[].skus`, а не рядом с артикулом:
+        у одной карточки несколько размеров, и вещь на полке определяет
+        именно штрихкод (раздел 3.2). Разворачиваем здесь, чтобы дальше по
+        коду карточка была одна на штрихкод.
+        """
+        body = self._call("POST", "/content/v2/get/cards/list",
+                          json={"settings": {"cursor": {"limit": limit, "offset": cursor}}})
+        rows: list[dict[str, Any]] = []
+        for card in body.get("cards") or []:
+            barcodes = [sku for size in (card.get("sizes") or [])
+                        for sku in (size.get("skus") or [])]
+            for barcode in barcodes or [None]:
+                if not barcode:
+                    continue
+                rows.append({
+                    "barcode": str(barcode),
+                    "seller_sku": card.get("vendorCode"),
+                    "name": card.get("title") or card.get("subjectName"),
+                    "nm_id": int(card["nmID"]) if card.get("nmID") is not None else None,
+                    "brand": card.get("brand"),
+                    "subject": card.get("subjectName"),
+                    "updated_at": card.get("updatedAt"),
+                })
+        next_cursor = int(((body.get("cursor") or {}).get("offset")) or cursor)
+        return rows, next_cursor
+
     # ------------------------------------------------------------- стикеры
 
     def stickers(self, order_ids: list[int], *, sticker_format: str = "zplv") -> list[WbSticker]:

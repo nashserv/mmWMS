@@ -58,8 +58,29 @@ def _request_id(body: Any) -> Any:
     return body.get("id", 1) if isinstance(body, dict) else 1
 
 
+def _drop_empty(value: Any) -> Any:
+    """Убирает поля без значения из ответа.
+
+    Отсутствующий ключ и `null` значат для клиента одно и то же — «этого у
+    задания нет», — но контракт объявляет типы строго (`string`, не
+    `string | null`), и это правильная строгость: если поле пришло, им можно
+    пользоваться не проверяя. Коробки у позиции может не быть, артикула у
+    товара может не быть, у движения приёмки нет ячейки-источника — такие
+    поля просто не едут.
+
+    Обязательные поля этим не спрячешь: пропавшее обязательное поле схема
+    ловит как «required property», то есть громче, чем `null`.
+    """
+    if isinstance(value, dict):
+        return {key: _drop_empty(inner) for key, inner in value.items() if inner is not None}
+    if isinstance(value, list):
+        return [_drop_empty(item) for item in value]
+    return value
+
+
 def _result(body: Any, payload: Any) -> JSONResponse:
-    return JSONResponse({"jsonrpc": "2.0", "id": _request_id(body), "result": payload})
+    return JSONResponse({"jsonrpc": "2.0", "id": _request_id(body),
+                         "result": _drop_empty(payload)})
 
 
 def _error(body: Any, code: int, message: str, **data: Any) -> JSONResponse:
@@ -92,7 +113,7 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     wms = WmsService(pool, on_stock_changed=stock_publisher.notify)
     catalog = CatalogOperations(pool)
     stock = StockOperations(pool, stock_publisher.notify)
-    receiving = ReceivingOperations(pool, stock_publisher.notify)
+    receiving = ReceivingOperations(pool, wms, stock_publisher.notify)
     shipments = ShipmentOperations(pool, wms)
     labels = LabelOperations(pool, wms)
     returns = ReturnOperations(pool, wms, stock_publisher.notify)
@@ -175,18 +196,40 @@ def create_router(pool: ConnectionPool) -> APIRouter:
 
     # ------------------------------------------------------------ служебное
 
-    post("/health", lambda _: {"status": "ok", "mock": False, "database": pool.healthy()})
+    # Форма — HealthResult: `status` и `checks`. Своих полей у схемы нет
+    # (`additionalProperties: false`), поэтому доступность базы едет проверкой.
+    post("/health", lambda _: {"status": "ok" if pool.healthy() else "degraded",
+                               "checks": {"database": "up" if pool.healthy() else "down"}})
 
     # ---------------------------------------------------------- справочники
 
     def sellers(params: dict[str, Any]) -> dict[str, Any]:
-        seller = params.get("seller_external_id")
-        created = catalog.upsert_owner(params) if seller else None
-        return {"sellers": catalog.owners(), "seller": created}
+        """Форма — SellerResult: один владелец, а не список.
+
+        Списка владельцев контракт не знает вовсе, и синониму места нет
+        (`additionalProperties: false`).
+        """
+        seller = str(params.get("seller_external_id") or "").strip()
+        if not seller:
+            raise ValueError("seller_external_id обязателен")
+        created = catalog.upsert_owner(params)
+        return {
+            "owner_external_id": created["seller_external_id"],
+            "owner_id": created.get("owner_id"),
+            "name": created.get("name") or created["seller_external_id"],
+            "inn": created.get("inn"),
+            "active": bool(created.get("active", True)),
+            "allow_ledger_short": bool(created.get("allow_ledger_short", True)),
+            "created": bool(created.get("created", False)),
+        }
 
     post("/sellers", sellers)
-    post("/catalog/products", lambda p: {"products": catalog.products(p.get("seller_external_id"))})
+    post("/catalog/products", lambda p: {
+        "products": catalog.products(p.get("seller_external_id"))})
     post("/catalog/products/ensure", catalog.ensure_product)
+    # Карточки Wildberries каталог берёт через wms, не через отдельный шлюз
+    # (раздел 6.8): токен категории «Контент» держит wms (раздел 12).
+    post("/catalog/wb-cards", catalog.wb_cards)
 
     def catalog_stocks(params: dict[str, Any]) -> dict[str, Any]:
         seller = str(params.get("seller_external_id") or "")
@@ -207,6 +250,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
 
     post("/warehouse/documents", stock.apply_document)
     post("/warehouse/stock", stock.placements)
+    # История движений по товару — файл 04 требует её от ЛК клиента прямым
+    # текстом, а читать stock_move за период было нечем.
+    post("/warehouse/movements", stock.movements)
 
     # ---------------------------------------------------------------- резерв
 
@@ -222,9 +268,13 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     # ------------------------------------------------------- кабинеты WB
 
     def wb_accounts(params: dict[str, Any]) -> dict[str, Any]:
+        """Форма — WbAccountsResult: всегда список кабинетов плюс признак
+        заведения. Одиночная карточка контрактом не предусмотрена."""
+        created = False
         if str(params.get("op") or "").strip() == "upsert":
-            return catalog.upsert_wb_account(params)
-        return {"accounts": catalog.accounts(params.get("owner_external_id"))}
+            created = bool(catalog.upsert_wb_account(params).get("created"))
+        owner = params.get("owner_external_id") or params.get("seller_external_id")
+        return {"accounts": catalog.accounts(owner), "created": created}
 
     post("/wb/accounts", wb_accounts)
 
@@ -247,6 +297,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     post("/receipts", receiving.receive)
     post("/receipts/screen", receiving.screen)
     post("/putaway/screen", receiving.putaway_screen)
+    # Расхождения вне контекста приёмки: у ledger_short receipt_id пуст, и в
+    # /receipts/screen он не попадёт никогда (раздел 6.5).
+    post("/discrepancies", receiving.discrepancies)
     post("/inventory/sheet", receiving.sheet)
     post("/inventory/count", receiving.count)
 
@@ -262,7 +315,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     post("/boxes/list", receiving.list_boxes)
     post("/boxes/remove", receiving.remove_box)
     post("/storage/lookup", receiving.lookup)
-    post("/storage/count", receiving.count_cell)
+    # Чтение итога по состояниям (StorageCountResult), а не пересчёт:
+    # пересчёт ячейки — это /inventory/count со scope=partial.
+    post("/storage/count", stock.count_by_state)
 
     # ------------------------------------- ещё не написано потоком A
 

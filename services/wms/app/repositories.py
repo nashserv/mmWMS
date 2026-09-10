@@ -323,8 +323,10 @@ def ledger_short_cell(cursor: Cursor, owner_id: uuid.UUID, sku_id: uuid.UUID, *,
 
 def find_box(cursor: Cursor, barcode: str) -> dict[str, Any] | None:
     cursor.execute(
-        "SELECT id, barcode, owner_id, sku_id, cell_id, quantity, counted, comment, state "
-        "  FROM box WHERE barcode = %s", (barcode,))
+        "SELECT b.id, b.barcode, b.owner_id, b.sku_id, b.cell_id, b.quantity, "
+        "       b.counted, b.comment, b.state, o.seller_external_id "
+        "  FROM box b JOIN owner o ON o.id = b.owner_id "
+        " WHERE b.barcode = %s", (barcode,))
     return cursor.fetchone()
 
 
@@ -915,6 +917,97 @@ def receipts_for_screen(cursor: Cursor, *, states: Sequence[str],
              "created_at": row["created_at"].isoformat()} for row in cursor.fetchall()]
 
 
+
+def discrepancies_for_screen(cursor: Cursor, *, kinds: Sequence[str] | None = None,
+                             decisions: Sequence[str] | None = None,
+                             owner_external_id: str | None = None,
+                             task_id: uuid.UUID | None = None,
+                             receipt_id: uuid.UUID | None = None,
+                             since: Any = None, limit: int = 100) -> list[dict[str, Any]]:
+    """Расхождения экрана начальника склада — все, а не только приёмочные.
+
+    `ledger_short` рождается на резерве, а не на приёмке, и `receipt_id` у него
+    пуст: через `/receipts/screen` его не увидеть никогда. Схема заводит под
+    него отдельный индекс ровно ради этого экрана (миграция 005).
+    """
+    cursor.execute(
+        "SELECT d.id, d.kind, d.qty, d.decision, d.liable, d.comment, d.created_at, "
+        "       s.barcode, c.address AS cell_address "
+        "  FROM discrepancy d "
+        "  JOIN owner o ON o.id = d.owner_id "
+        "  LEFT JOIN sku s ON s.id = d.sku_id "
+        "  LEFT JOIN cell c ON c.id = d.cell_id "
+        " WHERE (%(kinds)s::text[] IS NULL OR d.kind = ANY(%(kinds)s)) "
+        "   AND (%(decisions)s::text[] IS NULL OR d.decision = ANY(%(decisions)s)) "
+        "   AND (%(owner)s::text IS NULL OR o.seller_external_id = %(owner)s) "
+        "   AND (%(task)s::uuid IS NULL OR d.task_id = %(task)s) "
+        "   AND (%(receipt)s::uuid IS NULL OR d.receipt_id = %(receipt)s) "
+        "   AND (%(since)s::timestamptz IS NULL OR d.created_at >= %(since)s) "
+        " ORDER BY d.created_at DESC LIMIT %(limit)s",
+        {"kinds": list(kinds) if kinds else None,
+         "decisions": list(decisions) if decisions else None,
+         "owner": owner_external_id, "task": task_id, "receipt": receipt_id,
+         "since": since, "limit": limit})
+    return [{"discrepancy_id": str(row["id"]), "kind": row["kind"],
+             "barcode": row["barcode"], "qty": int(row["qty"]),
+             "decision": row["decision"], "liable": row["liable"],
+             "comment": row["comment"], "cell_address": row["cell_address"],
+             "created_at": row["created_at"].isoformat()} for row in cursor.fetchall()]
+
+
+def movements_of(cursor: Cursor, *, owner_id: uuid.UUID, barcode: str | None = None,
+                 since: Any = None, until: Any = None,
+                 cursor_id: int | None = None,
+                 limit: int = 100) -> list[dict[str, Any]]:
+    """История движений по SKU — прямо из журнала.
+
+    Журнал append-only и есть единственный источник истины (инвариант 3),
+    поэтому история читается из него, а не из отдельной проекции: второй
+    источник разошёлся бы с первым молча.
+
+    Листание курсором, а не смещением: движения дописываются во время
+    листания, и страница со смещением показала бы одну строку дважды.
+    """
+    cursor.execute(
+        "SELECT m.id, m.ts, m.qty, m.state_from, m.state_to, m.reason, "
+        "       m.doc_type, m.doc_ref, s.barcode, "
+        "       cf.address AS cell_from, ct.address AS cell_to, "
+        "       bf.barcode AS box_from, bt.barcode AS box_to "
+        "  FROM stock_move m "
+        "  JOIN sku s ON s.id = m.sku_id "
+        "  LEFT JOIN cell cf ON cf.id = m.cell_from "
+        "  LEFT JOIN cell ct ON ct.id = m.cell_to "
+        "  LEFT JOIN box bf ON bf.id = m.box_from "
+        "  LEFT JOIN box bt ON bt.id = m.box_to "
+        " WHERE m.owner_id = %(owner)s "
+        "   AND (%(barcode)s::text IS NULL OR s.barcode = %(barcode)s) "
+        "   AND (%(since)s::timestamptz IS NULL OR m.ts >= %(since)s) "
+        "   AND (%(until)s::timestamptz IS NULL OR m.ts <= %(until)s) "
+        "   AND (%(cursor)s::bigint IS NULL OR m.id < %(cursor)s) "
+        " ORDER BY m.id DESC LIMIT %(limit)s",
+        {"owner": owner_id, "barcode": barcode, "since": since, "until": until,
+         "cursor": cursor_id, "limit": limit})
+    # id монотонный (bigint identity) и он же порядок записи, поэтому листаем
+    # по нему: сортировка по ts неоднозначна — движения одной транзакции
+    # получают одинаковый now().
+    return [{"movement_id": str(row["id"]), "occurred_at": row["ts"].isoformat(),
+             "barcode": row["barcode"], "qty": int(row["qty"]),
+             "state_from": row["state_from"], "state_to": row["state_to"],
+             "cell_from": row["cell_from"], "cell_to": row["cell_to"],
+             "box_from": row["box_from"], "box_to": row["box_to"],
+             "reason": row["reason"], "doc_type": row["doc_type"],
+             "doc_ref": row["doc_ref"]} for row in cursor.fetchall()]
+
+
+def known_barcodes(cursor: Cursor, owner_id: uuid.UUID) -> set[str]:
+    """Штрихкоды, заведённые в каталоге склада. Нужны, чтобы отличить
+    маппленную карточку от немаппленной: немаппленный товар — это
+    `manual_review` с кодом, а не остаток (инвариант 6)."""
+    cursor.execute(
+        "SELECT barcode FROM sku WHERE owner_id = %s AND barcode IS NOT NULL", (owner_id,))
+    return {row["barcode"] for row in cursor.fetchall()}
+
+
 # ------------------------------------------------------------- размещение
 
 def putaway_queue(cursor: Cursor, *, owner_external_id: str | None = None,
@@ -1436,9 +1529,11 @@ def return_by_id_or_event(cursor: Cursor, value: str) -> dict[str, Any] | None:
     except (ValueError, AttributeError):
         identifier = None
     cursor.execute(
-        "SELECT id, task_id, return_event_id, owner_id, state, decision, reason "
-        "  FROM wms_return WHERE (%s::uuid IS NOT NULL AND id = %s::uuid) "
-        "     OR return_event_id = %s",
+        "SELECT r.id, r.task_id, r.return_event_id, r.owner_id, r.state, r.decision, "
+        "       r.reason, o.seller_external_id "
+        "  FROM wms_return r JOIN owner o ON o.id = r.owner_id "
+        " WHERE (%s::uuid IS NOT NULL AND r.id = %s::uuid) "
+        "    OR r.return_event_id = %s",
         (identifier, identifier, str(value)))
     return cursor.fetchone()
 

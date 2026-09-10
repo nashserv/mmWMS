@@ -175,7 +175,10 @@ def test_inventory_writes_off_and_takes_on_by_movement(
                    "fact_qty": before - 3}]})
 
     assert result["state"] == "applied"
-    assert result["adjustments"] and result["adjustments"][0]["delta"] == -3
+    # Форма — InventoryCountResult: наружу едет число движений, а разбор
+    # расхождений читается по /discrepancies. Ответ команды — не способ
+    # доставки данных (раздел 6.1).
+    assert result["moves"] >= 1
     assert balance(pool, client["seller"], client["barcode"]) == before - 3
     moves = rows(pool, "SELECT doc_type, reason, qty FROM stock_move "
                        " WHERE doc_ref = %s", (result["reference"],))

@@ -6,10 +6,11 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from . import fixtures
 from .domain import TaskState, now, uid
@@ -45,6 +46,15 @@ class MockState:
             self._labels: dict[str, dict[str, Any]] = {}
             self._sequences: dict[str, int] = {}
             self._receipts: dict[str, dict[str, Any]] = {}
+            # Расхождения отдельным списком: экран начальника склада читает их
+            # по /discrepancies, а не внутри приёмок — у ledger_short
+            # receipt_id пуст, и в /receipts/screen он не попадёт никогда.
+            self._discrepancies: list[dict[str, Any]] = []
+            # Журнал движений. У настоящего сервиса это append-only stock_move
+            # и единственный источник истины (инвариант 3); здесь — тот же
+            # порядок и та же форма, чтобы клиент ЛК не переучивался.
+            self._moves: list[dict[str, Any]] = []
+            self._next_move_id = 1
             self._boxes: list[dict[str, Any]] = [dict(box) for box in fixtures.BOXES]
             self._returns: dict[str, dict[str, Any]] = {}
             self._shipments: list[dict[str, Any]] = []
@@ -121,6 +131,38 @@ class MockState:
     def owners(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(owner) for owner in self._owners.values()]
+
+    def owner(self, seller_external_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            owner = self._owners.get(seller_external_id)
+            return dict(owner) if owner else None
+
+    def placements_for(self, seller_external_id: Any) -> list[dict[str, Any]]:
+        """Где и в каком состоянии лежит товар — форма StockPlacement.
+
+        Коробка первой, ячейка второй: коробка и есть фактическая единица
+        адресации склада (раздел 2.9).
+        """
+        with self._lock:
+            rows: list[dict[str, Any]] = []
+            by_box = {(b["owner_external_id"], b.get("product_barcode")): b
+                      for b in self._boxes}
+            for (seller, barcode), good in sorted(self._stock.items()):
+                if seller_external_id and seller != seller_external_id:
+                    continue
+                box = by_box.get((seller, barcode))
+                if good:
+                    rows.append({
+                        "barcode": barcode, "state": "good", "quantity": int(good),
+                        "cell_address": (box or {}).get("cell_address"),
+                        "box_barcode": (box or {}).get("barcode")})
+                reserved = self._reserved.get((seller, barcode), 0)
+                if reserved:
+                    rows.append({
+                        "barcode": barcode, "state": "reserved", "quantity": int(reserved),
+                        "cell_address": (box or {}).get("cell_address"),
+                        "box_barcode": (box or {}).get("barcode")})
+            return rows
 
     def owner_is_known(self, seller_external_id: str) -> bool:
         with self._lock:
@@ -276,6 +318,9 @@ class MockState:
             key = (seller_external_id, barcode)
             self._reserved[key] = self._reserved.get(key, 0) + quantity
             self._stock[key] = self._stock.get(key, 0) - quantity
+            self.record_move(
+                seller_external_id=key[0], barcode=key[1], qty=quantity,
+                state_from="good", state_to="reserved", reason="reservation")
 
             product = self._products.get(key) or {}
             task = {
@@ -306,37 +351,66 @@ class MockState:
             payload = _zpl(barcode, str(product.get("name") or seller_external_id))
             label_id = uid()
             task["label_id"] = label_id
+            raw = payload.encode("utf-8")
             self._labels[task_id] = {
                 "id": label_id,
                 "order_id": wb_order_id,
                 "version": 1,
-                "payload": payload,
-                "content_type": "zplv",
-                "checksum": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                # base64, как требует контракт (`contentEncoding: base64`).
+                # Заглушка отдавала ZPL текстом, и клиент, написанный против
+                # неё, спотыкался бы на настоящем сервисе.
+                "payload": base64.b64encode(raw).decode("ascii"),
+                # MIME-тип, а не имя формата: `zplv` — это `format`.
+                "content_type": "application/x-zpl",
+                "format": "zplv",
+                # sha256 от самих байтов, до кодирования: так её считает и
+                # проверяет настоящий сервис (`hmac.compare_digest`).
+                "checksum": hashlib.sha256(raw).hexdigest(),
                 "sticker": {"barcode": barcode},
                 "invalidated": False,
             }
             return task
 
-    def pull(self, *, assignee: Any, limit: int) -> list[dict[str, Any]]:
+    def pull(self, *, assignee: Any, limit: int, claim: bool = True,
+             states: Sequence[str] | None = None,
+             owner_external_ids: Sequence[str] | None = None) -> list[dict[str, Any]]:
         """Выдача заданий сборщику.
 
         Задание не должно уйти двоим (шаг 8 прогона). В настоящем сервисе это
         FOR UPDATE SKIP LOCKED; здесь — замок и отметка assignee.
+
+        `claim=false` — только посмотреть. Экран обновляется чаще, чем человек
+        берёт работу, и занимать при каждом обновлении нельзя: заглушка читала
+        параметр мимо и занимала всегда, а экран, опрашивающий очередь раз в
+        секунду, за минуту разложил бы её по несуществующей сессии. Симптом
+        при этом выглядел бы как «заданий нет» — неотличимо от «новые заказы
+        не падают в приложение», ровно та беда, которую чиним (заявка 2
+        потока B).
+
+        `states` по умолчанию `reserved` — то, что готово к подбору. Без
+        фильтра задания в работе (`picking`, `packed`) не были видны вовсе.
         """
+        wanted = list(states) if states else [TaskState.RESERVED.value]
+        owners = set(owner_external_ids or ())
         with self._lock:
             deadline_at = datetime.now(timezone.utc) + CLAIM_TTL
             taken: list[dict[str, Any]] = []
             candidates = [
                 task for task in self._tasks.values()
-                if task["state"] == TaskState.RESERVED.value and task["assignee"] is None
+                if task["state"] in wanted
+                # Свободным считается задание без исполнителя. При claim=false
+                # это неважно — читаем и занятые, если их явно спросили
+                # состоянием.
+                and (not claim or task["assignee"] is None)
+                and (not owners or task.get("seller_external_id") in owners)
             ]
             # Сортировка по сроку WB, а не по времени создания (раздел 7).
             candidates.sort(key=lambda task: (task["deadline"] is None, task["deadline"] or ""))
             for task in candidates[:max(0, limit)]:
-                task["assignee"] = assignee
-                task["claim_expires_at"] = deadline_at.isoformat()
-                task["state"] = TaskState.PICKING.value
+                if claim:
+                    task["assignee"] = assignee
+                    task["claim_expires_at"] = deadline_at.isoformat()
+                    task["state"] = TaskState.PICKING.value
                 taken.append(dict(task))
             return taken
 
@@ -415,10 +489,10 @@ class MockState:
     def lookup(self, barcode: Any) -> list[dict[str, Any]]:
         with self._lock:
             return [
-                {"box_barcode": box["barcode"], "cell": box["cell"],
+                {"box_barcode": box["barcode"], "cell_address": box["cell_address"],
                  "quantity": box["quantity"], "comment": box["comment"]}
                 for box in self._boxes
-                if not barcode or box.get("barcode_product") == barcode
+                if not barcode or box.get("product_barcode") == barcode
             ]
 
     def _cell_for(self, seller_external_id: str, barcode: str) -> str | None:
@@ -429,8 +503,8 @@ class MockState:
         инвентаризация не знает, куда идти.
         """
         for box in self._boxes:
-            if (box.get("barcode_product") == barcode
-                    and box.get("seller_external_id") == seller_external_id):
+            if (box.get("product_barcode") == barcode
+                    and box.get("owner_external_id") == seller_external_id):
                 return box.get("cell_id")
         return self._placement.get((seller_external_id, barcode))
 
@@ -460,20 +534,35 @@ class MockState:
                 self.register_product(seller_external_id, barcode)
                 key = (seller_external_id, barcode)
                 self._stock[key] = self._stock.get(key, 0) + int(actual)
+                self.record_move(
+                    seller_external_id=seller_external_id, barcode=barcode,
+                    qty=int(actual), state_from=None, state_to="good",
+                    reason="receipt", cell_to=line.get("cell_address"),
+                    doc_type="receipt", doc_ref=reference)
                 address = line.get("cell_address")
                 if address:
                     self._placement[key] = self.register_cell(str(address))["cell_id"]
                 if expected is not None and int(actual) != int(expected):
-                    discrepancies.append({
+                    row = {
+                        "discrepancy_id": uid(),
                         "barcode": barcode,
                         "kind": "shortage" if int(actual) < int(expected) else "surplus",
                         "qty": abs(int(actual) - int(expected)),
                         "decision": "pending",
-                    })
+                        "cell_address": str(address) if address else None,
+                        "created_at": now(),
+                    }
+                    discrepancies.append(row)
+                    # Расхождения живут отдельным списком: экран начальника
+                    # склада читает их по /discrepancies, вне контекста
+                    # приёмки — у ledger_short receipt_id пуст вовсе.
+                    self._discrepancies.append({**row, "owner_external_id": seller_external_id})
 
             receipt = {
                 "receipt_id": uid(), "reference": reference,
-                "seller_external_id": seller_external_id,
+                # Контракт зовёт это owner_external_id, и
+                # `additionalProperties: false` не оставляет места синониму.
+                "owner_external_id": seller_external_id,
                 "state": "accepted", "lines": lines, "discrepancies": discrepancies,
             }
             self._receipts[reference] = receipt
@@ -481,24 +570,122 @@ class MockState:
                                    "created_at": now()})
             return dict(receipt)
 
-    def open_receipts(self) -> list[dict[str, Any]]:
+    def record_move(self, *, seller_external_id: str, barcode: str, qty: int,
+                    state_from: str | None, state_to: str | None,
+                    reason: str, cell_to: str | None = None,
+                    doc_type: str | None = None, doc_ref: str | None = None) -> None:
+        """Дописать движение. Правок здесь не бывает — только дозапись."""
         with self._lock:
-            return [dict(r) for r in self._receipts.values() if r["state"] != "accepted"]
+            self._moves.append({
+                "movement_id": str(self._next_move_id),
+                "occurred_at": now(),
+                "owner_external_id": seller_external_id,
+                "barcode": barcode,
+                "qty": abs(int(qty)),
+                "state_from": state_from,
+                "state_to": state_to,
+                "cell_from": None,
+                "cell_to": cell_to,
+                "box_from": None,
+                "box_to": None,
+                "reason": reason,
+                "doc_type": doc_type,
+                "doc_ref": doc_ref,
+            })
+            self._next_move_id += 1
 
-    def pending_putaway(self) -> list[dict[str, Any]]:
+    def movements(self, *, seller_external_id: Any, barcode: Any = None,
+                  limit: int = 100) -> list[dict[str, Any]]:
+        """История движений — свежие первыми, как её показывает ЛК."""
+        with self._lock:
+            rows = [
+                {k: v for k, v in move.items() if k != "owner_external_id"}
+                for move in reversed(self._moves)
+                if (not seller_external_id
+                    or move["owner_external_id"] == seller_external_id)
+                and (not barcode or move["barcode"] == barcode)
+            ]
+            return rows[:max(0, limit)]
+
+    def wb_cards(self, *, seller_external_id: str,
+                 barcodes: Sequence[str] | None = None) -> list[dict[str, Any]]:
+        """Карточки кабинета. Штрихкод определяет вещь, артикул — только модель.
+
+        `mapped` отвечает на единственный вопрос, ради которого каталог сюда
+        и ходит: заведена ли карточка у нас. Немаппленный товар — это
+        `manual_review` с кодом, а не остаток (инвариант 6).
+        """
+        wanted = set(barcodes or ())
+        with self._lock:
+            known = {code for (seller, code) in self._products if seller == seller_external_id}
+            cards = []
+            for index, code in enumerate(sorted(known), start=1):
+                if wanted and code not in wanted:
+                    continue
+                product = self._products.get((seller_external_id, code), {})
+                cards.append({
+                    "barcode": code,
+                    "seller_sku": product.get("seller_sku"),
+                    "name": product.get("name"),
+                    "nm_id": 170000000 + index,
+                    "brand": "Тестовый бренд",
+                    "subject": "Одежда",
+                    "mapped": True,
+                    "updated_at": now(),
+                })
+            return cards
+
+    def open_receipts(self) -> list[dict[str, Any]]:
+        """Приёмки для экрана приёмщика — форма ReceiptScreenItem."""
         with self._lock:
             return [
-                {"reference": receipt["reference"], "lines": receipt["lines"]}
-                for receipt in self._receipts.values()
+                {"receipt_id": r["receipt_id"], "reference": r["reference"],
+                 "owner_external_id": r["owner_external_id"], "state": r["state"],
+                 "lines": [_receipt_line(line) for line in r["lines"]],
+                 "discrepancies": [dict(d) for d in r["discrepancies"]]}
+                for r in self._receipts.values()
             ]
+
+    def discrepancies(self, *, owner_external_id: Any = None,
+                      kinds: Sequence[str] | None = None,
+                      decisions: Sequence[str] | None = None) -> list[dict[str, Any]]:
+        """Расхождения вне контекста приёмки — экран начальника склада."""
+        with self._lock:
+            rows = []
+            for row in self._discrepancies:
+                if owner_external_id and row.get("owner_external_id") != owner_external_id:
+                    continue
+                if kinds and row["kind"] not in kinds:
+                    continue
+                if decisions and row.get("decision") not in decisions:
+                    continue
+                rows.append({k: v for k, v in row.items() if k != "owner_external_id"})
+            return rows
+
+    def pending_putaway(self) -> list[dict[str, Any]]:
+        """Что принято, но не разложено — форма PutawayItem."""
+        with self._lock:
+            items = []
+            for receipt in self._receipts.values():
+                for line in receipt["lines"]:
+                    qty = line.get("actual_qty") or line.get("expected_qty") or 0
+                    if int(qty) <= 0:
+                        continue
+                    items.append({
+                        "owner_external_id": receipt["owner_external_id"],
+                        "barcode": str(line.get("barcode", "")),
+                        "qty_to_place": int(qty),
+                        "source_reference": receipt["reference"],
+                    })
+            return items
 
     def inventory_sheet(self, seller_external_id: Any) -> list[dict[str, Any]]:
         with self._lock:
             return [
-                {"box_barcode": box["barcode"], "cell": box["cell"],
-                 "barcode": box.get("barcode_product"), "expected_qty": box["quantity"]}
+                {"box_barcode": box["barcode"], "cell_address": box["cell_address"],
+                 "barcode": box.get("product_barcode"), "expected_qty": box["quantity"]}
                 for box in self._boxes
-                if not seller_external_id or box["seller_external_id"] == seller_external_id
+                if not seller_external_id or box["owner_external_id"] == seller_external_id
             ]
 
     def inventory_count(self, *, seller_external_id: str, reference: str, scope: str,
@@ -515,9 +702,9 @@ class MockState:
         with self._lock:
             box = {
                 "barcode": str(params.get("barcode", uid())),
-                "seller_external_id": str(params.get("seller_external_id", "")),
-                "barcode_product": params.get("product_barcode"),
-                "cell": params.get("cell"),
+                "owner_external_id": str(params.get("seller_external_id", "")),
+                "product_barcode": params.get("product_barcode"),
+                "cell_address": params.get("cell_address") or params.get("cell"),
                 "quantity": int(params.get("quantity", 0)),
                 "counted": bool(params.get("counted", False)),
                 "comment": str(params.get("comment", "")),
@@ -528,10 +715,20 @@ class MockState:
 
     def boxes(self, seller_external_id: Any) -> list[dict[str, Any]]:
         with self._lock:
+            # `box.get("state", "stored")` вместо `box["state"]`: фикстурная
+            # коробка без поля роняла весь список в 500. Поле теперь есть у
+            # всех, но читаем мягко — одна коробка не должна гасить экран.
             return [dict(box) for box in self._boxes
-                    if box["state"] == "stored"
+                    if box.get("state", "stored") == "stored"
                     and (not seller_external_id
-                         or box["seller_external_id"] == seller_external_id)]
+                         or box["owner_external_id"] == seller_external_id)]
+
+    def box(self, barcode: str) -> dict[str, Any] | None:
+        with self._lock:
+            for box in self._boxes:
+                if box["barcode"] == barcode:
+                    return dict(box)
+            return None
 
     def remove_box(self, barcode: str) -> dict[str, Any]:
         with self._lock:
@@ -544,13 +741,46 @@ class MockState:
     # ------------------------------------------------------------ отгрузка
 
     def open_shipment(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Поставка: открыть, наполнить, передать.
+
+        `action` раньше не читался вовсе — любой вызов заводил новую поставку в
+        `open`, и подтверждение передачи человеком проверить было нечем. Это
+        шаг 11 полного прогона: «HANDED_TO_WB требует подтверждения человеком»,
+        а в бою таких подтверждений меньше 1 % отгруженных (раздел 3).
+        """
+        action = str(params.get("action") or "open").strip()
+        seller = str(params.get("seller_external_id") or "")
         with self._lock:
+            if action != "open":
+                current = next((sh for sh in reversed(self._shipments)
+                                if sh["owner_external_id"] == seller
+                                and sh["state"] != "handed"), None)
+                if current is None:
+                    raise ValueError(f"у клиента {seller!r} нет открытой поставки")
+                if action == "add_orders":
+                    current["orders"] = int(current["orders"]) + len(params.get("orders") or [])
+                elif action == "hand_over":
+                    # Подпись обязательна: без неё передача не отличается от
+                    # «поставка просто закрылась сама».
+                    handed_by = str(params.get("handed_over_by")
+                                    or params.get("handed_by") or "").strip()
+                    if not handed_by:
+                        raise ValueError(
+                            "передачу подтверждает человек: handed_over_by обязателен")
+                    current["state"] = "handed"
+                    current["handed_by"] = handed_by
+                    current["handed_at"] = now()
+                    current["closed_at"] = now()
+                return dict(current)
+
             shipment = {
                 "shipment_id": uid(),
-                "seller_external_id": params.get("seller_external_id"),
+                "owner_external_id": seller,
                 "wb_supply_id": params.get("wb_supply_id"),
                 "state": "open",
-                "orders": params.get("orders") or [],
+                # Тарифицируемое количество — число заказов (приложение E),
+                # а не их список.
+                "orders": len(params.get("orders") or []),
                 # HANDED_TO_WB требует подтверждения человеком (раздел 2.12).
                 "handed_by": None,
                 "handed_at": None,
@@ -561,6 +791,19 @@ class MockState:
     def shipments(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(shipment) for shipment in self._shipments]
+
+    def picked_tasks(self, seller_external_id: Any = None) -> list[dict[str, Any]]:
+        """Собранные задания, готовые к отгрузке — форма TaskProjection.
+
+        Контракт ждёт здесь именно задания, а не поставки: отгружают вещи,
+        а поставка это их упаковка.
+        """
+        ready = {TaskState.PACKED.value, TaskState.LABELED.value}
+        with self._lock:
+            return [_task_projection(task) for task in self._tasks.values()
+                    if task["state"] in ready
+                    and (not seller_external_id
+                         or task.get("seller_external_id") == seller_external_id)]
 
     # ------------------------------------------------------------ возвраты
 
@@ -617,3 +860,63 @@ class MockState:
                                     if not label["invalidated"]),
                 "returns_total": len(self._returns),
             }
+
+
+def _receipt_line(line: dict[str, Any]) -> dict[str, Any]:
+    """Строка приёмки в форме контракта (`ReceiptLine`)."""
+    expected = line.get("expected_qty")
+    actual = line.get("actual_qty")
+    row: dict[str, Any] = {"barcode": str(line.get("barcode", ""))}
+    if expected is not None:
+        row["expected_qty"] = int(expected)
+    if actual is not None:
+        row["actual_qty"] = int(actual)
+    if line.get("cell_address"):
+        row["cell_address"] = str(line["cell_address"])
+    if line.get("box_barcode"):
+        row["box_barcode"] = str(line["box_barcode"])
+    return row
+
+
+# Поля TaskProjection по контракту. Внутренние идентификаторы (`owner_id`,
+# `sku_id`, `cell_id`, `label_id`, `sequence`) наружу не отдаются: у клиента
+# наших uuid нет, он адресует внешними ключами и адресами. Схема с
+# `additionalProperties: false` их просто не пропустит.
+_TASK_FIELDS = (
+    "task_id", "wb_order_id", "wb_order_uid", "wb_account_external_id",
+    "owner_external_id", "barcode", "seller_sku", "name", "quantity", "deadline",
+    "state", "wb_status", "reservation_id", "package_ref", "supply_id",
+    "assignee", "claim_expires_at", "cancel_reason", "manual_review_code",
+    "manual_review_reason", "last_reconciled_at", "created_at", "updated_at", "version",
+)
+
+
+def _task_projection(task: dict[str, Any]) -> dict[str, Any]:
+    """Задание в форме контракта (`TaskProjection`)."""
+    row = {"owner_external_id": task.get("seller_external_id") or ""}
+    for field in _TASK_FIELDS:
+        if field in task and task[field] is not None:
+            row[field] = task[field]
+    row.setdefault("owner_external_id", "")
+    # Готовность стикера — блоком `label`, а не внутренним `label_id`:
+    # рабочему месту важно «этикетка уже лежит», а не наш uuid.
+    if task.get("label_id"):
+        row["label"] = {"ready": True, "format": "zplv"}
+    return row
+
+
+def task_placements(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Откуда брать — едет рядом с заданием в `PullTask`, а не внутри него.
+
+    Лист подбора собирается одним запросом: без этого пришлось бы досбирать
+    вторым запросом на каждую строку (`include_extended` контракта).
+    """
+    if not (task.get("cell_address") or task.get("box_barcode")):
+        return []
+    return [{
+        "barcode": task.get("barcode", ""),
+        "state": "reserved",
+        "quantity": int(task.get("quantity", 0)),
+        "cell_address": task.get("cell_address"),
+        "box_barcode": task.get("box_barcode"),
+    }]

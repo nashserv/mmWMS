@@ -71,9 +71,13 @@ def test_seeded_seller_is_visible_to_reservation(client: TestClient) -> None:
     Заглушка держала свой in-memory реестр и посеянных продавцов не видела.
     Настоящий сервис обязан отвечать по `owner`, а не по фикстуре.
     """
-    sellers = call(client, "/sellers", {})["sellers"]
-    known = {row["seller_external_id"] for row in sellers}
-    assert known, "маршрут не читает таблицу owner"
+    # Списка владельцев контракт не отдаёт: `/sellers` — это один владелец
+    # (SellerResult). Проверяем на посеянном: он обязан находиться в таблице
+    # `owner`, а не в фикстуре.
+    seeded = call(client, "/sellers", {"seller_external_id": "stand-seller-001"})
+    assert seeded["owner_external_id"] == "stand-seller-001"
+    assert seeded["created"] is False, "посеянный продавец завёлся заново — сид мёртв"
+    assert seeded["owner_id"], "маршрут не читает таблицу owner"
 
 
 def test_opening_stock_lands_in_the_ledger(client: TestClient, seller: dict) -> None:
@@ -112,10 +116,12 @@ def test_reservation_answers_by_contract(client: TestClient, seller: dict) -> No
 
     assert result["status"] == "reserved"
     assert result["owner_external_id"] == seller["seller"]
-    assert result["error_code"] is None
+    # Поля без значения не едут: отсутствующий ключ и null значат для клиента
+    # одно и то же, а контракт объявляет типы строго.
+    assert result.get("error_code") is None
     assert result["ledger_short"] is False
-    # additionalProperties: false — в ответе ровно поля схемы ReservationResult.
-    assert set(result) == {"status", "task_id", "owner_external_id", "error_code",
+    # additionalProperties: false — лишних полей в ответе нет.
+    assert set(result) <= {"status", "task_id", "owner_external_id", "error_code",
                            "reservation_id", "ledger_short"}
 
 

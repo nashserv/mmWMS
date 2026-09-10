@@ -732,6 +732,8 @@ Shadow на проде                          ▓▓▓▓▓▓▓▓
 
 **Новое в 1.2:** `wms.stock.shortfall.v1` — сборка без остатка (6.5).
 
+**Новое в 1.3:** `wms.receipt.completed.v1` — завершённая приёмка. Инвариант 13 требует событие на любое физическое движение, а раздел 3.4 числит приёмку среди услуг с тарифом — эмитить и тарифицировать её было нечем. `inventory.movement.recorded.v1` для этого не годится дважды: оно сопровождает почти всякое движение (счёт вышел бы на каждую строку) и требует `order_id`, которого у приёмки нет.
+
 **Склад:** `inventory.movement.recorded.v1` (8), `inventory.stock.updated.v1` (3)
 
 **Wildberries:** `wb.fbs.order.synced.v1` (15), `wb.fbs.order.updated.v1` (11), `wb.fbs-task.received.v1`, `wb.fbs-task.rejected.v1`, `wb.fbs.metadata.submitted.v1`, `wb.label.requested.v1` (4), `wb.supply.adopted.v1`, `wb.supply.shipped.v1` (5), `wb.supply.retired.v1`, `wb.delivery.completed.v1`, `wb.stocks.pushed.v1`, `wb.warehouse.created.v1`, `wb.warehouse.deleted.v1`, `wb.account.connected.v1`, `wb.account.verified.v1`, `wb.account.token-rotated.v1`, `wb.account.disabled.v1`, `wb.lifecycle.step-failed.v1`, `wb.fbs.return.detected.v1` (6), `wb.return.unmatched.v1`
@@ -758,6 +760,11 @@ Shadow на проде                          ▓▓▓▓▓▓▓▓
 | `/labels/{task_id}/print` | отдать локальный ZPL агенту на печать |
 | `/receipts/screen`, `/putaway/screen` | данные для экранов приёмки и размещения |
 | `/wb/accounts`, `/wb/accounts/{id}/verify` | управление кабинетами WB (отдельная роль) |
+| `/discrepancies` | расхождения вне контекста приёмки — у `ledger_short` `receipt_id` пуст (1.3) |
+| `/warehouse/movements` | история движений по SKU за период, для ЛК клиента (1.3) |
+| `/catalog/wb-cards` | карточки Wildberries через `wms`, как требует раздел 6.8 (1.3) |
+
+Станции маршрутом **не перечисляются**: их пять (раздел 4), меняются они не чаще, чем переезжает склад, и заводятся сидом при развёртывании. `station_id` настраивается на самой станции. Правило записано в контракт явно, чтобы рабочее место не ждало маршрута, которого не будет.
 
 ---
 
@@ -847,9 +854,31 @@ return_id : string, pattern ^wb-[0-9a-f-]{36}$
 task_id   : string, uuid
 ```
 
+**LabelAttachedPayload** (`wms.label.attached.v1`) — `owner_id` **обязателен** с версии 1.3. Стикеровка тарифицируется (раздел 3.4), и без владельца биллингу некому её выставить: строка повисает в отчёте с причиной `SELLER_UNKNOWN`. Содержимое этикетки в событие не кладётся — до 10 МБ через шину это не уведомление; ZPL лежит в `wb_label` и отдаётся по `/labels/{task_id}/print`.
+
+**ReceiptCompletedPayload** (`wms.receipt.completed.v1`, новое в 1.3) — обязательны:
+```
+receipt_id         : string, uuid
+owner_id           : string, uuid
+seller_external_id : string
+doc_ref            : string   — receipt.reference, ключ идемпотентности (инвариант 5)
+accepted_qty       : integer ≥ 0 — принято ПО ФАКТУ, не по ожиданию
+occurred_at        : date-time
+sequence           : integer
+```
+Необязательные: `lines_count`, `discrepancies_count`, `warehouse_code`, `actor_id`. Строки в событие не кладутся — их читают по `/receipts/screen`.
+
+**OrdersProcessedPayload** (`wb.orders.processed.v1`, форма зафиксирована в 1.3) — обязательны:
+```
+seller_id   : string   — кабинет клиента, кому выставляется счёт
+orders      : integer ≥ 0 — заказов обработано, ТАРИФИЦИРУЕМОЕ КОЛИЧЕСТВО
+occurred_at : date-time
+```
+Необязательные: `owner_id`, `wb_account_external_id`. Тип числился тарифицируемым в разделе 3.4 (150 ₽ в диагностике раздела 3), но формы не было нигде, и биллинг считал количество единицей как временную меру: при пачке заказов клиент был бы недосчитан во столько раз, сколько заказов в пачке.
+
 **Порядок событий по заданию.** В Odoo-аутбоксе на каждое задание ведётся `sequence`: инкремент под блокировкой строки задания, событие и номер пишутся атомарно. Потребители полагаются на монотонность в пределах задания. **В новой WMS сохранить**: `outbox.sequence` инкрементируется в той же транзакции, что и движение.
 
-**Список `WMS_EVENT_TYPES`** (валидируется при эмиссии): `wms.reservation.succeeded.v1`, `wms.reservation.failed.v1`, `wms.picking.started.v1`, `wms.item.scanned.v1`, `wms.picking.completed.v1`, `wms.packing.completed.v1`, `wms.label.attached.v1`, `wms.returned.to.shelf.v1`, `wms.return.expected.v1`, `wms.return.received.v1`, `wms.return.resellable.v1`, `wms.return.defective.v1`, `wms.order.cancelled.v1`. Расширяется на `wms.stock.shortfall.v1`.
+**Список `WMS_EVENT_TYPES`** (валидируется при эмиссии): `wms.reservation.succeeded.v1`, `wms.reservation.failed.v1`, `wms.picking.started.v1`, `wms.item.scanned.v1`, `wms.picking.completed.v1`, `wms.packing.completed.v1`, `wms.label.attached.v1`, `wms.returned.to.shelf.v1`, `wms.return.expected.v1`, `wms.return.received.v1`, `wms.return.resellable.v1`, `wms.return.defective.v1`, `wms.order.cancelled.v1`. Расширяется на `wms.stock.shortfall.v1` (1.2) и `wms.receipt.completed.v1` (1.3).
 
 ---
 
