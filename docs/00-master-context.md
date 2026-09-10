@@ -130,7 +130,7 @@ WB → gateway-sync-worker (опрос) → wb_assembly_tasks
 
 Рядом с каждым Odoo-адаптером лежит fake с теми же методами. Интерфейс настоящий, замена предусмотрена.
 
-### 2.7 Контракт WMS as-is (32 маршрута)
+### 2.7 Контракт WMS as-is (29 маршрутов)
 
 `services/wb-fbs-gateway/contracts/odoo-wms-openapi.yaml`, реализация в `mmx-addons/mmx_wms_bridge/controllers/api.py`. Все `POST`, JSON-RPC. Список — приложение B, формы — приложение C.
 
