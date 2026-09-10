@@ -23,6 +23,8 @@ from .admin import Admin, OnboardingError
 from .config import app_environment, database_url, trusted_hosts
 from .db import Database
 from .domain import Service
+from .principal import (Forbidden, Principal, Principals, Unauthorized, require_partner,
+                        require_write, summary, visible_cabinet_ids)
 from .service import BillingService
 from .wms_client import WmsClient
 
@@ -31,7 +33,17 @@ BASE_PATH = "/api/billing/v1"
 database = Database(database_url() or "postgresql:///billing")
 billing = BillingService(database)
 admin = Admin(database, WmsClient())
+principals = Principals()
 router = APIRouter(prefix=BASE_PATH)
+
+
+def caller(request: Request) -> Principal:
+    """Кто спрашивает. Отказ — исключение, а не пустая выдача.
+
+    Пустой список вместо отказа читается как «у вас ничего нет» и прячет
+    настоящую причину: человеку не выдали роль либо identity лежит.
+    """
+    return principals.of(request.headers.get("authorization"))
 
 
 def plain(value: Any) -> Any:
@@ -85,13 +97,22 @@ async def health() -> JSONResponse:
 # ------------------------------------------------------------------ партнёры
 
 @router.get("/partners")
-async def list_partners() -> JSONResponse:
-    """Дерево менеджеров целиком — справочник, с которого начинается всё остальное."""
-    return ok({"partners": admin.partner_tree()})
+async def list_partners(request: Request) -> JSONResponse:
+    """Дерево менеджеров. Администратору — целиком, партнёру — своя ветка."""
+    principal = caller(request)
+    tree = admin.partner_tree()
+    if principal.unrestricted:
+        return ok({"partners": tree})
+    with database.cursor() as cursor:
+        from .principal import visible_partner_ids
+
+        visible = set(visible_partner_ids(cursor, principal) or ())
+    return ok({"partners": [row for row in tree if str(row["id"]) in visible]})
 
 
 @router.post("/partners")
 async def create_partner(request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     name = str(body.get("name") or "").strip()
     if not name:
@@ -101,13 +122,17 @@ async def create_partner(request: Request) -> JSONResponse:
 
 
 @router.get("/partners/{partner_id}/cabinets")
-async def partner_cabinets(partner_id: str, on: str | None = None) -> JSONResponse:
+async def partner_cabinets(partner_id: str, request: Request,
+                           on: str | None = None) -> JSONResponse:
+    with database.cursor() as cursor:
+        require_partner(cursor, caller(request), partner_id)
     return ok({"cabinets": admin.partner_cabinets(partner_id, on=as_date(on, date.today()))})
 
 
 @router.post("/partners/{partner_id}/markups")
 async def set_markup(partner_id: str, request: Request) -> JSONResponse:
     """Наценка партнёра по услуге, с даты. Прошлые периоды не пересчитываются."""
+    require_write(caller(request))
     body = await body_of(request)
     try:
         layer = admin.set_markup(
@@ -119,19 +144,29 @@ async def set_markup(partner_id: str, request: Request) -> JSONResponse:
 
 
 @router.get("/partners/{partner_id}/commission")
-async def partner_commission(partner_id: str, period: str) -> JSONResponse:
+async def partner_commission(partner_id: str, period: str, request: Request) -> JSONResponse:
+    """Своя комиссия и комиссия ветки. Чужую не показываем даже по прямой ссылке."""
+    with database.cursor() as cursor:
+        require_partner(cursor, caller(request), partner_id)
     return ok(billing.commission(partner_id, period))
 
 
 # ------------------------------------------------------------------ кабинеты
 
 @router.get("/cabinets")
-async def list_cabinets(needs_onboarding: bool = False) -> JSONResponse:
-    return ok({"cabinets": admin.cabinets(only_needing_onboarding=needs_onboarding)})
+async def list_cabinets(request: Request, needs_onboarding: bool = False) -> JSONResponse:
+    principal = caller(request)
+    cabinets = admin.cabinets(only_needing_onboarding=needs_onboarding)
+    if principal.unrestricted:
+        return ok({"cabinets": cabinets})
+    with database.cursor() as cursor:
+        visible = set(visible_cabinet_ids(cursor, principal) or ())
+    return ok({"cabinets": [row for row in cabinets if str(row["id"]) in visible]})
 
 
 @router.post("/cabinets/{cabinet_id}/assign")
 async def assign_cabinet(cabinet_id: str, request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     try:
         assignment = admin.assign_cabinet(
@@ -145,6 +180,7 @@ async def assign_cabinet(cabinet_id: str, request: Request) -> JSONResponse:
 @router.post("/onboarding")
 async def onboard(request: Request) -> JSONResponse:
     """Онбординг клиента одним потоком. Ни одного ручного запроса в базу."""
+    require_write(caller(request))
     body = await body_of(request)
     try:
         result = admin.onboard(
@@ -175,6 +211,7 @@ async def list_tariffs() -> JSONResponse:
 
 @router.post("/tariffs")
 async def create_tariff(request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     try:
         tariff = admin.create_tariff(
@@ -187,6 +224,7 @@ async def create_tariff(request: Request) -> JSONResponse:
 
 @router.post("/tariffs/{tariff_id}/versions")
 async def add_version(tariff_id: str, request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     try:
         version = admin.add_version(
@@ -200,6 +238,7 @@ async def add_version(tariff_id: str, request: Request) -> JSONResponse:
 
 @router.post("/tariff-versions/{version_id}/approve")
 async def approve_version(version_id: str, request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     try:
         return ok({"version": admin.approve_version(version_id,
@@ -222,7 +261,7 @@ async def ingest(request: Request) -> JSONResponse:
 
 
 @router.get("/accruals")
-async def accruals(cabinet_id: str | None = None, period: str | None = None,
+async def accruals(request: Request, cabinet_id: str | None = None, period: str | None = None,
                    limit: int = 200) -> JSONResponse:
     """Расшифровка начислений с видимой наценкой партнёра (файл 04, «ЛК клиента»).
 
@@ -230,18 +269,21 @@ async def accruals(cabinet_id: str | None = None, period: str | None = None,
     а не считать нас источником завышенной цены.
     """
     with database.cursor() as cursor:
+        visible = visible_cabinet_ids(cursor, caller(request))
         cursor.execute(
             """
             SELECT a.*, c.seller_external_id AS cabinet_seller, p.name AS partner_name
               FROM billing_accrual a
               JOIN cabinet c ON c.id = a.cabinet_id
          LEFT JOIN partner p ON p.id = a.partner_id
-             WHERE (%s::uuid IS NULL OR a.cabinet_id = %s::uuid)
-               AND (%s::text IS NULL OR a.period = %s::text)
+             WHERE (%(cabinet)s::uuid IS NULL OR a.cabinet_id = %(cabinet)s::uuid)
+               AND (%(period)s::text IS NULL OR a.period = %(period)s::text)
+               AND (%(visible)s::uuid[] IS NULL OR a.cabinet_id = ANY(%(visible)s::uuid[]))
              ORDER BY a.occurred_on DESC, a.created_at DESC
-             LIMIT %s
+             LIMIT %(limit)s
             """,
-            (cabinet_id, cabinet_id, period, period, max(1, min(limit, 1000))))
+            {"cabinet": cabinet_id, "period": period, "visible": visible,
+             "limit": max(1, min(limit, 1000))})
         rows = [dict(row) for row in cursor.fetchall()]
     return ok({"accruals": rows, "count": len(rows)})
 
@@ -249,14 +291,21 @@ async def accruals(cabinet_id: str | None = None, period: str | None = None,
 # -------------------------------------------------------------------- отчёты
 
 @router.get("/reports/margin")
-async def margin(period: str) -> JSONResponse:
-    """выручка − наценка партнёра − себестоимость = маржа по кабинету."""
+async def margin(period: str, request: Request) -> JSONResponse:
+    """выручка − наценка партнёра − себестоимость = маржа по кабинету.
+
+    Себестоимость — внутреннее число MM-Express, поэтому отчёт целиком виден
+    только администратору и бухгалтеру. Партнёру видна его комиссия, но не то,
+    сколько мы на его клиенте заработали.
+    """
+    require_write(caller(request))
     return ok({"period": period, "cabinets": billing.margin(period)})
 
 
 @router.get("/reports/unbilled")
-async def unbilled() -> JSONResponse:
+async def unbilled(request: Request) -> JSONResponse:
     """Что склад сделал, а клиенту не выставлено, — по причинам."""
+    require_write(caller(request))
     return ok({"reasons": billing.unbilled()})
 
 
@@ -271,6 +320,7 @@ async def shift(day: str | None = None) -> JSONResponse:
 
 @router.post("/periods/{period}/close")
 async def close_period(period: str, request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     closed_by = str(body.get("closed_by") or "").strip()
     if not closed_by:
@@ -280,12 +330,14 @@ async def close_period(period: str, request: Request) -> JSONResponse:
 
 
 @router.post("/periods/{period}/allocate")
-async def allocate(period: str) -> JSONResponse:
+async def allocate(period: str, request: Request) -> JSONResponse:
+    require_write(caller(request))
     return ok(admin.allocate_period(period))
 
 
 @router.post("/expenses")
 async def add_expense(request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     try:
         expense = admin.add_expense(
@@ -300,6 +352,7 @@ async def add_expense(request: Request) -> JSONResponse:
 
 @router.post("/invoices")
 async def issue_invoice(request: Request) -> JSONResponse:
+    require_write(caller(request))
     body = await body_of(request)
     try:
         invoice = admin.issue_invoice(str(body["cabinet_id"]), str(body["period"]),
@@ -320,8 +373,9 @@ async def invoice(invoice_id: str) -> JSONResponse:
 
 
 @router.post("/invoices/{invoice_id}/pay")
-async def pay_invoice(invoice_id: str) -> JSONResponse:
+async def pay_invoice(invoice_id: str, request: Request) -> JSONResponse:
     """Оплата счёта переводит вознаграждение партнёра в payable, не раньше."""
+    require_write(caller(request))
     try:
         return ok({"invoice": admin.pay_invoice(invoice_id)})
     except OnboardingError as error:
@@ -341,6 +395,19 @@ def create_app() -> FastAPI:
         response = await call_next(request)
         metrics.observe_http(response.status_code, time.monotonic() - started)
         return response
+
+    @application.exception_handler(Unauthorized)
+    async def unauthorized(_: Request, error: Unauthorized) -> JSONResponse:
+        return ok({"error": str(error)}, 401)
+
+    @application.exception_handler(Forbidden)
+    async def forbidden(_: Request, error: Forbidden) -> JSONResponse:
+        # 403, а не пустая выдача: человек должен понять, что видит не всё.
+        return ok({"error": str(error)}, 403)
+
+    @application.get("/whoami")
+    async def whoami(request: Request) -> JSONResponse:
+        return ok(summary(caller(request)))
 
     @application.get("/healthz")
     async def healthz() -> JSONResponse:

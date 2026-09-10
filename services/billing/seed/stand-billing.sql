@@ -6,12 +6,13 @@
 BEGIN;
 
 -- === Дерево партнёров ===
-INSERT INTO partner (id, parent_id, name) VALUES
-    ('367f8fe7-e37d-59d1-b685-5a7ef0e04c07', NULL, 'Зардал'),
-    ('02499f4f-4e18-56b6-879d-f3bc075cceac', '367f8fe7-e37d-59d1-b685-5a7ef0e04c07', 'Менеджер кабинетов 1'),
-    ('a828377a-030c-5be4-ba73-7b2826446ace', '367f8fe7-e37d-59d1-b685-5a7ef0e04c07', 'Менеджер кабинетов 2'),
-    ('d81b2c12-e214-5a43-a62d-324a0728f03c', '367f8fe7-e37d-59d1-b685-5a7ef0e04c07', 'Менеджер кабинетов 3')
-ON CONFLICT (id) DO NOTHING;
+-- user_id — тот же пользователь, которому identity выдаёт роль на ветку.
+INSERT INTO partner (id, parent_id, name, user_id) VALUES
+    ('367f8fe7-e37d-59d1-b685-5a7ef0e04c07', NULL, 'Зардал', 'a479196f-9c13-5444-a778-8d5db0a443f8'),
+    ('02499f4f-4e18-56b6-879d-f3bc075cceac', '367f8fe7-e37d-59d1-b685-5a7ef0e04c07', 'Менеджер кабинетов 1', 'b6622413-5e3e-5890-8cbc-950633023f86'),
+    ('a828377a-030c-5be4-ba73-7b2826446ace', '367f8fe7-e37d-59d1-b685-5a7ef0e04c07', 'Менеджер кабинетов 2', '2b24b8bb-431f-532a-a8af-811bb7821e97'),
+    ('d81b2c12-e214-5a43-a62d-324a0728f03c', '367f8fe7-e37d-59d1-b685-5a7ef0e04c07', 'Менеджер кабинетов 3', '20fba9a3-0e71-59e8-88f0-03577c1cd2e2')
+ON CONFLICT (id) DO UPDATE SET user_id = COALESCE(partner.user_id, EXCLUDED.user_id);
 
 -- === Кабинеты ===
 -- cabinet.wms_owner_id — тот же uuid владельца, что в базе wms: события

@@ -35,9 +35,62 @@ x-billing-env: &billing-env
   # Кабинет, приехавший событием, а не онбордингом, тарифицируется и помечается
   # needs_onboarding (см. app/service.py). Выключить — значит терять выручку молча.
   BILLING_AUTO_ONBOARD: "true"
+  # Кто спрашивает — отвечает identity. Токены биллинг не разбирает: механику
+  # JWT/JWKS поток C не трогает (файл 04).
+  IDENTITY_URL: http://identity:8080
   TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
 
 services:
+
+  # ---------------------------------------------------------------- identity
+  # Только роли: механику JWT/JWKS поток C не трогает. Боевой identity живёт на
+  # платформе, его исходников в репозитории нет — миграция дополняющая, а
+  # проверка токена делегируется ему, как только он появится (IDENTITY_UPSTREAM_URL).
+  identity-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/identity/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  identity-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      identity-migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ../../services/identity/seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "identity",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stand-roles.sql"]
+
+  identity:
+    build:
+      context: ../../services/identity
+    <<: *restart
+    depends_on:
+      identity-seed: {condition: service_completed_successfully}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+      # Пусто — на стенде боевого identity нет, и стендовые токены stand:<uuid>
+      # разрешены только потому, что APP_ENV локальный. В защищённой среде
+      # сервис откажет всем, пока адрес не задан.
+      IDENTITY_UPSTREAM_URL: ${IDENTITY_UPSTREAM_URL:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8084:8080"]
 
   # --------------------------------------------------------------- миграции
   billing-migrate:
@@ -76,7 +129,8 @@ services:
       context: ../../services/billing
     <<: *restart
     depends_on:
-      billing-migrate: {condition: service_completed_successfully}
+      billing-seed: {condition: service_completed_successfully}
+      identity: {condition: service_healthy}
       rabbitmq: {condition: service_healthy}
     environment:
       <<: *billing-env

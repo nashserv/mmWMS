@@ -19,6 +19,9 @@ import uuid
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "reference" / "stand-seed" / "seed-stand.sql"
 TARGET = pathlib.Path(__file__).resolve().parent / "stand-billing.sql"
+# Роли стенда генерируются здесь же: у партнёра и его пользователя обязан быть
+# один и тот же uuid в двух базах, иначе ветка прав не сойдётся с деревом.
+IDENTITY_TARGET = ROOT / "services" / "identity" / "seed" / "stand-roles.sql"
 
 # Пространство имён для устойчивых uuid: повторный запуск генератора обязан
 # дать те же идентификаторы, иначе сид перестанет быть идемпотентным.
@@ -81,6 +84,11 @@ def stable(kind: str, key: str) -> str:
     return str(uuid.uuid5(NAMESPACE, f"{kind}:{key}"))
 
 
+def user_of(partner_id: str) -> str:
+    """Пользователь identity, под которым партнёр входит в кабинет."""
+    return stable("user", partner_id)
+
+
 def owners_from_seed(text: str) -> list[tuple[str, str, str, str]]:
     """(owner_id, seller_external_id, name, inn) — в порядке файла."""
     block = re.search(r"INSERT INTO owner \([^)]*\) VALUES\s*(.*?);", text, re.S)
@@ -129,12 +137,15 @@ def main() -> None:
     add("BEGIN;")
     add("")
     add("-- === Дерево партнёров ===")
-    add("INSERT INTO partner (id, parent_id, name) VALUES")
-    rows = [f"    ({quote(root[1])}, NULL, {quote(root[0])})"]
-    rows += [f"    ({quote(pid)}, {quote(parent)}, {quote(name)})"
+    add("-- user_id — тот же пользователь, которому identity выдаёт роль на ветку.")
+    add("INSERT INTO partner (id, parent_id, name, user_id) VALUES")
+    rows = [f"    ({quote(root[1])}, NULL, {quote(root[0])}, {quote(user_of(root[1]))})"]
+    rows += [f"    ({quote(pid)}, {quote(parent)}, {quote(name)}, {quote(user_of(pid))})"
              for name, pid, parent in managers]
     add(",\n".join(rows))
-    add("ON CONFLICT (id) DO NOTHING;")
+    # Заполняем пустой user_id и не трогаем проставленный: повторный сид — это
+    # обновление стенда, а не откат того, что администратор поправил руками.
+    add("ON CONFLICT (id) DO UPDATE SET user_id = COALESCE(partner.user_id, EXCLUDED.user_id);")
     add("")
 
     add("-- === Кабинеты ===")
@@ -247,6 +258,53 @@ def main() -> None:
     TARGET.write_text("\n".join(out), encoding="utf-8")
     print(f"{TARGET.name}: {len(owners)} кабинетов, {len(account_rows)} кабинетов WB, "
           f"{len(managers) + 1} партнёров")
+
+    write_identity_seed(root, managers)
+
+
+def write_identity_seed(root: tuple[str, str, None],
+                        managers: list[tuple[str, str, str]]) -> None:
+    """Сид ролей стенда.
+
+    Партнёру выдаётся роль на ветку — на самого себя как корень. Отсюда и
+    работает правило «менеджер видит своих, старший — свою ветку целиком»:
+    ветка раскрывается рекурсивно, и отдельной роли «старший» для этого не
+    нужно, нужно лишь, чтобы под ним кто-то был.
+
+    Люди склада выдуманы: настоящих сотрудников на стенде нет и быть не должно.
+    """
+    out: list[str] = []
+    add = out.append
+    add("-- Роли стенда. Сгенерирован services/billing/seed/build-stand-seed.py вместе")
+    add("-- с сидом биллинга: пользователь партнёра обязан совпадать в двух базах.")
+    add("-- Люди склада выдуманы, настоящих сотрудников на стенде нет.")
+    add("")
+    add("BEGIN;")
+    add("")
+    add("INSERT INTO identity_role_grant (id, user_id, role_code, scope_kind, scope_id, granted_by) VALUES")
+
+    rows = []
+    for name, partner_id, role in [(root[0], root[1], "senior_manager")] + [
+            (name, pid, "account_manager") for name, pid, _ in managers]:
+        rows.append(
+            f"    ({quote(stable('grant', partner_id))}, {quote(user_of(partner_id))}, "
+            f"'{role}', 'partner_branch', {quote(partner_id)}, 'сид стенда')")
+    for role, key in (("admin", "admin"), ("accountant", "accountant"),
+                      ("warehouse_head", "warehouse-head"), ("picker", "picker-1"),
+                      ("picker", "picker-2"), ("receiver", "receiver-1"),
+                      ("logist", "logist-1")):
+        rows.append(
+            f"    ({quote(stable('grant', key))}, {quote(stable('user', key))}, "
+            f"'{role}', 'global', NULL, 'сид стенда')")
+    add(",\n".join(rows))
+    add("ON CONFLICT (id) DO NOTHING;")
+    add("")
+    add("COMMIT;")
+    add("")
+
+    IDENTITY_TARGET.parent.mkdir(parents=True, exist_ok=True)
+    IDENTITY_TARGET.write_text("\n".join(out), encoding="utf-8")
+    print(f"{IDENTITY_TARGET.name}: {len(rows)} выдач ролей")
 
 
 if __name__ == "__main__":

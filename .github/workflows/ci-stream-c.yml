@@ -91,3 +91,44 @@ jobs:
 
       - name: pip-audit
         run: pip-audit -r services/billing/requirements.txt
+
+  identity:
+    name: Identity — роли
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.10-bookworm
+        env:
+          POSTGRES_DB: identity
+          POSTGRES_USER: identity
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+        options: >-
+          --health-cmd "pg_isready -U identity -d identity"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+
+      - name: Миграция дополняющая и повторяемая
+        env:
+          DATABASE_URL: postgresql://identity:ci-only-not-a-secret@127.0.0.1:5432/identity
+          MIGRATIONS_DIR: services/identity/migrations
+        run: |
+          # Дважды подряд: миграция накатывается на чужую базу поверх, и
+          # повторный запуск не имеет права ничего сломать.
+          bash infrastructure/stand/scripts/migrate.sh
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f services/identity/migrations/001_roles.sql
+
+      - run: pip install --no-cache-dir -r services/identity/requirements.txt pytest pip-audit
+
+      - name: pytest
+        working-directory: services/identity
+        env:
+          APP_ENV: test
+          IDENTITY_TEST_DATABASE_URL: postgresql://identity:ci-only-not-a-secret@127.0.0.1:5432/identity
+        run: python -m pytest -q
+
+      - name: pip-audit
+        run: pip-audit -r services/identity/requirements.txt
