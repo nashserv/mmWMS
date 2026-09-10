@@ -1,0 +1,185 @@
+# Стенд потока 0. Сервер 151.245.140.225 (приложение F мастера).
+#
+# Поднимается одной командой: docker compose up -d
+#
+# Первым стартует token-guard. Пока он не завершится успешно, ни один сервис
+# не поднимется — проверка на живые токены WB встроена в поднятие, а не
+# оставлена на память (раздел 12 мастера, пункт 6 файла 01).
+#
+# Боевой контур 91.108.239.175 этот файл не трогает никак. Только чтение,
+# и только вручную при снятии дампа (см. scripts/dump-from-prod.sh).
+
+name: mmx-stand
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+
+  # ------------------------------------------------------------------ ворота
+  token-guard:
+    image: debian:bookworm-slim
+    restart: "no"
+    volumes:
+      - ./scripts/check-no-live-tokens.sh:/check.sh:ro
+      - ./dump:/scan/dump:ro
+      - ./env:/scan/env:ro
+    entrypoint: ["/bin/bash", "/check.sh", "/scan/dump", "/scan/env"]
+
+  # ------------------------------------------------------------------ хранилища
+  postgres:
+    image: postgres:16.10-bookworm
+    <<: *restart
+    depends_on:
+      token-guard: {condition: service_completed_successfully}
+    environment:
+      POSTGRES_DB: wms
+      POSTGRES_USER: wms
+      # Пароль стенда, не боевой. Живых секретов на стенде нет вовсе.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/create-databases.sh:/docker-entrypoint-initdb.d/10-create-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wms -d wms"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports: ["127.0.0.1:5432:5432"]
+
+  rabbitmq:
+    image: rabbitmq:4.1.2-management
+    <<: *restart
+    depends_on:
+      token-guard: {condition: service_completed_successfully}
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-mmx}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-stand-only-change-me}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    ports: ["127.0.0.1:5672:5672", "127.0.0.1:15672:15672"]
+
+  # Топология шины заводится шагом, а не файлом определений: определения
+  # загружаются раньше создания пользователя и падают с {no_such_user},
+  # а чинить это пришлось бы хешем пароля в репозитории.
+  rabbitmq-init:
+    image: curlimages/curl:8.11.1
+    restart: "no"
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+    environment:
+      RABBITMQ_USER: ${RABBITMQ_USER:-mmx}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ./scripts/rabbitmq-init.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+
+  # ------------------------------------------------------------------ миграции
+  migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/wms
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/wms/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # ------------------------------------------------------------------ сервисы
+  wms:
+    build:
+      context: ../../services/wms
+    <<: *restart
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+      rabbitmq-init: {condition: service_completed_successfully}
+    environment:
+      APP_ENV: development
+      # Заглушка обязана заявлять о себе явно. Поток A снимает флаг вместе с mock.
+      WMS_MOCK: "true"
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/wms
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+      MMX_EVENTS_EXCHANGE: mmx.events
+      MMX_TENANT_ID: mm-express
+      WB_SIMULATOR_URL: http://wb-simulator:8090
+      # Формат стикера. Целевой zplv (раздел 6.6); откат на png, если реальный
+      # принтер не распознает ZPL — раздел 13, вопрос 2 ещё открыт.
+      WB_STICKER_FORMAT: ${WB_STICKER_FORMAT:-zplv}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8080:8080"]
+
+  wb-simulator:
+    build:
+      context: ../../services/wb-simulator
+    <<: *restart
+    depends_on:
+      token-guard: {condition: service_completed_successfully}
+    environment:
+      APP_ENV: development
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wb-simulator,testserver}
+      # Лимит Wildberries: 300 запросов в минуту на кабинет (приложение D).
+      # Симулятор его соблюдает, иначе на стенде не воспроизвести блокировку.
+      WB_RATE_LIMIT_PER_MINUTE: "300"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8090:8090"]
+
+  # ------------------------------------------------------------------ наблюдаемость
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    <<: *restart
+    depends_on:
+      token-guard: {condition: service_completed_successfully}
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.6.1
+    <<: *restart
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-stand-only-change-me}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+
+# ---------------------------------------------------------------------------
+# Сервисы платформы, которые на стенд копируются as-is (пункт 6 файла 01):
+#   fbs-operator-workstation, product-catalog, billing,
+#   portal + portal-read-model + portal-report-worker + portal-frontend,
+#   internal-admin, identity
+#
+# Они не описаны здесь, потому что их исходников нет в этом репозитории —
+# они лежат на боевом сервере в /root/MM-express-final-platform-integration.
+# Порядок подключения описан в README.md, раздел «Сервисы платформы».
+# Каждому из них WMS_ADAPTER направляется на http://wms:8080 вместо Odoo.
+# ---------------------------------------------------------------------------
+
+volumes:
+  postgres-data: {}
+  rabbitmq-data: {}
+  prometheus-data: {}
+  grafana-data: {}
