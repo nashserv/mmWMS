@@ -161,3 +161,76 @@ services:
       timeout: 5s
       retries: 8
     ports: ["127.0.0.1:8083:8081"]
+
+  # ------------------------------------------------------------------ админка
+  internal-admin-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/internal-admin/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  internal-admin:
+    build:
+      context: ../../services/internal-admin
+    <<: *restart
+    depends_on:
+      internal-admin-migrate: {condition: service_completed_successfully}
+      billing: {condition: service_healthy}
+      identity: {condition: service_healthy}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      BILLING_URL: http://billing:8080
+      IDENTITY_URL: http://identity:8080
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8085:8080"]
+
+  # -------------------------------------------------------------- ЛК клиента
+  portal-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/portal/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Зеркала остатка у портала нет: он спрашивает склад при каждом показе.
+  # Именно зеркало кабинета WB и даёт сегодня 3528 единиц при остатке 92.
+  portal:
+    build:
+      context: ../../services/portal
+    <<: *restart
+    depends_on:
+      portal-migrate: {condition: service_completed_successfully}
+      billing: {condition: service_healthy}
+      identity: {condition: service_healthy}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      BILLING_URL: http://billing:8080
+      IDENTITY_URL: http://identity:8080
+      WMS_BASE_URL: http://wms:8080
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8086:8080"]

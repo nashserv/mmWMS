@@ -163,3 +163,55 @@ def test_a_cycle_in_the_manager_tree_is_refused_by_the_database(
         with database.transaction() as cursor:
             cursor.execute("UPDATE partner SET parent_id = %s WHERE id = %s",
                            (stand["manager"], stand["senior"]))
+
+
+def test_reassigning_the_same_partner_the_same_day_is_harmless(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Человек нажал дважды, сеть моргнула — повтор обязан быть безвредным.
+
+    Ограничение «два партнёра на один кабинет в один день» правильное, но
+    падать на нём при повторе онбординга — значит наказывать за надёжность.
+    """
+    admin = Admin(database, wms=None)  # type: ignore[arg-type]
+    first = admin.assign_cabinet(stand["cabinet"], stand["manager"], "account_manager",
+                                 date(2026, 9, 10))
+    again = admin.assign_cabinet(stand["cabinet"], stand["manager"], "account_manager",
+                                 date(2026, 9, 10))
+
+    assert first["id"] == again["id"]
+    assert len(rows(database, "SELECT * FROM cabinet_assignment WHERE cabinet_id = %s "
+                              "AND to_date IS NULL", (stand["cabinet"],))) == 1
+
+
+def test_replacing_a_partner_on_the_same_day_leaves_one_assignment(
+        database: Database, stand: dict[str, Any]) -> None:
+    """У закрепления, начатого сегодня, вчерашних денег нет — заменяем, не плодим."""
+    successor = str(uuid.uuid4())
+    with database.transaction() as cursor:
+        cursor.execute("INSERT INTO partner (id, parent_id, name) VALUES (%s, %s, 'Преемник')",
+                       (successor, stand["senior"]))
+    admin = Admin(database, wms=None)  # type: ignore[arg-type]
+    admin.assign_cabinet(stand["cabinet"], stand["manager"], "account_manager", date(2026, 9, 10))
+    admin.assign_cabinet(stand["cabinet"], successor, "account_manager", date(2026, 9, 10))
+
+    open_now = rows(database, "SELECT partner_id, from_date FROM cabinet_assignment "
+                              "WHERE cabinet_id = %s AND to_date IS NULL", (stand["cabinet"],))
+    assert len(open_now) == 1
+    assert str(open_now[0]["partner_id"]) == successor
+
+
+def test_assigning_behind_a_future_assignment_is_refused(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Молча подвинуть будущего партнёра — значит переписать деньги, которых ещё нет."""
+    from app.repositories import AssignmentConflict
+
+    successor = str(uuid.uuid4())
+    with database.transaction() as cursor:
+        cursor.execute("INSERT INTO partner (id, parent_id, name) VALUES (%s, %s, 'Преемник')",
+                       (successor, stand["senior"]))
+    admin = Admin(database, wms=None)  # type: ignore[arg-type]
+    admin.assign_cabinet(stand["cabinet"], successor, "account_manager", date(2026, 12, 1))
+
+    with pytest.raises(AssignmentConflict, match="задним числом"):
+        admin.assign_cabinet(stand["cabinet"], stand["manager"], "account_manager",
+                             date(2026, 10, 1))

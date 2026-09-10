@@ -140,10 +140,21 @@ def test_when_wms_is_down_onboarding_says_which_step_to_repeat(database: Databas
 
 
 def test_onboarding_twice_does_not_duplicate_the_client(database: Database) -> None:
-    """Повтор — обычное дело: сеть моргнула, человек нажал второй раз."""
+    """Повтор — обычное дело: сеть моргнула, человек нажал второй раз.
+
+    С партнёром, а не без: закрепление кабинета — как раз то место, где
+    повтор в тот же день упирается в ограничение «два партнёра на один день».
+    """
+    partner_id = str(uuid.uuid4())
+    with database.transaction() as cursor:
+        cursor.execute("INSERT INTO partner (id, name) VALUES (%s, 'Зардал')", (partner_id,))
+
     admin = Admin(database, wms=FakeWms())  # type: ignore[arg-type]
     for _ in range(2):
-        admin.onboard(seller_external_id="stand-seller-004", name="ИП Тест 4", inn=None,
-                      contract_reference="ДГ-2026-004", partner_id=None)
+        result = admin.onboard(seller_external_id="stand-seller-004", name="ИП Тест 4", inn=None,
+                               contract_reference="ДГ-2026-004", partner_id=partner_id)
+        assert result["state"] == "ok", result["steps"]
+
     assert len(rows(database, "SELECT * FROM cabinet")) == 1
     assert len(rows(database, "SELECT * FROM billing_contract")) == 1
+    assert len(rows(database, "SELECT * FROM cabinet_assignment")) == 1

@@ -259,11 +259,12 @@ def main() -> None:
     print(f"{TARGET.name}: {len(owners)} кабинетов, {len(account_rows)} кабинетов WB, "
           f"{len(managers) + 1} партнёров")
 
-    write_identity_seed(root, managers)
+    write_identity_seed(root, managers, [seller for _, seller, _, _ in owners])
 
 
 def write_identity_seed(root: tuple[str, str, None],
-                        managers: list[tuple[str, str, str]]) -> None:
+                        managers: list[tuple[str, str, str]],
+                        sellers: list[str]) -> None:
     """Сид ролей стенда.
 
     Партнёру выдаётся роль на ветку — на самого себя как корень. Отсюда и
@@ -296,6 +297,13 @@ def write_identity_seed(root: tuple[str, str, None],
         rows.append(
             f"    ({quote(stable('grant', key))}, {quote(stable('user', key))}, "
             f"'{role}', 'global', NULL, 'сид стенда')")
+    # Владелец на каждый кабинет: без него ЛК клиента показывать некому, а
+    # область роли — единственное, откуда портал узнаёт, чей это кабинет.
+    for seller in sellers:
+        rows.append(
+            f"    ({quote(stable('grant', 'owner-' + seller))}, "
+            f"{quote(stable('user', 'owner-' + seller))}, "
+            f"'owner', 'seller', {quote(seller)}, 'сид стенда')")
     add(",\n".join(rows))
     add("ON CONFLICT (id) DO NOTHING;")
     add("")

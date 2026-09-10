@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import metrics
+from . import repositories as repo
 from .admin import Admin, OnboardingError
 from .config import app_environment, database_url, trusted_hosts
 from .db import Database
@@ -172,6 +173,8 @@ async def assign_cabinet(cabinet_id: str, request: Request) -> JSONResponse:
         assignment = admin.assign_cabinet(
             cabinet_id, str(body.get("partner_id")), str(body.get("role", "account_manager")),
             as_date(body.get("from_date"), date.today()), comment=body.get("comment"))
+    except repo.AssignmentConflict as error:
+        return ok({"error": str(error)}, 409)
     except ValueError as error:
         return ok({"error": str(error)}, 400)
     return ok({"assignment": assignment}, 201)
@@ -197,6 +200,8 @@ async def onboard(request: Request) -> JSONResponse:
             from_date=as_date(body.get("from_date"), date.today()))
     except KeyError as error:
         return ok({"error": f"не хватает поля {error}"}, 400)
+    except repo.AssignmentConflict as error:
+        return ok({"error": str(error)}, 409)
     except (OnboardingError, ValueError) as error:
         return ok({"error": str(error)}, 400)
     return ok(result, 201 if result["state"] == "ok" else 202)

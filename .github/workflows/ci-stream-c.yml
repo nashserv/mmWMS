@@ -132,3 +132,47 @@ jobs:
 
       - name: pip-audit
         run: pip-audit -r services/identity/requirements.txt
+
+  screens:
+    name: Админка и ЛК клиента
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.10-bookworm
+        env:
+          POSTGRES_DB: screens
+          POSTGRES_USER: screens
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+        options: >-
+          --health-cmd "pg_isready -U screens -d screens"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22"}
+
+      - name: Фронт разбирается
+        run: |
+          # Ванильный JS без сборки (раздел 2.2) — значит, синтаксис некому
+          # проверить, кроме браузера. Проверяем здесь.
+          node --check services/internal-admin/static/app.js
+          node --check services/portal/static/app.js
+
+      - run: pip install --no-cache-dir -r services/internal-admin/requirements.txt pytest
+
+      - name: pytest админки
+        working-directory: services/internal-admin
+        env:
+          APP_ENV: test
+          ADMIN_TEST_DATABASE_URL: postgresql://screens:ci-only-not-a-secret@127.0.0.1:5432/screens
+        run: python -m pytest -q
+
+      - name: pytest ЛК клиента
+        working-directory: services/portal
+        env:
+          APP_ENV: test
+          PORTAL_TEST_DATABASE_URL: postgresql://screens:ci-only-not-a-secret@127.0.0.1:5432/screens
+        run: python -m pytest -q

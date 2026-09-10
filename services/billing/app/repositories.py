@@ -144,19 +144,53 @@ def subtree_ids(cursor: Cursor, root_partner_id: str) -> list[str]:
     return [str(row["partner_id"]) for row in cursor.fetchall()]
 
 
+class AssignmentConflict(RuntimeError):
+    """Закрепление позади уже заведённого будущего — это не история, а путаница."""
+
+
 def assign_cabinet(cursor: Cursor, cabinet_id: str, partner_id: str, role: str,
                    from_date: date, *, comment: str | None = None) -> dict[str, Any]:
     """Закрепляет кабинет за партнёром, закрывая предыдущее закрепление.
 
     Закрытие — не UPDATE поля, а конец периода: прошлые месяцы обязаны
     считаться по тому партнёру, который вёл кабинет тогда.
+
+    Три случая, и все три встречаются в жизни:
+
+    1. **Тот же партнёр с той же или более ранней даты** — делать нечего.
+       Повторный онбординг (человек нажал дважды, сеть моргнула) обязан быть
+       безвредным, а не падать на ограничении базы.
+    2. **Другой партнёр с более поздней даты** — обычная передача: старое
+       закрепление закрывается этой датой, новое начинается с неё.
+    3. **Другой партнёр с той же даты** — у старого закрепления нет ни одного
+       прошедшего дня, тарифицировать по нему было нечего. Заменяем, а не
+       плодим второе: два партнёра на один день — два счёта на одну операцию.
+
+    Закрепление задним числом позади уже заведённого будущего — отказ: молча
+    подвинуть будущего партнёра значит переписать деньги, которых ещё нет.
     """
     cursor.execute(
         """
-        UPDATE cabinet_assignment SET to_date = %s
-         WHERE cabinet_id = %s AND role = %s AND to_date IS NULL AND from_date < %s
+        SELECT * FROM cabinet_assignment
+         WHERE cabinet_id = %s AND role = %s AND to_date IS NULL
+         ORDER BY from_date DESC LIMIT 1
         """,
-        (from_date, cabinet_id, role, from_date))
+        (cabinet_id, role))
+    current = cursor.fetchone()
+
+    if current is not None:
+        if str(current["partner_id"]) == str(partner_id) and current["from_date"] <= from_date:
+            return current
+        if current["from_date"] > from_date:
+            raise AssignmentConflict(
+                f"кабинет уже закреплён с {current['from_date']}, а закрепление просят "
+                f"с {from_date}: задним числом позади будущего закрепления не ставим")
+        if current["from_date"] == from_date:
+            cursor.execute("DELETE FROM cabinet_assignment WHERE id = %s", (current["id"],))
+        else:
+            cursor.execute("UPDATE cabinet_assignment SET to_date = %s WHERE id = %s",
+                           (from_date, current["id"]))
+
     cursor.execute(
         """
         INSERT INTO cabinet_assignment (id, cabinet_id, partner_id, role, from_date, comment)
