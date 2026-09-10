@@ -1,0 +1,19 @@
+# Цель опроса — рабочее место. Поток B.
+#
+# Фрагмент для `scrape_configs` стенда: поток 0 владеет
+# `infrastructure/stand/prometheus/prometheus.yml`, поэтому правка туда идёт
+# заявкой, а не прямым редактированием чужого файла (правило 9.5.1).
+# Полностью — docs/stream-b-requests.md, заявка 3.
+
+- job_name: workstation
+  metrics_path: /metrics
+  static_configs:
+    - targets: ["workstation:8080"]
+
+# Агент печати отдаёт время записи в устройство — то единственное число,
+# которое не измерить снаружи станции. На стенде агент один; в бою их пять,
+# по одному на рабочее место (решение владельца 14).
+- job_name: workstation-print-agent
+  metrics_path: /
+  static_configs:
+    - targets: ["workstation-agent:8091"]

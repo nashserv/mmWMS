@@ -1,0 +1,217 @@
+# Алерты рабочего места. Поток B.
+#
+# Главный урок боевого контура: мониторинг следил за портами, а не за работой
+# (раздел 3.5 мастера). Четыре воркера стояли `Up` с зелёным healthcheck и
+# нулём строк лога, `dead_letters` был пуст при регулярных потерях заданий.
+#
+# Поэтому здесь нет ни одного правила вида «процесс жив». Каждое правило
+# отвечает на вопрос «делается ли работа» и ссылается на инвариант раздела 8
+# или на критерий раздела 10.
+
+groups:
+
+  - name: workstation-workers
+    rules:
+      # Инвариант 14: молчащий воркер считается сломанным.
+      #
+      # Ноль обработанных единиц сам по себе — не поломка: очередь бывает
+      # пустой. Поломка — это ноль обработанных при живом цикле, который
+      # обязан хотя бы раз в минуту сходить и посмотреть. Поэтому смотрим не на
+      # обработанные задания, а на то, что воркер вообще делал шаг.
+      - alert: WorkstationWorkerSilent
+        expr: |
+          time() - max by (worker) (mmx_workstation_worker_last_processed_unixtime) > 900
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Воркер {{ $labels.worker }} не сделал ни шага за 15 минут"
+          description: >-
+            Ни одной обработанной единицы и ни одного холостого прохода. Именно
+            так молчали gateway-sync-worker, gateway-command-worker,
+            catalog-stock-worker и workstation-inbox-consumer — при зелёном
+            healthcheck. Проверять работу, а не порт.
+
+      - alert: WorkstationPollerDown
+        expr: mmx_workstation_worker_up{worker="task_poller"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Опросчик заданий остановлен"
+          description: >-
+            Опрос /tasks/pull — единственный источник истины рабочего места
+            (раздел 6.1). Пока он стоит, экран показывает вчерашний день, а
+            новые задания не появляются вовсе.
+
+      - alert: WorkstationPollsFailing
+        expr: |
+          sum(rate(mmx_workstation_polls_total{outcome!="ok"}[5m]))
+            / sum(rate(mmx_workstation_polls_total[5m])) > 0.2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Больше пятой части опросов не проходит"
+          description: >-
+            Задания доезжают до экрана с задержкой или не доезжают. Проверить
+            доступность wms и сеть между ним и рабочим местом.
+
+  - name: workstation-full-path
+    rules:
+      # Полный путь задания: сколько ждёт в wms → сколько на экране.
+      # Расхождение между соседними числами — это «новые заказы иногда не
+      # падают в приложение», выраженное числом. Раньше его никто не считал.
+      - alert: WorkstationTasksStuckInWms
+        expr: |
+          (mmx_workstation_tasks_available_in_wms
+            - sum(mmx_workstation_tasks_on_screen)) > 5
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "В wms ждёт заданий больше, чем видно на экране: {{ $value }}"
+          description: >-
+            Между складом и экраном образовалась дыра. Цель раздела 10 — ноль
+            заданий, потерянных между WB и экраном, за неделю.
+
+      # Критерий раздела 10: задержка WB → экран меньше 5 секунд, p99.
+      - alert: WorkstationTaskVisibleDelayHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(mmx_workstation_task_visible_delay_seconds_bucket[10m]))) > 5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p99 задержки «задание в wms → задание на экране» выше 5 секунд"
+          description: >-
+            Сборщик узнаёт о задании позже, чем должен. Проверить период опроса
+            (WORKSTATION_POLL_INTERVAL_MS) и время ответа /tasks/pull.
+
+      # Инвариант 10: расхождение с WB будит человека, а не пишется тихо.
+      - alert: WorkstationTasksDiverged
+        expr: mmx_workstation_tasks_diverged > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Заданий с расхождением статуса: {{ $value }}"
+          description: >-
+            Наш статус не сходится со статусом Wildberries. В боевом контуре
+            таких заданий 2467 из 6374, и все они молчали.
+
+  - name: workstation-printing
+    rules:
+      # Критерий раздела 10: от нажатия «печать» до записи в устройство
+      # меньше 50 мс, до движения головки — меньше 300 мс.
+      - alert: WorkstationPrintSlowToAgent
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(mmx_workstation_print_click_to_agent_seconds_bucket[10m]))) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p99 «нажатие → агент» выше 50 мс"
+          description: >-
+            На агента и принтер не остаётся бюджета. Проверить, что стикер
+            берётся из локального хранилища, а не запрашивается у WB
+            (инвариант 9).
+
+      - alert: WorkstationPrintSlowInDevice
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(mmx_workstation_print_agent_write_seconds_bucket[10m]))) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p99 записи в устройство выше 50 мс"
+          description: >-
+            Похоже на печать через графический драйвер и спулер вместо RAW.
+            Агент обязан писать WritePrinter с типом данных "RAW".
+
+      - alert: WorkstationPrintAgentMissing
+        expr: mmx_workstation_print_agents_connected == 0
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Ни одного подключённого агента печати"
+          description: >-
+            Печатать некуда: стикер получен, но в принтер он не уедет.
+            Принтеры USB, агент на каждом рабочем месте (решение владельца 14).
+
+      - alert: WorkstationReprintShareHigh
+        expr: |
+          sum(rate(mmx_workstation_prints_total{outcome="ok"}[1h])) > 0
+          and
+          sum(rate(mmx_workstation_prints_total{outcome="failed"}[1h]))
+            / sum(rate(mmx_workstation_prints_total[1h])) > 0.05
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Больше 5 % печатей не доходит до принтера"
+          description: >-
+            Доля неудачных печатей — метрика качества принтера и связи с
+            агентом. Смотреть журнал workstation_print_job: там причина.
+
+  - name: workstation-quality
+    rules:
+      # Контрольный скан — главный рубеж качества процесса (раздел 4).
+      # Всплеск отказов означает, что со стеллажей регулярно берут не то.
+      - alert: WorkstationControlScanRejections
+        expr: |
+          sum(increase(mmx_workstation_scans_total{stage="control",scan_result!="ok"}[1h])) > 5
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Контрольный скан отклонил {{ $value }} упаковок за час"
+          description: >-
+            Рубеж работает, но ошибок на подборе много. Смотреть журнал
+            workstation_scan: там видно, кто и на каком адресе берёт не то.
+
+      # Ноль сессий при непустой очереди — это боевой контур: одна запись
+      # workstation_pick_session на 6497 заданий.
+      - alert: WorkstationPickingNotUsed
+        expr: |
+          mmx_workstation_pick_sessions_open == 0
+          and mmx_workstation_tasks_available_in_wms > 10
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Очередь есть, а сессий подбора нет"
+          description: >-
+            Либо смена стоит, либо подбор идёт мимо системы. Второе — ровно то
+            состояние, из которого выводим: доля заданий с полным циклом в
+            приложении около 12 %, цель выше 95 %.
+
+      # Расхождение с замороженным контрактом. Не авария, но и не норма:
+      # прочитанное по запасной форме однажды перестанет читаться вовсе.
+      - alert: WorkstationContractDrift
+        expr: |
+          sum(increase(mmx_workstation_contract_fallbacks_total[1h])) > 0
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "wms отвечает не по контракту: {{ $value }} чтений по запасной форме за час"
+          description: >-
+            Поле {{ $labels.field }} маршрута {{ $labels.route }} прочитано
+            запасным путём. Контракт меняется только потоком 0 (правило 9.5.2):
+            либо сервис привести к контракту, либо контракт к жизни.
+
+  - name: workstation-service
+    rules:
+      - alert: WorkstationNotReady
+        expr: mmx_service_ready{service="fbs_operator_workstation"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Рабочее место не готово"
+          description: >-
+            Готовность определяется прохождением опроса, а не открытым портом.
+            Выключенная шина на готовность не влияет — склад от неё не зависит.
+
+      - alert: WorkstationStoreUnavailable
+        expr: |
+          sum(increase(mmx_workstation_store_errors_total[15m])) > 10
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Записи рабочего места не доходят до базы"
+          description: >-
+            Смена продолжается (экран и подбор от базы не зависят), но сессии,
+            сканы и причины отмен не сохраняются. Молчаливая потеря записи —
+            это те самые 2645 отмен без причины.
