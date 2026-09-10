@@ -37,6 +37,8 @@ log = logging.getLogger("wms.wb_reconcile")
 INTERVAL = float(os.getenv("WB_RECONCILE_INTERVAL_SECONDS", "60"))
 ACCOUNTS_PER_TICK = int(os.getenv("WB_RECONCILE_ACCOUNTS_PER_TICK", "4"))
 PAGE = int(os.getenv("WB_RECONCILE_PAGE", "1000"))
+# Ежедневный отчёт расхождений по owner × sku (раздел 11, шаг 2).
+REPORT_INTERVAL = float(os.getenv("WB_RECONCILE_REPORT_SECONDS", "86400"))
 
 
 class WbReconcileWorker:
@@ -50,6 +52,9 @@ class WbReconcileWorker:
         # навсегда — и сверка уходит в бесконечный цикл, выбирая общий лимит
         # кабинета и лишая вызовов опрос заданий.
         self._next_allowed: dict[Any, float] = {}
+        # Первый отчёт — сразу после старта: если расхождения уже накопились,
+        # узнать об этом надо не через сутки.
+        self._next_report = 0.0
 
     def tick(self) -> int:
         with self._pool.connection() as connection:
@@ -64,6 +69,9 @@ class WbReconcileWorker:
         for account in due:
             self._next_allowed[account["id"]] = time.monotonic() + INTERVAL
         self._refresh_gauge()
+        if time.monotonic() >= self._next_report:
+            self._report()
+            self._next_report = time.monotonic() + REPORT_INTERVAL
         return checked
 
     def _reconcile(self, account: dict[str, Any]) -> int:
@@ -107,6 +115,29 @@ class WbReconcileWorker:
                       account["external_id"], len(diverged), diverged[0][0],
                       diverged[0][1], diverged[0][2])
         return checked
+
+    def _report(self) -> None:
+        """Отчёт расхождений по владельцу и товару — то, что читают в shadow.
+
+        Раздел 11, шаг 2: `wms` строит свою таблицу заданий рядом с боевым
+        контуром, и ежедневный отчёт показывает, сходятся ли они. Отчёт идёт в
+        лог и в метрику: отдельного места для него в контракте нет, а копить
+        расхождения молча — ровно то, что делал боевой контур.
+        """
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                lines = repo.divergence_report(cursor)
+        if not lines:
+            log.info("сверка: расхождений с Wildberries нет")
+            return
+        total = sum(int(line["tasks"]) for line in lines)
+        log.error("сверка: расхождений с WB %d по %d парам владелец × товар",
+                  total, len(lines))
+        for line in lines[:20]:
+            log.error("  %s / %s: %s у нас против %s у WB — заданий %d, старшему с %s",
+                      line["seller_external_id"], line["barcode"] or "—",
+                      line["state"], line["wb_status"] or "—", int(line["tasks"]),
+                      line["oldest"])
 
     def _refresh_gauge(self) -> None:
         with self._pool.connection() as connection:
