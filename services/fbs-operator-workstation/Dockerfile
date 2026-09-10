@@ -7,6 +7,10 @@ COPY requirements.txt requirements-bus.txt ./
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* \
  && pip install --no-cache-dir -r requirements-bus.txt
 COPY --chown=65532:65532 app ./app
+# Агент печати ездит в том же образе. На складе он запускается на самом ПК
+# рядом с USB-принтером, но на стенде поднимается контейнером ради телеметрии
+# записи в устройство — без неё шаг 10 прогона проверить нечем.
+COPY --chown=65532:65532 agent ./agent
 EXPOSE 8080
 USER 65532:65532
 CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8080"]
