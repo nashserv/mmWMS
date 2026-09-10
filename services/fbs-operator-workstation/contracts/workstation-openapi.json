@@ -1,0 +1,1863 @@
+{
+  "components": {
+    "schemas": {
+      "BarcodeLookup": {
+        "properties": {
+          "picklist_barcode": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Picklist Barcode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "picklist_barcode"
+        ],
+        "title": "BarcodeLookup",
+        "type": "object"
+      },
+      "BoxSubmit": {
+        "properties": {
+          "actor_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Id"
+          },
+          "barcode": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Barcode",
+            "type": "string"
+          },
+          "cell_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cell Address"
+          },
+          "comment": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Comment",
+            "type": "string"
+          },
+          "counted": {
+            "default": false,
+            "title": "Counted",
+            "type": "boolean"
+          },
+          "product_barcode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Barcode"
+          },
+          "quantity": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "seller_external_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Seller External Id",
+            "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequence"
+          },
+          "total_boxes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Boxes"
+          }
+        },
+        "required": [
+          "barcode",
+          "seller_external_id",
+          "comment"
+        ],
+        "title": "BoxSubmit",
+        "type": "object"
+      },
+      "CancelCommand": {
+        "properties": {
+          "actor_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "comment": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Comment",
+            "type": "string"
+          },
+          "handed_over": {
+            "default": false,
+            "title": "Handed Over",
+            "type": "boolean"
+          },
+          "reason_code": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "reason_code",
+          "comment",
+          "actor_id"
+        ],
+        "title": "CancelCommand",
+        "type": "object"
+      },
+      "CountSubmit": {
+        "properties": {
+          "actor_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Id"
+          },
+          "lines": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Lines",
+            "type": "array"
+          },
+          "reference": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reference",
+            "type": "string"
+          },
+          "scope": {
+            "default": "partial",
+            "title": "Scope",
+            "type": "string"
+          },
+          "seller_external_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Seller External Id",
+            "type": "string"
+          },
+          "warehouse_code": {
+            "default": "RUM",
+            "title": "Warehouse Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "seller_external_id",
+          "reference",
+          "lines"
+        ],
+        "title": "CountSubmit",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "PackCommand": {
+        "properties": {
+          "actor_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "box_barcode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Box Barcode"
+          },
+          "control_barcode": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Control Barcode",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "station_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Station Id"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "control_barcode",
+          "actor_id"
+        ],
+        "title": "PackCommand",
+        "type": "object"
+      },
+      "PrintCommand": {
+        "properties": {
+          "actor_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Id"
+          },
+          "copies": {
+            "default": 1,
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Copies",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "reprint": {
+            "default": false,
+            "title": "Reprint",
+            "type": "boolean"
+          },
+          "station_id": {
+            "minLength": 1,
+            "title": "Station Id",
+            "type": "string"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "station_id"
+        ],
+        "title": "PrintCommand",
+        "type": "object"
+      },
+      "ProbeCommand": {
+        "properties": {
+          "station_id": {
+            "minLength": 1,
+            "title": "Station Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "station_id"
+        ],
+        "title": "ProbeCommand",
+        "type": "object"
+      },
+      "ProbeConfirm": {
+        "properties": {
+          "confirmed_format": {
+            "pattern": "^(zplv|zplh|tspl|png)$",
+            "title": "Confirmed Format",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "station_id": {
+            "minLength": 1,
+            "title": "Station Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "station_id",
+          "confirmed_format"
+        ],
+        "title": "ProbeConfirm",
+        "type": "object"
+      },
+      "ReceiptSubmit": {
+        "properties": {
+          "actor_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Id"
+          },
+          "lines": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Lines",
+            "type": "array"
+          },
+          "reference": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reference",
+            "type": "string"
+          },
+          "seller_external_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Seller External Id",
+            "type": "string"
+          },
+          "seller_inn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seller Inn"
+          },
+          "seller_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seller Name"
+          },
+          "warehouse_code": {
+            "default": "RUM",
+            "title": "Warehouse Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "seller_external_id",
+          "reference",
+          "lines"
+        ],
+        "title": "ReceiptSubmit",
+        "type": "object"
+      },
+      "ScanCommand": {
+        "properties": {
+          "actor_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "barcode": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Barcode",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "station_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Station Id"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "barcode",
+          "actor_id"
+        ],
+        "title": "ScanCommand",
+        "type": "object"
+      },
+      "ScreenQuery": {
+        "properties": {
+          "limit": {
+            "default": 50,
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "owner_external_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner External Id"
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference"
+          }
+        },
+        "title": "ScreenQuery",
+        "type": "object"
+      },
+      "SessionStart": {
+        "properties": {
+          "actor_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "owner_external_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner External Ids"
+          },
+          "station_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Station Id"
+          }
+        },
+        "required": [
+          "actor_id"
+        ],
+        "title": "SessionStart",
+        "type": "object"
+      },
+      "SheetQuery": {
+        "properties": {
+          "barcodes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Barcodes"
+          },
+          "cell_addresses": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cell Addresses"
+          },
+          "scope": {
+            "default": "partial",
+            "title": "Scope",
+            "type": "string"
+          },
+          "seller_external_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Seller External Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "seller_external_id"
+        ],
+        "title": "SheetQuery",
+        "type": "object"
+      },
+      "ShelfCommand": {
+        "properties": {
+          "actor_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "box_barcode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Box Barcode"
+          },
+          "cell_address": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Cell Address",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "cell_address",
+          "actor_id"
+        ],
+        "title": "ShelfCommand",
+        "type": "object"
+      },
+      "ShipmentCommand": {
+        "properties": {
+          "action": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Action",
+            "type": "string"
+          },
+          "handed_over_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Handed Over By"
+          },
+          "seller_external_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Seller External Id",
+            "type": "string"
+          },
+          "task_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Ids"
+          },
+          "wb_supply_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wb Supply Id"
+          }
+        },
+        "required": [
+          "seller_external_id",
+          "action"
+        ],
+        "title": "ShipmentCommand",
+        "type": "object"
+      },
+      "TasksQuery": {
+        "properties": {
+          "assignee": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignee"
+          },
+          "owner_external_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner External Id"
+          },
+          "screen_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screen Status"
+          }
+        },
+        "title": "TasksQuery",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Задания берутся опросом /tasks/pull, а не из шины (раздел 6.1).",
+    "title": "MM-Express — рабочее место сборщика и приёмщика",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "screen_picking__get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Screen Picking"
+      }
+    },
+    "/agent/stats": {
+      "get": {
+        "description": "Телеметрия записи в устройство — `PRINT_AGENT_STATS_URL` шага 10 прогона.\n\nЭто единственное число, которое не может измерить никто снаружи:\n`POST /labels/{task_id}/print` меряется по HTTP, а запись RAW-байтов в\nUSB-принтер — только на станции.",
+        "operationId": "agent_stats_agent_stats_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Agent Stats Agent Stats Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Agent Stats"
+      }
+    },
+    "/api/workstation/v1/cancel": {
+      "post": {
+        "operationId": "cancel_api_workstation_v1_cancel_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel"
+      }
+    },
+    "/api/workstation/v1/inventory/count": {
+      "post": {
+        "operationId": "inventory_count_api_workstation_v1_inventory_count_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CountSubmit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Inventory Count"
+      }
+    },
+    "/api/workstation/v1/inventory/sheet": {
+      "post": {
+        "operationId": "inventory_sheet_api_workstation_v1_inventory_sheet_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SheetQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Inventory Sheet"
+      }
+    },
+    "/api/workstation/v1/pack": {
+      "post": {
+        "description": "Упаковка с контрольным сканом.\n\nОтказ приезжает статусом 409, а не 200 с полем: экран обязан показать\nкрасное и остановиться, а не «показать результат».",
+        "operationId": "pack_api_workstation_v1_pack_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pack"
+      }
+    },
+    "/api/workstation/v1/poll": {
+      "post": {
+        "description": "Опросить немедленно. Нужна экрану после команды и кнопке «обновить».",
+        "operationId": "poll_now_api_workstation_v1_poll_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Poll Now Api Workstation V1 Poll Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Poll Now"
+      }
+    },
+    "/api/workstation/v1/print": {
+      "post": {
+        "operationId": "print_label_api_workstation_v1_print_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrintCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Print Label"
+      }
+    },
+    "/api/workstation/v1/print/probe": {
+      "post": {
+        "description": "Проверить на живом принтере, понимает ли он ZPL.\n\nВопрос 2 раздела 13 мастера закрывается этим вызовом, а не значением по\nумолчанию в конфиге.",
+        "operationId": "print_probe_api_workstation_v1_print_probe_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Print Probe"
+      }
+    },
+    "/api/workstation/v1/print/probe/confirm": {
+      "post": {
+        "description": "Записать, что человек увидел на выходе из принтера.\n\nЭто и есть закрытие вопроса 2 раздела 13 мастера для конкретной станции:\nне «по документации XP-420B умеет ZPL», а «на этой машине вышла вот такая\nэтикетка, дата такая-то».",
+        "operationId": "print_probe_confirm_api_workstation_v1_print_probe_confirm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeConfirm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Print Probe Confirm"
+      }
+    },
+    "/api/workstation/v1/printers": {
+      "post": {
+        "operationId": "printers_api_workstation_v1_printers_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Printers Api Workstation V1 Printers Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Printers"
+      }
+    },
+    "/api/workstation/v1/putaway/box": {
+      "post": {
+        "operationId": "putaway_box_api_workstation_v1_putaway_box_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BoxSubmit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Putaway Box"
+      }
+    },
+    "/api/workstation/v1/putaway/screen": {
+      "post": {
+        "operationId": "putaway_screen_api_workstation_v1_putaway_screen_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Putaway Screen"
+      }
+    },
+    "/api/workstation/v1/receiving/screen": {
+      "post": {
+        "operationId": "receiving_screen_api_workstation_v1_receiving_screen_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Receiving Screen"
+      }
+    },
+    "/api/workstation/v1/receiving/submit": {
+      "post": {
+        "operationId": "receiving_submit_api_workstation_v1_receiving_submit_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReceiptSubmit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Receiving Submit"
+      }
+    },
+    "/api/workstation/v1/return-to-shelf": {
+      "post": {
+        "operationId": "return_to_shelf_api_workstation_v1_return_to_shelf_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShelfCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Return To Shelf"
+      }
+    },
+    "/api/workstation/v1/scan": {
+      "post": {
+        "operationId": "scan_api_workstation_v1_scan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScanCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Scan"
+      }
+    },
+    "/api/workstation/v1/sessions": {
+      "post": {
+        "operationId": "session_start_api_workstation_v1_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionStart"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Start"
+      }
+    },
+    "/api/workstation/v1/sessions/by-barcode": {
+      "post": {
+        "operationId": "session_by_barcode_api_workstation_v1_sessions_by_barcode_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BarcodeLookup"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session By Barcode"
+      }
+    },
+    "/api/workstation/v1/sessions/{session_id}": {
+      "post": {
+        "operationId": "session_view_api_workstation_v1_sessions__session_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session View"
+      }
+    },
+    "/api/workstation/v1/sessions/{session_id}/finish": {
+      "post": {
+        "operationId": "session_finish_api_workstation_v1_sessions__session_id__finish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Finish"
+      }
+    },
+    "/api/workstation/v1/shipping/action": {
+      "post": {
+        "description": "Действия над поставкой, включая подтверждение передачи человеком.",
+        "operationId": "shipping_action_api_workstation_v1_shipping_action_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShipmentCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Shipping Action"
+      }
+    },
+    "/api/workstation/v1/shipping/picked": {
+      "post": {
+        "operationId": "shipping_picked_api_workstation_v1_shipping_picked_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Shipping Picked"
+      }
+    },
+    "/api/workstation/v1/status": {
+      "post": {
+        "description": "Состояние самого рабочего места — для экрана и для человека.",
+        "operationId": "status_api_workstation_v1_status_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Status Api Workstation V1 Status Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status"
+      }
+    },
+    "/api/workstation/v1/supervisor/screen": {
+      "post": {
+        "operationId": "supervisor_screen_api_workstation_v1_supervisor_screen_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Supervisor Screen Api Workstation V1 Supervisor Screen Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Supervisor Screen"
+      }
+    },
+    "/api/workstation/v1/tasks": {
+      "post": {
+        "description": "Очередь для экрана — из проекции, а не из wms.\n\nЭкран обновляется чаще, чем меняется склад; ходить в wms на каждое\nобновление незачем — опросчик уже сходил.",
+        "operationId": "tasks_api_workstation_v1_tasks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TasksQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Tasks Api Workstation V1 Tasks Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tasks"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "description": "Процесс жив. Ничего больше этот ответ не значит — и в этом суть.",
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Healthz Healthz Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Healthz"
+      }
+    },
+    "/inventory": {
+      "get": {
+        "operationId": "screen_inventory_inventory_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Screen Inventory"
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics_endpoint_metrics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Metrics Endpoint"
+      }
+    },
+    "/picklist/{session_id}": {
+      "get": {
+        "description": "Бумажный лист подбора со штрихкодом.\n\nПечатается браузером станции. Штрихкод настоящий (Code 128): лист,\nнайденный через час на складе, возвращается к своей сессии сканером.",
+        "operationId": "picklist_picklist__session_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Picklist"
+      }
+    },
+    "/putaway": {
+      "get": {
+        "operationId": "screen_putaway_putaway_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Screen Putaway"
+      }
+    },
+    "/readyz": {
+      "get": {
+        "description": "Работа делается: опрос проходит, база отвечает.",
+        "operationId": "readyz_readyz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Readyz"
+      }
+    },
+    "/receiving": {
+      "get": {
+        "operationId": "screen_receiving_receiving_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Screen Receiving"
+      }
+    },
+    "/shipping": {
+      "get": {
+        "operationId": "screen_shipping_shipping_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Screen Shipping"
+      }
+    },
+    "/supervisor": {
+      "get": {
+        "operationId": "screen_supervisor_supervisor_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Screen Supervisor"
+      }
+    }
+  }
+}

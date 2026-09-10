@@ -1,6 +1,14 @@
 # MM-Express WMS — мастер-контекст
 
-Версия 1.2 · 10.09.2026 · собран по чтению боевого контура `91.108.239.175` (только чтение) и решениям владельца.
+Версия 1.3 · 10.09.2026 · собран по чтению боевого контура `91.108.239.175` (только чтение) и решениям владельца.
+
+**Что изменилось в 1.3** (интеграция потоков A, B и C, правило 9.5.6):
+- Формула публикации остатка больше не вычитает резерв дважды: `available = good − buffer(sku)`. Раздел 6.2 переводит товар движением `good → reserved`, и `good` зарезервированного уже не содержит.
+- Событие завершённой приёмки `wms.receipt.completed.v1` — приёмку было нечем ни эмитить (инвариант 13), ни тарифицировать (раздел 3.4).
+- `wms.label.attached.v1` несёт владельца: без него стикеровку некому выставить.
+- Форма `wb.orders.processed.v1` зафиксирована: тип числился тарифицируемым, а схемы не было нигде.
+- Три новых маршрута: `/discrepancies` (расхождения вне контекста приёмки), `/warehouse/movements` (история движений по SKU для ЛК), `/catalog/wb-cards` (карточки WB через `wms`, раздел 6.8).
+- Станции не перечисляются маршрутом: их пять, они заводятся сидом при развёртывании. Правило записано в контракт явно.
 
 **Что изменилось в 1.2:**
 - Разгадка 92 единиц: `WORKSTATION_IGNORE_STOCK=true`, резерв дописывается на несуществующий товар. Клапан сохраняем, но делаем видимым.
@@ -352,7 +360,9 @@ Postgres, 2–5 мс. Либо всё, либо ничего. Расхожден
 
 **Ограничитель — только защита от бана.** Лимит Wildberries 300 запросов в минуту на кабинет. При реальных объёмах (около 2 заданий в минуту на все кабинеты) он не сработает никогда. Но массовая приёмка на 500 SKU выпустит 500 вызовов и получит блокировку кабинета — тогда очередь придерживается. В нормальной работе очередь пуста.
 
-Формула публикации: `available = good − reserved − buffer(sku)`. Всегда занижать (инвариант 6).
+Формула публикации: `available = good − buffer(sku)`. Всегда занижать (инвариант 6).
+
+Резерв в формуле не участвует: транзакция раздела 6.2 переводит товар движением `good → reserved`, поэтому `good` в проекции `stock_balance` зарезервированного уже не содержит. До версии 1.3 здесь стояло `good − reserved − buffer`, и резерв вычитался второй раз — при 10 единицах и резерве на 3 в Wildberries уезжало 4 вместо 7. Занижает `buffer`, страховой запас владельца; двойное вычитание резерва было ошибкой переписывания, а не предохранителем, и стоило клиенту продаж.
 
 ### 6.5 Клапан «собрать без остатка» — сохранить, но сделать видимым
 
@@ -544,7 +554,7 @@ SELECT ... FROM wms_task
 4. **Резерв берёт `SELECT … FOR UPDATE`** по ключу `(owner, sku, cell, box)`. Выдача заданий сборщику — `FOR UPDATE SKIP LOCKED`. Время удержания блокировки под 100 мс, измеряется.
 5. **Каждая команда идемпотентна** по внешнему ключу (`wb_order_id`, `idem_key`, `reference`, `return_event_id`). Повтор — тот же ответ, не второе движение.
 6. **Изоляция владельца.** Резерв, скан, отгрузка, инвентаризация не пересекают `owner_id`. Товар без маппинга — `manual_review` с кодом, не остаток.
-7. **В WB публикуется заниженный остаток немедленно:** `available = good − reserved − buffer(sku)`, вызов уходит сразу, без таймеров.
+7. **В WB публикуется заниженный остаток немедленно:** `available = good − buffer(sku)`, вызов уходит сразу, без таймеров. Резерв уже вычтен движением `good → reserved` (раздел 6.2) — вычитать его второй раз значит занижать вдвое.
 8. **Задание доступно рабочему месту сразу после записи в базу**, без публикации события.
 9. **Стикер лежит локально до того, как человек нажал печать.** Формат ZPL (проверить на реальном принтере — раздел 13, вопрос 2). Запрос к WB в момент упаковки запрещён.
 10. **Расхождение с WB — состояние `diverged` и алерт**, а не тихая запись.
@@ -619,7 +629,7 @@ SELECT ... FROM wms_task
 14. RabbitMQ выключен                                                (A, B)
     ASSERT задания продолжают появляться через /tasks/pull
 15. Публикация остатка                                               (A)
-    ASSERT вызов ушёл немедленно после движения, available = good − reserved − buffer
+    ASSERT вызов ушёл немедленно после движения, available = good − buffer
 16. Нагрузка: 10 000 заданий в час                                   (A)
     ASSERT ошибок нет, удержание блокировки p99 < 100 мс
 ```
@@ -722,6 +732,8 @@ Shadow на проде                          ▓▓▓▓▓▓▓▓
 
 **Новое в 1.2:** `wms.stock.shortfall.v1` — сборка без остатка (6.5).
 
+**Новое в 1.3:** `wms.receipt.completed.v1` — завершённая приёмка. Инвариант 13 требует событие на любое физическое движение, а раздел 3.4 числит приёмку среди услуг с тарифом — эмитить и тарифицировать её было нечем. `inventory.movement.recorded.v1` для этого не годится дважды: оно сопровождает почти всякое движение (счёт вышел бы на каждую строку) и требует `order_id`, которого у приёмки нет.
+
 **Склад:** `inventory.movement.recorded.v1` (8), `inventory.stock.updated.v1` (3)
 
 **Wildberries:** `wb.fbs.order.synced.v1` (15), `wb.fbs.order.updated.v1` (11), `wb.fbs-task.received.v1`, `wb.fbs-task.rejected.v1`, `wb.fbs.metadata.submitted.v1`, `wb.label.requested.v1` (4), `wb.supply.adopted.v1`, `wb.supply.shipped.v1` (5), `wb.supply.retired.v1`, `wb.delivery.completed.v1`, `wb.stocks.pushed.v1`, `wb.warehouse.created.v1`, `wb.warehouse.deleted.v1`, `wb.account.connected.v1`, `wb.account.verified.v1`, `wb.account.token-rotated.v1`, `wb.account.disabled.v1`, `wb.lifecycle.step-failed.v1`, `wb.fbs.return.detected.v1` (6), `wb.return.unmatched.v1`
@@ -748,6 +760,11 @@ Shadow на проде                          ▓▓▓▓▓▓▓▓
 | `/labels/{task_id}/print` | отдать локальный ZPL агенту на печать |
 | `/receipts/screen`, `/putaway/screen` | данные для экранов приёмки и размещения |
 | `/wb/accounts`, `/wb/accounts/{id}/verify` | управление кабинетами WB (отдельная роль) |
+| `/discrepancies` | расхождения вне контекста приёмки — у `ledger_short` `receipt_id` пуст (1.3) |
+| `/warehouse/movements` | история движений по SKU за период, для ЛК клиента (1.3) |
+| `/catalog/wb-cards` | карточки Wildberries через `wms`, как требует раздел 6.8 (1.3) |
+
+Станции маршрутом **не перечисляются**: их пять (раздел 4), меняются они не чаще, чем переезжает склад, и заводятся сидом при развёртывании. `station_id` настраивается на самой станции. Правило записано в контракт явно, чтобы рабочее место не ждало маршрута, которого не будет.
 
 ---
 
@@ -837,9 +854,31 @@ return_id : string, pattern ^wb-[0-9a-f-]{36}$
 task_id   : string, uuid
 ```
 
+**LabelAttachedPayload** (`wms.label.attached.v1`) — `owner_id` **обязателен** с версии 1.3. Стикеровка тарифицируется (раздел 3.4), и без владельца биллингу некому её выставить: строка повисает в отчёте с причиной `SELLER_UNKNOWN`. Содержимое этикетки в событие не кладётся — до 10 МБ через шину это не уведомление; ZPL лежит в `wb_label` и отдаётся по `/labels/{task_id}/print`.
+
+**ReceiptCompletedPayload** (`wms.receipt.completed.v1`, новое в 1.3) — обязательны:
+```
+receipt_id         : string, uuid
+owner_id           : string, uuid
+seller_external_id : string
+doc_ref            : string   — receipt.reference, ключ идемпотентности (инвариант 5)
+accepted_qty       : integer ≥ 0 — принято ПО ФАКТУ, не по ожиданию
+occurred_at        : date-time
+sequence           : integer
+```
+Необязательные: `lines_count`, `discrepancies_count`, `warehouse_code`, `actor_id`. Строки в событие не кладутся — их читают по `/receipts/screen`.
+
+**OrdersProcessedPayload** (`wb.orders.processed.v1`, форма зафиксирована в 1.3) — обязательны:
+```
+seller_id   : string   — кабинет клиента, кому выставляется счёт
+orders      : integer ≥ 0 — заказов обработано, ТАРИФИЦИРУЕМОЕ КОЛИЧЕСТВО
+occurred_at : date-time
+```
+Необязательные: `owner_id`, `wb_account_external_id`. Тип числился тарифицируемым в разделе 3.4 (150 ₽ в диагностике раздела 3), но формы не было нигде, и биллинг считал количество единицей как временную меру: при пачке заказов клиент был бы недосчитан во столько раз, сколько заказов в пачке.
+
 **Порядок событий по заданию.** В Odoo-аутбоксе на каждое задание ведётся `sequence`: инкремент под блокировкой строки задания, событие и номер пишутся атомарно. Потребители полагаются на монотонность в пределах задания. **В новой WMS сохранить**: `outbox.sequence` инкрементируется в той же транзакции, что и движение.
 
-**Список `WMS_EVENT_TYPES`** (валидируется при эмиссии): `wms.reservation.succeeded.v1`, `wms.reservation.failed.v1`, `wms.picking.started.v1`, `wms.item.scanned.v1`, `wms.picking.completed.v1`, `wms.packing.completed.v1`, `wms.label.attached.v1`, `wms.returned.to.shelf.v1`, `wms.return.expected.v1`, `wms.return.received.v1`, `wms.return.resellable.v1`, `wms.return.defective.v1`, `wms.order.cancelled.v1`. Расширяется на `wms.stock.shortfall.v1`.
+**Список `WMS_EVENT_TYPES`** (валидируется при эмиссии): `wms.reservation.succeeded.v1`, `wms.reservation.failed.v1`, `wms.picking.started.v1`, `wms.item.scanned.v1`, `wms.picking.completed.v1`, `wms.packing.completed.v1`, `wms.label.attached.v1`, `wms.returned.to.shelf.v1`, `wms.return.expected.v1`, `wms.return.received.v1`, `wms.return.resellable.v1`, `wms.return.defective.v1`, `wms.order.cancelled.v1`. Расширяется на `wms.stock.shortfall.v1` (1.2) и `wms.receipt.completed.v1` (1.3).
 
 ---
 

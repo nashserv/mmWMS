@@ -40,8 +40,19 @@ class Simulator:
             self._orders: list[dict[str, Any]] = []
             self._supplies: dict[str, dict[str, Any]] = {}
             self._stocks: dict[str, dict[str, int]] = {}
+            # Карточки Content API. Раздел 6.8: каталог берёт их через wms,
+            # а токен держит wms (раздел 12), поэтому ходить в Content API
+            # каталогу больше нечем.
+            self._cards: dict[str, list[dict[str, Any]]] = {}
+            self._next_nm_id = 170000001
             self._calls: dict[str, list[float]] = {}
-            self._next_order_id = 900001
+            # Идентификатор заказа не должен повторяться между перезапусками.
+            # Счётчик с фиксированного числа выдавал бы те же номера, что уже
+            # лежат в Postgres от прошлых прогонов, и опросчик отсеивал бы
+            # свежие заказы как уже известные (`known_orders`): задания не
+            # заводятся, остаток не двигается, а шаг 4 краснеет «good не упал».
+            # У настоящего Wildberries номера сквозные, поэтому берём время.
+            self._next_order_id = 900_000_000 + int(time.time()) % 90_000_000
             self._next_supply = 1
 
     # Лимит считается по кабинету, а не глобально: у WB он именно такой.
@@ -55,6 +66,39 @@ class Simulator:
             window.append(now)
             self._calls[account] = window
             return True
+
+    def cards(self, account: str, cursor: int = 0,
+              limit: int = 100) -> tuple[list[dict[str, Any]], int]:
+        """Карточки кабинета страницей. Content API отдаёт их курсором."""
+        with self._lock:
+            rows = self._cards.get(account, [])
+            page = rows[cursor:cursor + limit]
+            return page, cursor + len(page)
+
+    def seed_cards(self, account: str, barcodes: list[str]) -> list[dict[str, Any]]:
+        """Ручка стенда: у настоящего Content API её нет."""
+        with self._lock:
+            known = {row["barcode"] for row in self._cards.get(account, [])}
+            created = []
+            for barcode in barcodes:
+                if barcode in known:
+                    continue
+                card = {
+                    "nmID": self._next_nm_id,
+                    "vendorCode": f"art-{barcode[-6:]}",
+                    "title": f"Товар {barcode[-4:]}",
+                    "brand": "Тестовый бренд",
+                    "subjectName": "Одежда",
+                    # У Wildberries штрихкод лежит в size.skus (раздел 3.2):
+                    # у одной карточки несколько размеров, и вещь на полке
+                    # определяет именно штрихкод, а не артикул.
+                    "sizes": [{"skus": [barcode]}],
+                    "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                self._next_nm_id += 1
+                self._cards.setdefault(account, []).append(card)
+                created.append(card)
+            return created
 
     def seed_orders(self, account: str, count: int, barcode: str,
                     deadline: str | None = None) -> list[dict[str, Any]]:
@@ -80,8 +124,19 @@ class Simulator:
 
     def orders(self, account: str, next_cursor: int) -> tuple[list[dict[str, Any]], int]:
         with self._lock:
-            rows = [o for o in self._orders if o["account"] == account][next_cursor:]
-            return rows, next_cursor + len(rows)
+            rows = [o for o in self._orders if o["account"] == account]
+            # Курсор из прошлой жизни симулятора обнуляем. Симулятор держит
+            # заказы в памяти, а `wb_sync_cursor` лежит в Postgres и переживает
+            # его перезапуск: после `docker compose up --build wb-simulator`
+            # клиент просит «с 185-го», заказов пять, и он навсегда получает
+            # пустой ответ. Настоящий Wildberries память не теряет, поэтому у
+            # него такого не бывает; симулятор существует ради
+            # воспроизводимости стенда, и терять её на своём же перезапуске
+            # ему нельзя.
+            if next_cursor > len(rows):
+                next_cursor = 0
+            page = rows[next_cursor:]
+            return page, next_cursor + len(page)
 
     def create_supply(self, account: str) -> str:
         with self._lock:
@@ -252,6 +307,34 @@ async def seed_orders(request: Request) -> Any:
         barcode=str(body.get("barcode", "2000000000011")),
         deadline=body.get("deadline"))
     return {"created": len(created), "orders": created}
+
+
+@app.post("/content/v2/get/cards/list")
+async def cards_list(request: Request) -> Any:
+    """Карточки кабинета. Форма ответа — как у Content API Wildberries.
+
+    Токен категории «Контент» (приложение D). На стенде не проверяется: живых
+    токенов здесь нет вовсе (раздел 12).
+    """
+    account = _account(request)
+    if (limited := _rate_limited(account)) is not None:
+        return limited
+    body = await request.json()
+    settings = (body.get("settings") or {}).get("cursor") or {}
+    limit = min(int(settings.get("limit") or 100), 1000)
+    offset = int(settings.get("offset") or 0)
+    rows, cursor = simulator.cards(account, offset, limit)
+    return {"cards": rows, "cursor": {"offset": cursor, "total": len(rows)}}
+
+
+# Ручка стенда: у настоящего Content API её нет.
+@app.post("/__stand__/seed-cards")
+async def seed_cards(request: Request) -> Any:
+    body = await request.json()
+    created = simulator.seed_cards(
+        account=str(body.get("account", "default")),
+        barcodes=[str(b) for b in (body.get("barcodes") or [])])
+    return {"created": len(created), "cards": created}
 
 
 @app.post("/__stand__/reset")

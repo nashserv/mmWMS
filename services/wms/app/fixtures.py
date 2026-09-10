@@ -62,29 +62,33 @@ CELLS: list[dict[str, Any]] = [
      "address": "RCV-01", "zone": "RECV", "route_order": None},
 ]
 
+# Имена полей — из BoxProjection контракта, не из головы: клиенты потоков B и C
+# пишутся против заглушки, и её форма становится их формой. `state` обязателен
+# по контракту, и без него `MockState.boxes()` роняла весь список в 500 —
+# заявка 3 потока B и пункт 5 потока C, найдено дважды независимо.
 BOXES: list[dict[str, Any]] = [
     {"box_id": "e0000000-0000-4000-8000-000000000001", "barcode": "BOX-0001",
-     "seller_external_id": "seller-a", "barcode_product": "2000000000011",
-     "cell": "01-02-03", "cell_id": "c0000000-0000-4000-8000-000000000001",
-     "quantity": 42, "counted": True,
+     "owner_external_id": "seller-a", "product_barcode": "2000000000011",
+     "cell_address": "01-02-03", "cell_id": "c0000000-0000-4000-8000-000000000001",
+     "quantity": 42, "counted": True, "state": "stored",
      "comment": "куртки M, верхняя полка у окна"},
     {"box_id": "e0000000-0000-4000-8000-000000000002", "barcode": "BOX-0002",
-     "seller_external_id": "seller-a", "barcode_product": "2000000000028",
-     "cell": "01-02-04", "cell_id": "c0000000-0000-4000-8000-000000000002",
-     "quantity": 17, "counted": True,
+     "owner_external_id": "seller-a", "product_barcode": "2000000000028",
+     "cell_address": "01-02-04", "cell_id": "c0000000-0000-4000-8000-000000000002",
+     "quantity": 17, "counted": True, "state": "stored",
      "comment": "куртки L, нижняя полка, рядом со стойкой 4"},
     {"box_id": "e0000000-0000-4000-8000-000000000003", "barcode": "BOX-0003",
-     "seller_external_id": "seller-b", "barcode_product": "2000000000042",
-     "cell": "01-03-01", "cell_id": "c0000000-0000-4000-8000-000000000003",
-     "quantity": 8, "counted": True,
+     "owner_external_id": "seller-b", "product_barcode": "2000000000042",
+     "cell_address": "01-03-01", "cell_id": "c0000000-0000-4000-8000-000000000003",
+     "quantity": 8, "counted": True, "state": "stored",
      "comment": "платья S, синяя коробка с наклейкой"},
     # Коробка стоит на полке, а по учёту в ней ноль — ровно тот случай, ради
     # которого держат клапан раздела 6.5. Расхождение обязано быть адресным,
     # поэтому у сборки без остатка есть ячейка, а не NULL.
     {"box_id": "e0000000-0000-4000-8000-000000000004", "barcode": "BOX-0004",
-     "seller_external_id": "seller-a", "barcode_product": "2000000000035",
-     "cell": "01-03-02", "cell_id": "c0000000-0000-4000-8000-000000000004",
-     "quantity": 0, "counted": False,
+     "owner_external_id": "seller-a", "product_barcode": "2000000000035",
+     "cell_address": "01-03-02", "cell_id": "c0000000-0000-4000-8000-000000000004",
+     "quantity": 0, "counted": False, "state": "stored",
      "comment": "ботинки 39, дальний стеллаж — учёт расходится с полкой"},
 ]
 

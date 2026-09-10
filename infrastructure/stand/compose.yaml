@@ -1,6 +1,11 @@
-# Стенд потока 0. Сервер 151.245.140.225 (приложение F мастера).
+# Стенд. Сервер 151.245.140.225 (приложение F мастера).
 #
 # Поднимается одной командой: docker compose up -d
+#
+# После слияния потоков A, B и C файл описывает стенд целиком. Наложения
+# compose.stream-c.yaml и compose.workstation.yaml, которыми потоки обходили
+# правило 9.5.1 (общий файл не редактируется), переехали сюда и удалены:
+# два описания одного стенда разъезжаются молча.
 #
 # Первым стартует token-guard. Пока он не завершится успешно, ни один сервис
 # не поднимется — проверка на живые токены WB встроена в поднятие, а не
@@ -13,6 +18,25 @@ name: mmx-stand
 
 x-restart: &restart
   restart: unless-stopped
+
+# Общее окружение сервисов потока C. Перенесено вместе с ними из
+# compose.stream-c.yaml.
+x-billing-env: &billing-env
+  APP_ENV: development
+  DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+  MMX_EVENTS_EXCHANGE: mmx.events
+  MMX_TENANT_ID: mm-express
+  # Контракт wms (приложение B). До готовности потока A на этом адресе стоит
+  # mock потока 0 — правило 9.5.4, никто никого не ждёт.
+  WMS_BASE_URL: http://wms:8080
+  # Кабинет, приехавший событием, а не онбордингом, тарифицируется и помечается
+  # needs_onboarding (см. app/service.py). Выключить — значит терять выручку молча.
+  BILLING_AUTO_ONBOARD: "true"
+  # Кто спрашивает — отвечает identity. Токены биллинг не разбирает: механику
+  # JWT/JWKS поток C не трогает (файл 04).
+  IDENTITY_URL: http://identity:8080
+  TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
 
 services:
 
@@ -93,6 +117,20 @@ services:
       - ../../services/wms/migrations:/migrations:ro
     entrypoint: ["/bin/bash", "/migrate.sh"]
 
+  # Рабочие места. Станций пять (раздел 4), меняются они реже, чем переезжает
+  # склад, поэтому заводятся сидом при развёртывании, а не маршрутом контракта.
+  wms-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ./seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "wms",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stations.sql"]
+
   # ------------------------------------------------------------------ сервисы
   wms:
     build:
@@ -100,12 +138,15 @@ services:
     <<: *restart
     depends_on:
       migrate: {condition: service_completed_successfully}
+      wms-seed: {condition: service_completed_successfully}
       rabbitmq: {condition: service_healthy}
       rabbitmq-init: {condition: service_completed_successfully}
     environment:
       APP_ENV: development
-      # Заглушка обязана заявлять о себе явно. Поток A снимает флаг вместе с mock.
-      WMS_MOCK: "true"
+      # Поток A слит — стенд поднимает настоящий сервис. Заглушка никуда не
+      # делась: тот же образ поднимает её по WMS_MOCK=true, и вернуться к ней
+      # можно переменной, а не пересборкой (правило 9.5.4).
+      WMS_MOCK: ${WMS_MOCK:-false}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
       DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/wms
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
@@ -115,12 +156,76 @@ services:
       # Формат стикера. Целевой zplv (раздел 6.6); откат на png, если реальный
       # принтер не распознает ZPL — раздел 13, вопрос 2 ещё открыт.
       WB_STICKER_FORMAT: ${WB_STICKER_FORMAT:-zplv}
+      # Переключение идёт по одному кабинету, не пачкой (раздел 11, шаг 6).
+      # Пусто — все кабинеты; откат — убрать кабинет из списка.
+      WB_SYNC_ONLY_ACCOUNTS: ${WB_SYNC_ONLY_ACCOUNTS:-}
+      # Секреты только по ссылке, значение токена в переменных не появляется
+      # никогда (инвариант 15).
+      WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
     healthcheck:
+      # Готовность — доступность базы, а не «процесс жив». Мониторинг, следящий
+      # за портом вместо работы, — раздел 3.5.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
       interval: 10s
       timeout: 5s
       retries: 12
     ports: ["127.0.0.1:8080:8080"]
+
+  # Воркеры wms. Вынесены в отдельные процессы намеренно (раздел 12): упал
+  # опрос Wildberries — приёмка, подбор и инвентаризация продолжают работать.
+  # Общий процесс такой изоляции не даёт.
+
+  # Опрос Wildberries. Заменяет gateway-sync-worker вместе с очередью, которая
+  # за ним стояла (раздел 6.3).
+  wms-wb-sync: &wms-worker
+    build:
+      context: ../../services/wms
+    <<: *restart
+    depends_on:
+      wms: {condition: service_healthy}
+    environment: &wms-worker-env
+      APP_ENV: development
+      WMS_MOCK: ${WMS_MOCK:-false}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/wms
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+      MMX_EVENTS_EXCHANGE: mmx.events
+      MMX_TENANT_ID: mm-express
+      WB_SIMULATOR_URL: http://wb-simulator:8090
+      WB_STICKER_FORMAT: ${WB_STICKER_FORMAT:-zplv}
+      WB_SYNC_ONLY_ACCOUNTS: ${WB_SYNC_ONLY_ACCOUNTS:-}
+      WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
+      # Период опроса кабинета. Полсекунды — это 120 запросов в минуту на
+      # кабинет из 300 разрешённых (приложение D): сорок процентов бюджета
+      # уходит на опрос, и на стикеры, поставки и публикацию остатка остаётся
+      # меньше, чем нужно. Секунда укладывается в критерий раздела 10
+      # («WB → доступность меньше 2 с, p99») с запасом вдвое и оставляет
+      # бюджет работе.
+      WB_SYNC_INTERVAL_SECONDS: ${WB_SYNC_INTERVAL_SECONDS:-1.0}
+    command: ["python", "-m", "app.workers.wb_sync"]
+
+  # Стикеры заранее, пачкой до 100 (раздел 6.6).
+  wms-wb-labels:
+    <<: *wms-worker
+    environment:
+      <<: *wms-worker-env
+    command: ["python", "-m", "app.workers.wb_labels"]
+
+  # Сверка статусов с WB. Читает только GET /api/v3/orders, поэтому работает
+  # и в shadow — там она главный инструмент (раздел 11, шаг 2).
+  wms-wb-reconcile:
+    <<: *wms-worker
+    environment:
+      <<: *wms-worker-env
+    command: ["python", "-m", "app.workers.wb_reconcile"]
+
+  # События из outbox в шину, плюс партиции и ретеншен. На проде
+  # integration_outbox дорос до 136 210 записей без чистки (раздел 3.6).
+  wms-outbox:
+    <<: *wms-worker
+    environment:
+      <<: *wms-worker-env
+    command: ["python", "-m", "app.workers.outbox_publisher"]
 
   wb-simulator:
     build:
@@ -165,6 +270,312 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports: ["127.0.0.1:3000:3000"]
+
+  # ================================================================ поток B
+  # Рабочее место сборщика и приёмщика. Перенесено из
+  # services/fbs-operator-workstation/compose.workstation.yaml (заявка 6
+  # потока B), пути сборки пересчитаны относительно этого файла.
+
+
+  workstation:
+    build:
+      context: ../../services/fbs-operator-workstation
+    restart: unless-stopped
+    depends_on:
+      wms: {condition: service_healthy}
+      workstation-migrate: {condition: service_completed_successfully}
+    environment:
+      APP_ENV: development
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,workstation,testserver}
+
+      # Единственная переменная, которая меняется при переходе с заглушки на
+      # настоящий сервис потока A. Больше ничего править не нужно: контракт
+      # один и тот же (приложение B мастера).
+      WMS_BASE_URL: http://wms:8080
+
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/workstation
+
+      # Шина — ускоритель экрана, не источник истины (раздел 6.1). Убрать эту
+      # строку целиком — законная конфигурация: рабочее место продолжит
+      # работать опросом. Это ровно пункт 14 полного прогона.
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+      MMX_EVENTS_EXCHANGE: mmx.events
+      MMX_TENANT_ID: mm-express
+
+      # Период опроса задаёт худшую задержку «задание в базе wms → задание на
+      # экране» при молчащей шине. Критерий раздела 10 — меньше 5 секунд p99.
+      WORKSTATION_POLL_INTERVAL_MS: ${WORKSTATION_POLL_INTERVAL_MS:-1000}
+      WORKSTATION_POLL_LIMIT: ${WORKSTATION_POLL_LIMIT:-200}
+      WORKSTATION_LEASE_SECONDS: ${WORKSTATION_LEASE_SECONDS:-900}
+    healthcheck:
+      # Проба спрашивает «процесс жив», а не «работа делается»: /readyz честно
+      # отдаёт 503 при непроходящем опросе, и на нём контейнер уходил бы в
+      # рестарт вместо того, чтобы показать проблему. Работу проверяет
+      # Prometheus (observability/prometheus/workstation-alerts.yml).
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8081:8080"]
+
+  workstation-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/workstation
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/fbs-operator-workstation/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Агент печати. На стенде принтера нет, поэтому пишет в файл — но пишет
+  # по-настоящему, с fsync, чтобы измеренное время что-то значило. На складе
+  # агент запускается на самом ПК рядом с USB-принтером, в контейнере ему
+  # делать нечего: до устройства оттуда не дотянуться.
+  workstation-agent:
+    build:
+      context: ../../services/fbs-operator-workstation
+    restart: unless-stopped
+    depends_on:
+      workstation: {condition: service_healthy}
+    command:
+      - python
+      - agent/print_agent.py
+      - --url=ws://workstation:8080/api/workstation/v1/agent
+      - --station-id=${WORKSTATION_STATION_ID:-11111111-1111-4111-8111-111111111111}
+      - --station-name=${WORKSTATION_STATION_NAME:-Станция 1}
+      - --backend=sink
+      - --printer=/tmp/labels
+      - --stats-port=8091
+    environment:
+      APP_ENV: development
+    # Телеметрия записи в устройство: PRINT_AGENT_STATS_URL шага 10 прогона.
+    ports: ["127.0.0.1:8091:8091"]
+
+  # ================================================================ поток C
+  # Деньги и кабинеты. Перенесено из compose.stream-c.yaml как есть.
+
+
+  # ---------------------------------------------------------------- identity
+  # Только роли: механику JWT/JWKS поток C не трогает. Боевой identity живёт на
+  # платформе, его исходников в репозитории нет — миграция дополняющая, а
+  # проверка токена делегируется ему, как только он появится (IDENTITY_UPSTREAM_URL).
+  identity-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/identity/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  identity-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      identity-migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ../../services/identity/seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "identity",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stand-roles.sql"]
+
+  identity:
+    build:
+      context: ../../services/identity
+    <<: *restart
+    depends_on:
+      identity-seed: {condition: service_completed_successfully}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+      # Пусто — на стенде боевого identity нет, и стендовые токены stand:<uuid>
+      # разрешены только потому, что APP_ENV локальный. В защищённой среде
+      # сервис откажет всем, пока адрес не задан.
+      IDENTITY_UPSTREAM_URL: ${IDENTITY_UPSTREAM_URL:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8084:8080"]
+
+  # --------------------------------------------------------------- миграции
+  billing-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      # Скрипт потока 0 переиспользуется как есть: существующие миграции не
+      # переписываются, применение идёт по журналу (правило 9.5).
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/billing/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Сид стенда: партнёры, кабинеты и тарифы поверх тех же продавцов, что уже
+  # посеяны в базе wms (reference/stand-seed). Идемпотентен — ON CONFLICT DO
+  # NOTHING, повторный запуск ничего не меняет.
+  billing-seed:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      billing-migrate: {condition: service_completed_successfully}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+    volumes:
+      - ../../services/billing/seed:/seed:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "billing",
+                 "-v", "ON_ERROR_STOP=1", "-q", "-f", "/seed/stand-billing.sql"]
+
+  # ---------------------------------------------------------------- сервисы
+  billing:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-seed: {condition: service_completed_successfully}
+      identity: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    environment:
+      <<: *billing-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8082:8080"]
+
+  # Хранение по суткам и вынос собственных событий на шину. Хранение приходит
+  # не событием, а кроном: единица — коробко-место × сутки (файл 04), и товар
+  # лежит независимо от того, заказали его или нет.
+  billing-worker:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-seed: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+      rabbitmq-init: {condition: service_completed_successfully}
+    environment:
+      <<: *billing-env
+      METRICS_PORT: "8081"
+      # На стенде считаем чаще суток, чтобы не ждать ночи ради проверки.
+      # Повтор безвреден: event_id вычислим из кабинета и дня.
+      BILLING_STORAGE_INTERVAL_SECONDS: ${BILLING_STORAGE_INTERVAL_SECONDS:-900}
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/metrics', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    ports: ["127.0.0.1:8087:8081"]
+
+  # Инвариант 14: молчащий воркер считается сломанным. Поэтому у консьюмера
+  # свой /metrics — он обязан уметь доказать, что работает, а не просто быть Up.
+  billing-inbox-consumer:
+    build:
+      context: ../../services/billing
+    <<: *restart
+    depends_on:
+      billing-migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+      rabbitmq-init: {condition: service_completed_successfully}
+    environment:
+      <<: *billing-env
+      METRICS_PORT: "8081"
+    command: ["python", "-m", "app.consumer"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/metrics', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    ports: ["127.0.0.1:8083:8081"]
+
+  # ------------------------------------------------------------------ админка
+  internal-admin-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/internal-admin/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  internal-admin:
+    build:
+      context: ../../services/internal-admin
+    <<: *restart
+    depends_on:
+      internal-admin-migrate: {condition: service_completed_successfully}
+      billing: {condition: service_healthy}
+      identity: {condition: service_healthy}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      BILLING_URL: http://billing:8080
+      IDENTITY_URL: http://identity:8080
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8085:8080"]
+
+  # -------------------------------------------------------------- ЛК клиента
+  portal-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/portal/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Зеркала остатка у портала нет: он спрашивает склад при каждом показе.
+  # Именно зеркало кабинета WB и даёт сегодня 3528 единиц при остатке 92.
+  portal:
+    build:
+      context: ../../services/portal
+    <<: *restart
+    depends_on:
+      portal-migrate: {condition: service_completed_successfully}
+      billing: {condition: service_healthy}
+      identity: {condition: service_healthy}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      BILLING_URL: http://billing:8080
+      IDENTITY_URL: http://identity:8080
+      WMS_BASE_URL: http://wms:8080
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports: ["127.0.0.1:8086:8080"]
 
 # ---------------------------------------------------------------------------
 # Сервисы платформы, которые на стенд копируются as-is (пункт 6 файла 01):

@@ -193,6 +193,22 @@ channels:
       envelope:
         $ref: '#/components/messages/wms.stock.shortfall.v1'
 
+  wms.receipt.completed.v1:
+    address: wms.receipt.completed.v1
+    title: Приёмка завершена
+    description: >-
+      Новое в версии 1.3 мастера. Приёмку было нечем ни эмитить, ни тарифицировать:
+      инвариант 13 требует событие на любое физическое движение, а раздел 3.4 числит
+      приёмку среди услуг с тарифом. Ближайшее по смыслу
+      `inventory.movement.recorded.v1` не годится дважды: оно сопровождает почти
+      всякое движение (счёт вышел бы на каждую строку) и требует `order_id`, которого
+      у приёмки нет — приёмка приходит без заказа.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wms.receipt.completed.v1'
+
   wms.picking.started.v1:
     address: wms.picking.started.v1
     title: Подбор начат
@@ -341,7 +357,7 @@ channels:
     address: inventory.stock.updated.v1
     title: Остаток пересчитан
     description: >-
-      Издаётся после каждого движения. `available = good - reserved - buffer`
+      Издаётся после каждого движения. `available = good - buffer`
       и всегда занижается (инвариант 6.4/7). Публикация в WB уходит немедленно,
       без таймеров, — событие лишь уведомляет портал и каталог о том, что уже сделано.
     bindings:
@@ -385,6 +401,21 @@ channels:
     messages:
       envelope:
         $ref: '#/components/messages/wb.supply.shipped.v1'
+
+  wb.orders.processed.v1:
+    address: wb.orders.processed.v1
+    title: Заказы обработаны
+    description: >-
+      Тарифицируемое событие потока C (раздел 3.4) — реальный тип с прода, 150 ₽
+      за месяц в диагностике раздела 3. Формы payload не было нигде до версии 1.3
+      мастера, и биллинг считал количество единицей как временную меру: при пачке
+      заказов клиент был бы недосчитан во столько раз, сколько заказов в пачке.
+      Тарифицируемое количество — `orders`, не единица за событие.
+    bindings:
+      $ref: '#/components/channelBindings/mmxEvents'
+    messages:
+      envelope:
+        $ref: '#/components/messages/wb.orders.processed.v1'
 
   wb.fbs.return.detected.v1:
     address: wb.fbs.return.detected.v1
@@ -447,6 +478,14 @@ operations:
     action: send
     channel:
       $ref: '#/channels/wms.stock.shortfall.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wms-core
+  sendWmsReceiptCompleted:
+    action: send
+    channel:
+      $ref: '#/channels/wms.receipt.completed.v1'
     bindings:
       $ref: '#/components/operationBindings/persistent'
     tags:
@@ -578,6 +617,14 @@ operations:
     action: send
     channel:
       $ref: '#/channels/wb.fbs.order.updated.v1'
+    bindings:
+      $ref: '#/components/operationBindings/persistent'
+    tags:
+      - name: wb-inherited
+  sendWbOrdersProcessed:
+    action: send
+    channel:
+      $ref: '#/channels/wb.orders.processed.v1'
     bindings:
       $ref: '#/components/operationBindings/persistent'
     tags:
@@ -730,6 +777,20 @@ components:
                 const: wms.stock.shortfall.v1
               payload:
                 $ref: '#/components/schemas/StockShortfallPayload'
+
+    wms.receipt.completed.v1:
+      name: wms.receipt.completed.v1
+      title: Приёмка завершена
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wms.receipt.completed.v1
+              payload:
+                $ref: '#/components/schemas/ReceiptCompletedPayload'
 
     wms.picking.started.v1:
       name: wms.picking.started.v1
@@ -982,6 +1043,20 @@ components:
                 const: wb.supply.shipped.v1
               payload:
                 $ref: '#/components/schemas/SupplyShippedPayload'
+
+    wb.orders.processed.v1:
+      name: wb.orders.processed.v1
+      title: Заказы обработаны
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: wb.orders.processed.v1
+              payload:
+                $ref: '#/components/schemas/OrdersProcessedPayload'
 
     wb.fbs.return.detected.v1:
       name: wb.fbs.return.detected.v1
@@ -1655,6 +1730,107 @@ components:
         sequence:
           $ref: '#/components/schemas/OutboxSequence'
 
+    ReceiptCompletedPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        Приёмка завершена. Событие несёт ровно то, чем её тарифицируют и по чему
+        находят документ: чей товар, какая приёмка, сколько принято по факту.
+
+        Количество — `accepted_qty`, фактически принятое, а не ожидавшееся:
+        приёмка с недостачей тарифицируется по тому, что реально легло на полку
+        (шаг 3 полного прогона проверяет, что баланс идёт по факту, а не по
+        ожиданию). Строки в событие не кладутся: их читают по `/receipts/screen`,
+        событие — уведомление, а не способ доставки (раздел 6.1).
+      required:
+        - receipt_id
+        - owner_id
+        - seller_external_id
+        - doc_ref
+        - accepted_qty
+        - occurred_at
+        - sequence
+      properties:
+        receipt_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        doc_ref:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >-
+            `receipt.reference` — внешний ключ идемпотентности приёмки
+            (инвариант 5). По нему начисление сходится с документом склада.
+        accepted_qty:
+          type: integer
+          minimum: 0
+          description: Суммарно принято по факту, по всем строкам документа.
+        lines_count:
+          type: integer
+          minimum: 0
+          description: Сколько строк в приёмке — единица тарифа «за строку», если владелец выберет её вместо штуки.
+        discrepancies_count:
+          type: integer
+          minimum: 0
+          description: >-
+            Сколько строк разошлось с ожиданием. Ноль — приёмка сошлась;
+            больше нуля — есть что разбирать на экране начальника склада.
+        warehouse_code:
+          type: string
+          minLength: 1
+          maxLength: 32
+        occurred_at:
+          type: string
+          format: date-time
+        actor_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        sequence:
+          $ref: '#/components/schemas/OutboxSequence'
+
+    OrdersProcessedPayload:
+      type: object
+      additionalProperties: false
+      description: >-
+        `wb.orders.processed.v1` — реальный тип с прода: 150 ₽ за месяц в
+        диагностике раздела 3, и раздел 3.4 числит его тарифицируемым. Формы
+        payload при этом не было нигде — ни в приложении E, ни здесь, — и
+        биллинг считал количество единицей как временную меру. При настоящем
+        payload с пачкой заказов клиент был бы недосчитан ровно во столько раз,
+        сколько заказов в пачке. Форма зафиксирована в версии 1.3 мастера.
+      required:
+        - seller_id
+        - orders
+        - occurred_at
+      properties:
+        owner_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+          description: Владелец в терминах `wms`, если он известен отправителю.
+        seller_id:
+          $ref: '#/components/schemas/SellerExternalId'
+          description: >-
+            Кабинет клиента — кому выставляется счёт. Обязателен: без него
+            начисление повисает в отчёте с причиной SELLER_UNKNOWN.
+        orders:
+          type: integer
+          minimum: 0
+          description: >-
+            Сколько заказов обработано — тарифицируемое количество. Именно это
+            число умножается на тариф, а не единица за событие.
+        wb_account_external_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        occurred_at:
+          type: string
+          format: date-time
+
     LabelAttachedPayload:
       type: object
       additionalProperties: false
@@ -1665,6 +1841,7 @@ components:
       required:
         - task_id
         - label_id
+        - owner_id
         - format
         - checksum
         - version
@@ -1676,6 +1853,11 @@ components:
           $ref: '#/components/schemas/Uuid'
         owner_id:
           $ref: '#/components/schemas/Uuid'
+          description: >-
+            Владелец товара. Обязателен: стикеровка — тарифицируемая услуга
+            (раздел 3.4), и без владельца биллингу некому её выставить —
+            строка повисает в отчёте с причиной SELLER_UNKNOWN. Был
+            необязательным до версии 1.3 мастера; поток C нашёл это на стенде.
         format:
           $ref: '#/components/schemas/LabelFormat'
         checksum:
@@ -2025,7 +2207,7 @@ components:
         available:
           type: integer
           minimum: 0
-          description: 'good - reserved - buffer, не ниже нуля.'
+          description: 'good - buffer, не ниже нуля. Резерв уже вычтен движением good → reserved.'
         published_to_wb:
           type: boolean
           default: false

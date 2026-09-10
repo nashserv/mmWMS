@@ -237,7 +237,7 @@ paths:
       description: |
         Возвращает те же строки, что и `/catalog/stocks/bulk`, но по одному
         штрихкоду. Значение `available` считается по формуле инварианта 7:
-        `good − reserved − buffer(sku)` — всегда занижаем, чтобы не продать
+        `good − buffer(sku)` — всегда занижаем, чтобы не продать
         то, чего на полке нет.
       requestBody:
         required: true
@@ -303,6 +303,50 @@ paths:
 
   # --- Склад -------------------------------------------------------------
 
+  /catalog/wb-cards:
+    post:
+      operationId: catalogWbCards
+      tags: [catalog, new]
+      summary: Карточки Wildberries — через wms.
+      description: |
+        Раздел 6.8: «Карточки Wildberries `product-catalog` берёт через `wms`,
+        не через отдельный шлюз». Маршрута под это не было, и фраза оставалась
+        невыполнимой: приложение B знало `/catalog/products`,
+        `/catalog/products/ensure`, `/catalog/stocks`, `/catalog/stocks/bulk` —
+        ничего про Content API Wildberries.
+
+        `wms` становится держателем токенов WB (раздел 12), поэтому ходить в
+        Content API из каталога больше незачем и нечем: токена у него нет.
+
+        **Переключение самого `product-catalog` на этот маршрут — отдельная
+        задача.** Его исходников в этом репозитории нет, они лежат на боевом
+        сервере, а боевой контур — только чтение до отдельного разрешения
+        владельца (раздел 12). Здесь закрыта та сторона, которая от `wms`
+        зависит.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/WbCardsParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/WbCardsResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
   /warehouse/documents:
     post:
       operationId: warehouseDocuments
@@ -336,6 +380,48 @@ paths:
                   - properties:
                       result:
                         $ref: '#/components/schemas/WarehouseDocumentResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /warehouse/movements:
+    post:
+      operationId: warehouseMovements
+      tags: [storage, new]
+      summary: История движений по товару.
+      description: |
+        Файл 04 требует от ЛК клиента «историю движений по товару» прямым
+        текстом, а прочитать `stock_move` за период было нечем: приложение B
+        знало только текущий остаток (`/warehouse/stock`, `/storage/lookup`)
+        и лист инвентаризации. Экран остатка показывал коробки и ячейки, а
+        историю подменять выдумкой не стали.
+
+        Журнал append-only и есть единственный источник истины (инвариант 3),
+        поэтому история читается прямо из него, а не из отдельной проекции:
+        второй источник разошёлся бы с первым молча.
+
+        Постраничность обязательна: у клиента с оборотом за квартал строк
+        десятки тысяч, и отдавать их одним ответом нельзя.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/WarehouseMovementsParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/WarehouseMovementsResult'
         default:
           $ref: '#/components/responses/TransportError'
 
@@ -868,6 +954,49 @@ paths:
                   - properties:
                       result:
                         $ref: '#/components/schemas/ReceiptsScreenResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /discrepancies:
+    post:
+      operationId: discrepancies
+      tags: [receiving, new]
+      summary: Расхождения — вне контекста приёмки.
+      description: |
+        Экран начальника склада видит расхождения все сразу, а не только те,
+        что родились на приёмке. `ledger_short` — клапан «собрать без остатка»
+        (раздел 6.5) — рождается на резерве, и `receipt_id` у него пуст, поэтому
+        в `/receipts/screen` он не попадёт никогда. Прочитать его до версии 1.3
+        было нечем вовсе: схема заводит под него отдельный индекс с прямым
+        комментарием про экран начальника склада, а маршрута к нему не было.
+
+        Пустой список здесь означает «таких случаев не было» — и это должно
+        быть правдой, а не следствием отсутствия маршрута. Молчаливый
+        `_force_reservation` мы чиним именно тем, что его теперь видно
+        (инвариант 12).
+
+        Только чтение: ничего не занимает и не меняет.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/DiscrepanciesParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/DiscrepanciesResult'
         default:
           $ref: '#/components/responses/TransportError'
 
@@ -1925,7 +2054,7 @@ components:
     StockRow:
       type: object
       description: |
-        Строка остатка для публикации. `available = good − reserved − buffer(sku)`
+        Строка остатка для публикации. `available = good − buffer(sku)`
         (инвариант 7) — всегда занижаем.
       required: [barcode, available]
       additionalProperties: false
@@ -2371,7 +2500,10 @@ components:
       description: |
         Задание в форме, пригодной для строки листа подбора: адрес, коробка,
         порядок обхода. Сборщик должен видеть, куда идти, а не искать глазами.
-      required: [task, leased_until]
+      # `leased_until` не обязателен: при `claim: false` задание не занимают,
+      # и срока лизинга у него нет. Экран обновляется чаще, чем человек берёт
+      # работу, и «только посмотреть» — законный режим.
+      required: [task]
       additionalProperties: false
       properties:
         task:
@@ -2658,6 +2790,15 @@ components:
           description: |
             Рабочее место. Принтер на каждом месте свой (решение владельца 14),
             поэтому арбитраж очереди не нужен — нужно лишь не перепутать станцию.
+
+            Станции сервис НЕ перечисляет: маршрута `/stations` нет и не будет.
+            Их пять (раздел 4), и меняются они не чаще, чем переезжает склад,
+            поэтому они заводятся при развёртывании стенда
+            (`infrastructure/stand/seed/stations.sql`), а на складе — тем же
+            сидом при установке. `station_id` настраивается на самой станции:
+            у агента печати это `--station-id`. Правило записано явно, чтобы
+            рабочее место не ждало маршрута, которого не будет (заявка 5
+            потока B, находка 9 потока A).
         idempotency_key:
           $ref: '#/components/schemas/IdempotencyKey'
         copies:
@@ -2837,6 +2978,221 @@ components:
         duplicate:
           type: boolean
           description: true — приёмка с таким `reference` уже применена, повтор ничего не добавил.
+
+    DiscrepanciesParams:
+      type: object
+      additionalProperties: false
+      description: >-
+        Фильтры экрана начальника склада. По умолчанию — нерешённые расхождения
+        за сутки: экран показывает работу, а не архив.
+      properties:
+        owner_external_id:
+          $ref: '#/components/schemas/OwnerExternalId'
+        task_id:
+          type: string
+          format: uuid
+          description: >-
+            Расхождения одного задания. `ledger_short` рождается на резерве и
+            привязан к заданию, а не к приёмке — по нему его и находят.
+        receipt_id:
+          type: string
+          format: uuid
+        kinds:
+          type: array
+          description: По умолчанию все виды, включая `ledger_short`.
+          items:
+            $ref: '#/components/schemas/DiscrepancyKind'
+        decisions:
+          type: array
+          description: По умолчанию `pending` — то, что ещё не разобрали.
+          items:
+            type: string
+            enum: [pending, accepted, rejected, written_off]
+        since:
+          type: string
+          format: date-time
+          description: По умолчанию сутки назад.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 100
+
+    DiscrepanciesResult:
+      type: object
+      required: [discrepancies, generated_at]
+      additionalProperties: false
+      properties:
+        discrepancies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Discrepancy'
+        generated_at:
+          type: string
+          format: date-time
+
+    WarehouseMovementsParams:
+      type: object
+      required: [seller_external_id]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        since:
+          type: string
+          format: date-time
+          description: По умолчанию 30 суток назад.
+        until:
+          type: string
+          format: date-time
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 100
+        cursor:
+          type: string
+          description: >-
+            Курсор следующей страницы из `next_cursor` предыдущего ответа —
+            это `movement_id` последней отданной строки. Смещением страницы не
+            берутся: движения дописываются во время листания, и страница со
+            смещением показала бы одну строку дважды.
+
+    WarehouseMovementsResult:
+      type: object
+      required: [seller_external_id, movements, generated_at]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        movements:
+          type: array
+          items:
+            $ref: '#/components/schemas/StockMovement'
+        next_cursor:
+          type: [string, 'null']
+          description: Пусто — страниц больше нет.
+        generated_at:
+          type: string
+          format: date-time
+
+    StockMovement:
+      type: object
+      description: >-
+        Строка журнала `stock_move` — append-only и единственный источник истины
+        (инвариант 3). Правок здесь не бывает: движение отменяется встречным
+        движением, а не переписыванием.
+      # `state_from`/`state_to` не обязательны: у приёмки нет состояния-источника
+      # (товар пришёл извне), у списания — состояния-приёмника.
+      required: [movement_id, occurred_at, barcode, qty]
+      additionalProperties: false
+      properties:
+        movement_id:
+          type: string
+          description: >-
+            Ключ журнала (`stock_move.id`) — монотонный `bigint identity`, а не
+            uuid: журнал append-only и читается по порядку, так что ключ здесь
+            и есть порядок записи. Передаётся строкой, чтобы не упереться в
+            точность целых у клиентов на JavaScript.
+        occurred_at:
+          type: string
+          format: date-time
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        qty:
+          type: integer
+          description: Всегда положительное; направление задают состояния и ячейки.
+        state_from:
+          type: [string, 'null']
+        state_to:
+          type: [string, 'null']
+        cell_from:
+          $ref: '#/components/schemas/CellAddress'
+        cell_to:
+          $ref: '#/components/schemas/CellAddress'
+        box_from:
+          type: [string, 'null']
+        box_to:
+          type: [string, 'null']
+        reason:
+          type: [string, 'null']
+          description: "`receipt`, `reservation`, `ledger_short`, `cancel`, `opening` и прочие."
+        doc_type:
+          type: [string, 'null']
+        doc_ref:
+          type: [string, 'null']
+
+    WbCardsParams:
+      type: object
+      required: [seller_external_id]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcodes:
+          type: array
+          maxItems: 100
+          description: Пусто — все карточки кабинета.
+          items:
+            $ref: '#/components/schemas/Barcode'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 100
+        cursor:
+          type: string
+
+    WbCardsResult:
+      type: object
+      required: [seller_external_id, cards, generated_at]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        cards:
+          type: array
+          items:
+            $ref: '#/components/schemas/WbCard'
+        next_cursor:
+          type: [string, 'null']
+        generated_at:
+          type: string
+          format: date-time
+
+    WbCard:
+      type: object
+      description: >-
+        Карточка Wildberries. Штрихкод определяет вещь на полке, артикул —
+        только модель: у одной карточки несколько размеров (раздел 3.2).
+        Поэтому ключ здесь `barcode`, а не `seller_sku`.
+      required: [barcode]
+      additionalProperties: false
+      properties:
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        seller_sku:
+          type: [string, 'null']
+        name:
+          type: [string, 'null']
+        nm_id:
+          type: [integer, 'null']
+          description: Номенклатура Wildberries, как её отдаёт Content API.
+        brand:
+          type: [string, 'null']
+        subject:
+          type: [string, 'null']
+        mapped:
+          type: boolean
+          description: >-
+            Заведена ли карточка в каталоге `wms`. Немаппленный товар — это
+            `manual_review` с кодом, а не остаток (инвариант 6), и каталогу
+            важно видеть разницу.
+        updated_at:
+          type: [string, 'null']
+          format: date-time
 
     ReceiptsScreenParams:
       type: object
@@ -3318,7 +3674,7 @@ components:
         available:
           type: integer
           minimum: 0
-          description: То же число, что уедет в WB — `good − reserved − buffer`.
+          description: То же число, что уедет в WB — `good − buffer`.
 
     # === Отгрузка ========================================================
 

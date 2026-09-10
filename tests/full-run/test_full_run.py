@@ -41,6 +41,12 @@ TXN_LIMIT_MS = 100.0
 # Шаг 10: от вызова до записи в устройство менее 50 мс.
 PRINT_LIMIT_MS = 50.0
 
+# Шаг 7: сколько ждать стикеры. Они тянутся фоново, пачкой до 100 штук, сразу
+# после резерва (раздел 6.6) — то есть асинхронно по построению. Проверяется,
+# что стикер лежит ДО начала подбора, а не что он появляется мгновенно:
+# критерий раздела 10 — «стикер готов до начала упаковки > 99 %».
+LABEL_READY_S = 10.0
+
 # Шаг 16: запас пропускной способности — решение владельца 4.
 TARGET_PER_HOUR = 10_000
 
@@ -253,19 +259,42 @@ def test_step_04_five_wb_orders_become_tasks_and_reservations_in_one_transaction
     with TxnWatch(db) as watch:
         started = time.monotonic()
         order_ids = seed_wb_orders(data.WB_ACCOUNT, data.WB_ORDERS, barcode, deadline)
-        tasks = wait_until(
-            lambda: db.rows("SELECT id, state FROM wms_task WHERE wb_order_id = ANY(%s)",
-                            (order_ids,)) or None,
-            timeout_s=TASK_VISIBLE_S, interval_s=0.05)
+        # Ждать полный набор, а не первое появившееся задание. Пятёрка
+        # заводится за ~27 мс по 4 мс на задание, наблюдатель опрашивает раз в
+        # 50 мс — список из одной строки уже истинен, и `or None` завершал бы
+        # ожидание внутри пачки. Шаг мерил бы удачу попадания между опросами,
+        # а не «5 заданий за < 2 с». Атомарной пятёрка быть не может:
+        # одна транзакция на пять заказов держала бы блокировки строк остатка
+        # 200 мс при пределе 100 мс (инвариант 4).
+        def all_arrived() -> list[dict[str, Any]] | None:
+            found = db.rows(
+                "SELECT id, state FROM wms_task WHERE wb_order_id = ANY(%s)", (order_ids,))
+            return found if len(found) == data.WB_ORDERS else None
+
+        tasks = wait_until(all_arrived, timeout_s=TASK_VISIBLE_S, interval_s=0.05)
         elapsed = time.monotonic() - started
+        if not tasks:
+            # Досталось меньше пяти — покажем, сколько именно, а не пустоту.
+            tasks = db.rows(
+                "SELECT id, state FROM wms_task WHERE wb_order_id = ANY(%s)", (order_ids,))
 
     # Что доехало — то доехало: следующим шагам нужны эти задания, даже если
     # их меньше пяти. Неполный набор они увидят сами.
     ctx["wb_order_ids"] = order_ids
     ctx["task_ids"] = [task["id"] for task in (tasks or [])]
 
+    # Если заданий нет — сразу говорим, в каком состоянии кабинет. Чаще всего
+    # причина не в опросе, а в том, что кабинет придержан лимитом Wildberries
+    # после предыдущей работы (раздел 6.4), и это надо видеть, а не угадывать.
+    cabinet = db.row(
+        "SELECT status, sync_error_code, sync_attempts, "
+        "       round(EXTRACT(EPOCH FROM (next_sync_at - now()))::numeric, 1) AS wait_s "
+        "  FROM wb_account WHERE external_id = %s", (data.WB_ACCOUNT,)) or {}
     assert tasks and len(tasks) == data.WB_ORDERS, (
-        f"за {elapsed:.2f} с в wms_task появилось {len(tasks or [])} заданий из {data.WB_ORDERS}")
+        f"за {elapsed:.2f} с в wms_task появилось {len(tasks or [])} заданий из "
+        f"{data.WB_ORDERS}; кабинет {data.WB_ACCOUNT}: статус {cabinet.get('status')}, "
+        f"код {cabinet.get('sync_error_code')}, следующий опрос через "
+        f"{cabinet.get('wait_s')} с")
     assert elapsed < TASK_VISIBLE_S, (
         f"задания дошли за {elapsed:.2f} с при бюджете {TASK_VISIBLE_S} с")
 
@@ -288,7 +317,8 @@ def test_step_04_five_wb_orders_become_tasks_and_reservations_in_one_transaction
         "трейс пуст: за время резерва в базе не было ни одной транзакции — "
         "проверять нечего, резерв идёт мимо Postgres")
     assert not watch.idle_in_transaction, (
-        f"{len(watch.idle_in_transaction)} раз бэкенд ждал клиента с открытой транзакцией — "
+        f"{len(watch.idle_in_transaction)} раз бэкенд ждал клиента дольше "
+        f"{TxnWatch.IDLE_LIMIT_MS:.0f} мс с открытой транзакцией — "
         f"это HTTP-вызов внутри неё (инвариант 2)")
     assert watch.max_age_ms < TXN_LIMIT_MS, (
         f"самая долгая транзакция {watch.max_age_ms:.0f} мс при пределе {TXN_LIMIT_MS:.0f} мс: "
@@ -402,12 +432,25 @@ def test_step_07_labels_are_ready_in_zplv_before_picking_starts(
     assert int(db.value("SELECT count(*) AS n FROM pick_line WHERE task_id = ANY(%s)",
                         (task_ids,)) or 0) == 0
 
-    labels = db.rows(
-        "SELECT task_id, format, invalidated_at FROM wb_label WHERE task_id = ANY(%s)",
-        (task_ids,))
+    # Стикер тянется фоново, вне транзакции резерва (раздел 6.6), поэтому его
+    # ждут, а не читают сразу. Смысл шага от этого не меняется: проверяется,
+    # что стикер лежит ДО начала подбора, — а подбор ещё не начинался, это
+    # утверждение выше. Критерий раздела 10 — «стикер готов до начала
+    # упаковки», а не «мгновенно».
+    def all_labels() -> list[dict[str, Any]] | None:
+        found = db.rows(
+            "SELECT task_id, format, invalidated_at FROM wb_label WHERE task_id = ANY(%s)",
+            (task_ids,))
+        return found if len(found) == len(task_ids) else None
+
+    labels = wait_until(all_labels, timeout_s=LABEL_READY_S, interval_s=0.1)
+    if not labels:
+        labels = db.rows(
+            "SELECT task_id, format, invalidated_at FROM wb_label WHERE task_id = ANY(%s)",
+            (task_ids,))
     assert len(labels) == len(task_ids), (
-        f"стикеров {len(labels)} на {len(task_ids)} заданий: они тянутся заранее, "
-        f"пачкой, сразу после резерва (раздел 6.6)")
+        f"за {LABEL_READY_S:.0f} с стикеров {len(labels)} на {len(task_ids)} заданий: "
+        f"они тянутся заранее, пачкой, сразу после резерва (раздел 6.6)")
     for label in labels:
         assert label["format"] == "zplv", (
             f"формат {label['format']}, целевой zplv: 1–3 КБ текста против 20–100 КБ картинки")
@@ -479,8 +522,17 @@ def test_step_09_control_scan_rejects_a_foreign_barcode_and_the_session_keeps_pl
     `workstation_pick_session` на 6497 заданий из раздела 3.
     """
     pulled = need(ctx, "pulled", 8)
-    first_session = next(iter(pulled.values()))
-    task_id = first_session[0]
+    # Задание берём из пятёрки шага 4, а не первое попавшееся из произвольной
+    # сессии. В очереди рядом лежит задание шага 6 — на ZERO_STOCK_BARCODE, — и
+    # если досталось оно, «свой» штрихкод BARCODES[0] не совпадёт, шаг
+    # покраснеет не по вине рабочего места, а за ним и шаг 11, которому нужен
+    # packed_task_ids. Наблюдалось: два прогона подряд при одном и том же коде,
+    # в одном шаг 9 зелёный, в другом красный.
+    step_04 = {str(task_id) for task_id in need(ctx, "task_ids", 4)}
+    taken = [task_id for ids in pulled.values() for task_id in ids if str(task_id) in step_04]
+    assert taken, (
+        "среди выданных нет ни одного задания шага 4 — сканировать их штрихкодом нечего")
+    task_id = taken[0]
 
     rejected = wms.result(f"/tasks/{task_id}/scan", {"barcode": data.BARCODES[2]})
     assert rejected.get("status") != "picked", (
@@ -522,7 +574,18 @@ def test_step_10_print_reaches_the_device_in_under_50ms(
     """
     task_id = need(ctx, "packed_task_ids", 9)[0]
 
-    station_id = db.value("SELECT id FROM station WHERE active ORDER BY name LIMIT 1")
+    # Станцию берём ту, на которой стоит агент: он один знает, к какому
+    # принтеру подключён. Первая активная по имени — не то же самое, и
+    # случайная строка в таблице увела бы печать на станцию без агента.
+    stats_url = os.getenv("PRINT_AGENT_STATS_URL")
+    station_id = None
+    if stats_url:
+        try:
+            station_id = httpx.get(stats_url, timeout=5.0).json().get("station_id")
+        except Exception:  # noqa: BLE001 — упадём ниже, с внятной причиной
+            station_id = None
+    if not station_id:
+        station_id = db.value("SELECT id FROM station WHERE active ORDER BY name LIMIT 1")
     assert station_id, "на стенде не заведено ни одной станции — печатать некуда"
 
     worst = 0.0
@@ -539,6 +602,30 @@ def test_step_10_print_reaches_the_device_in_under_50ms(
         f"wms отдаёт стикер за {worst:.0f} мс при пределе {PRINT_LIMIT_MS:.0f} мс — "
         f"на агента и принтер не остаётся ничего")
 
+    # Вторая половина пути. «Клик печать» на складе делается на экране рабочего
+    # места, оно и толкает байты агенту по открытому соединению (раздел 6.6).
+    # Дёргать один только wms недостаточно: он отдаёт байты, но никому их не
+    # push'ит, и агент честно отчитывается о нуле записей. Проверять надо путь
+    # целиком, иначе половина, ради которой переписана вся этикетка, не
+    # проверяется вовсе.
+    workstation_url = os.getenv("WORKSTATION_BASE_URL")
+    if not workstation_url:
+        not_ready(
+            "не задана переменная окружения WORKSTATION_BASE_URL; «клик печать» идёт "
+            "через рабочее место (раздел 6.6), и без его адреса агенту никто "
+            "не толкнёт байты")
+    try:
+        pushed = httpx.post(
+            f"{workstation_url.rstrip('/')}/api/workstation/v1/print",
+            json={"task_id": str(task_id), "station_id": str(station_id),
+                  "actor_id": "picker-1", "reprint": True,
+                  "reason": "прогон: замер записи в устройство"},
+            timeout=10.0)
+    except Exception as failure:  # noqa: BLE001
+        not_ready(f"рабочее место не отвечает по WORKSTATION_BASE_URL ({failure})")
+    assert pushed.status_code == 200, (
+        f"рабочее место не приняло печать: {pushed.status_code} / {pushed.text[:200]}")
+
     stats_url = os.getenv("PRINT_AGENT_STATS_URL")
     if not stats_url:
         not_ready(
@@ -546,7 +633,12 @@ def test_step_10_print_reaches_the_device_in_under_50ms(
             "Нужен PRINT_AGENT_STATS_URL с JSON {\"last_write_ms\": …, \"task_id\": …}; "
             "без него «до записи в устройство» измерить нечем")
     try:
-        stats = httpx.get(stats_url, timeout=5.0).json()
+        # Push агенту и ответ рабочему месту — разные стороны сокета, поэтому
+        # телеметрию ждём, а не читаем сразу: гонка здесь дала бы ложный красный.
+        stats = wait_until(
+            lambda: (lambda s: s if s.get("last_write_ms") is not None else None)(
+                httpx.get(stats_url, timeout=5.0).json()),
+            timeout_s=10.0, interval_s=0.1) or httpx.get(stats_url, timeout=5.0).json()
     except Exception as failure:  # noqa: BLE001
         not_ready(f"агент печати не отвечает по PRINT_AGENT_STATS_URL ({failure})")
     write_ms = stats.get("last_write_ms")
@@ -768,7 +860,7 @@ def test_step_15_stock_push_leaves_immediately_and_publishes_a_lowered_available
         wms: Wms, db: Db, ctx: dict[str, Any], scenario: data.Scenario) -> None:
     """Шаг 15: публикация остатка.
 
-    ASSERT вызов ушёл немедленно после движения, available = good − reserved − buffer.
+    ASSERT вызов ушёл немедленно после движения, available = good − buffer.
 
     Никаких таймеров и накопления (раздел 6.4). Ограничитель существует только
     как защита от бана Wildberries и в нормальной работе не срабатывает.
@@ -799,22 +891,22 @@ def test_step_15_stock_push_leaves_immediately_and_publishes_a_lowered_available
     assert push, ("после движения не ушла публикация остатка в WB: "
                   "остаток публикуется сразу, без таймеров (раздел 6.4)")
 
+    # Резерв в формуле не участвует: движение `good → reserved` уже вывело его
+    # из `good` (раздел 6.2). Вычесть его второй раз — занизить вдвое.
     expected = db.row(
         "SELECT COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'good'), 0) AS good, "
-        "       COALESCE(SUM(b.qty) FILTER (WHERE b.state = 'reserved'), 0) AS reserved, "
         "       MAX(s.buffer) AS buffer "
         "  FROM stock_balance b JOIN owner o ON o.id = b.owner_id JOIN sku s ON s.id = b.sku_id "
         " WHERE o.seller_external_id = %s AND s.barcode = %s", (data.SELLER, barcode))
     assert expected, f"по {barcode} нет остатка в проекции"
-    available = max(0, int(expected["good"]) - int(expected["reserved"])
-                    - int(expected["buffer"] or 0))
+    available = max(0, int(expected["good"]) - int(expected["buffer"] or 0))
 
     published = wms.result("/catalog/stocks/bulk", {"seller_external_id": data.SELLER})
     rows = {row["barcode"]: row["available"] for row in published.get("stocks", [])}
     assert barcode in rows, f"{barcode} не попал в публикацию — непроданный товар"
     assert rows[barcode] == available, (
-        f"публикуем {rows[barcode]}, а good − reserved − buffer = {available}: "
-        f"остаток в WB всегда занижаем (инвариант 7)")
+        f"публикуем {rows[barcode]}, а good − buffer = {available}: "
+        f"остаток в WB всегда занижаем на страховой запас (инвариант 7)")
 
 
 # ============================================================= шаг 16 (A)
@@ -834,7 +926,32 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
     seconds = float(os.getenv("FULL_RUN_LOAD_SECONDS", "60"))
     workers = int(os.getenv("FULL_RUN_LOAD_WORKERS", "8"))
     interval = 3600.0 / TARGET_PER_HOUR          # пауза между заданиями на всём потоке
-    barcode = data.BARCODES[1]
+    barcode = data.LOAD_BARCODE
+
+    # Нагрузка идёт на СВОЕГО клиента и свой кабинет: 160 заданий за двадцать
+    # секунд выбирают лимит Wildberries (300 в минуту на кабинет), и если бы
+    # это был кабинет шага 4, следующий прогон не смог бы его опросить вовремя.
+    # Разный владелец заодно разводит очереди выдачи: задания нагрузки не
+    # попадут шагу 8 вместо его собственных.
+    wms.result("/sellers", {
+        "seller_external_id": data.LOAD_SELLER, "name": "Полный прогон — нагрузка",
+        "inn": data.SELLER_INN, "active": True, "allow_ledger_short": True})
+    wms.result("/catalog/products/ensure", {
+        "seller_external_id": data.LOAD_SELLER, "barcode": barcode,
+        "seller_sku": f"FR-LOAD-{barcode[-4:]}", "name": "Товар нагрузки"})
+    wms.result("/wb/accounts", {
+        "op": "upsert", "external_id": data.LOAD_WB_ACCOUNT,
+        "seller_external_id": data.LOAD_SELLER,
+        "display_name": "Кабинет нагрузки", "secret_ref": data.WB_SECRET_REF,
+        "mode": "shadow", "status": "ACTIVE"})
+    # Остатка должно хватить на всё окно: клапан ledger_short здесь не
+    # проверяется, а недостача исказила бы измерение удержания блокировки.
+    wms.result("/warehouse/documents", {
+        "seller_external_id": data.LOAD_SELLER, "warehouse_code": data.WAREHOUSE_CODE,
+        "reference": scenario.reference("load-opening"), "doc_type": "opening",
+        "comment": "нагрузочный шаг: остаток под окно",
+        "lines": [{"barcode": barcode, "quantity": 100000,
+                   "cell_address": "FR-LOAD-01", "state": "good"}]})
 
     outcome = LoadResult()
     lock = threading.Lock()
@@ -856,8 +973,8 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
                 order_id = scenario.next_order_id()
                 call = client.call("/reservations", {
                     "idempotency_key": scenario.idem(f"load-{order_id}"),
-                    "seller_external_id": data.SELLER,
-                    "wb_account_external_id": data.WB_ACCOUNT,
+                    "seller_external_id": data.LOAD_SELLER,
+                    "wb_account_external_id": data.LOAD_WB_ACCOUNT,
                     "wb_order_id": order_id, "sku": barcode, "barcode": barcode,
                     "quantity": 1, "correlation_id": f"load-{order_id}"})
                 status = call.result.get("status")
@@ -871,7 +988,14 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
         finally:
             client.close()
 
-    tasks_before = int(db.value("SELECT count(*) AS n FROM wms_task") or 0)
+    # Считаем задания СВОЕГО клиента, а не все подряд: рядом идёт опрос
+    # Wildberries по другим кабинетам, и общий счётчик мерил бы заодно и его.
+    def load_tasks() -> int:
+        return int(db.value(
+            "SELECT count(*) AS n FROM wms_task t JOIN owner o ON o.id = t.owner_id "
+            " WHERE o.seller_external_id = %s", (data.LOAD_SELLER,)) or 0)
+
+    tasks_before = load_tasks()
     with TxnWatch(db) as watch:
         started = time.monotonic()
         threads = [threading.Thread(target=fire, name=f"load-{n}") for n in range(workers)]
@@ -887,7 +1011,7 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
     assert outcome.per_hour >= TARGET_PER_HOUR, (
         f"держим {outcome.per_hour:.0f} заданий в час при требуемых {TARGET_PER_HOUR}")
 
-    tasks_after = int(db.value("SELECT count(*) AS n FROM wms_task") or 0)
+    tasks_after = load_tasks()
     assert tasks_after - tasks_before == outcome.accepted, (
         f"принято {outcome.accepted} заданий, а в wms_task прибавилось "
         f"{tasks_after - tasks_before}: часть нагрузки не доехала до базы")

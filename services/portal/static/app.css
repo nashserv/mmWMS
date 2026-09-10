@@ -1,0 +1,61 @@
+/* Ванильный фронт (раздел 2.2 мастера): ни фреймворка, ни сборки. */
+:root {
+  --ink: #1b1f24;
+  --muted: #6b7280;
+  --line: #e2e5ea;
+  --bg: #f7f8fa;
+  --card: #ffffff;
+  --accent: #1f5eff;
+  --bad: #c0392b;
+  --good: #1e824c;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+header {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 20px; background: var(--card); border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 16px; margin: 0; font-weight: 600; }
+h2 { font-size: 18px; margin: 0 0 4px; }
+h3 { font-size: 14px; margin: 20px 0 8px; }
+.who { display: flex; align-items: center; gap: 12px; }
+.who input { width: 320px; }
+nav { display: flex; gap: 4px; padding: 10px 20px 0; background: var(--card); }
+nav button {
+  border: 1px solid transparent; border-bottom: none; background: none; cursor: pointer;
+  padding: 8px 14px; border-radius: 6px 6px 0 0; color: var(--muted); font: inherit;
+}
+nav button.active { background: var(--bg); border-color: var(--line); color: var(--ink); }
+main { padding: 20px; max-width: 1200px; }
+.tab { display: none; }
+.tab.active { display: block; }
+.hint { color: var(--muted); margin: 0 0 16px; max-width: 70ch; }
+.muted { color: var(--muted); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.cards article { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.cards h3 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 500; }
+.cards p { margin: 4px 0 0; font-size: 12px; }
+.big { font-size: 28px; font-weight: 600; }
+table { border-collapse: collapse; width: 100%; background: var(--card); }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.negative { color: var(--bad); }
+.positive { color: var(--good); }
+form.grid, .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+label.wide { grid-column: 1 / -1; margin-top: 12px; }
+input, select, textarea, button[type=submit] { font: inherit; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--ink); }
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+small { color: var(--muted); font-size: 11px; }
+button[type=submit], .action { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; margin-top: 12px; }
+.action { padding: 4px 10px; margin: 0; font-size: 12px; border-radius: 5px; }
+.tree-row { padding-left: calc(var(--depth) * 22px); }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); }
+.badge.warn { border-color: var(--bad); color: var(--bad); }
+.badge.ok { border-color: var(--good); color: var(--good); }
+#toast { position: fixed; right: 20px; bottom: 20px; background: var(--ink); color: #fff; padding: 10px 14px; border-radius: 8px; max-width: 480px; }
+pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; }

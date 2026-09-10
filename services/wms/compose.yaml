@@ -1,0 +1,89 @@
+# Сервис wms и его воркеры.
+#
+# Подключается к стенду через `include` из infrastructure/stand/compose.yaml
+# либо поднимается отдельно. Заглушка потока 0 остаётся доступной: `WMS_MOCK`
+# по умолчанию `false` здесь, но сам образ несёт и её — потоки B и C снимают
+# зависимость от готовности потока A флагом, а не пересборкой (правило 9.5.4).
+#
+# Воркеры вынесены в отдельные процессы намеренно (раздел 12): упал опрос
+# Wildberries — приёмка, подбор и инвентаризация продолжают работать. Общий
+# процесс такой изоляции не даёт.
+
+name: mmx-wms
+
+x-wms: &wms
+  build:
+    context: .
+  restart: unless-stopped
+  environment: &wms-env
+    APP_ENV: ${APP_ENV:-development}
+    WMS_MOCK: "false"
+    TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
+    DATABASE_URL: ${DATABASE_URL:?set outside Git}
+    RABBITMQ_URL: ${RABBITMQ_URL:?set outside Git}
+    MMX_EVENTS_EXCHANGE: ${MMX_EVENTS_EXCHANGE:-mmx.events}
+    MMX_TENANT_ID: ${MMX_TENANT_ID:-mm-express}
+    # На стенде отвечает симулятор. WB_API_URL не задан намеренно: пустой
+    # адрес боевого Wildberries — часть ворот, которые не дают писать в
+    # кабинет клиента из shadow (раздел 11, шаг 2).
+    WB_SIMULATOR_URL: ${WB_SIMULATOR_URL:-http://wb-simulator:8090}
+    # Целевой формат стикера — ZPL (раздел 6.6). Откат на png, если реальный
+    # принтер не распознает ZPL: вопрос 2 раздела 13 ещё открыт.
+    WB_STICKER_FORMAT: ${WB_STICKER_FORMAT:-zplv}
+    # Переключение на новую WMS идёт по одному кабинету, не пачкой (раздел 11,
+    # шаг 6). Пусто — все кабинеты; откат — убрать кабинет из списка.
+    WB_SYNC_ONLY_ACCOUNTS: ${WB_SYNC_ONLY_ACCOUNTS:-}
+    # Секреты только по ссылке. Значение токена в переменных не появляется
+    # никогда (инвариант 15).
+    WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
+
+services:
+
+  wms:
+    <<: *wms
+    environment:
+      <<: *wms-env
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports: ["127.0.0.1:8080:8080"]
+    healthcheck:
+      # Готовность — доступность базы, а не «процесс жив». Мониторинг, следящий
+      # за портом вместо работы, — раздел 3.5.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Опрос Wildberries. Заменяет gateway-sync-worker вместе с очередью, которая
+  # за ним стояла (раздел 6.3).
+  wms-wb-sync:
+    <<: *wms
+    environment:
+      <<: *wms-env
+    command: ["python", "-m", "app.workers.wb_sync"]
+    depends_on: {wms: {condition: service_healthy}}
+
+  # Стикеры заранее, пачкой до 100 (раздел 6.6).
+  wms-wb-labels:
+    <<: *wms
+    environment:
+      <<: *wms-env
+    command: ["python", "-m", "app.workers.wb_labels"]
+    depends_on: {wms: {condition: service_healthy}}
+
+  # Сверка статусов с WB. Читает только GET /api/v3/orders, поэтому работает
+  # и в shadow — там она главный инструмент (раздел 11, шаг 2).
+  wms-wb-reconcile:
+    <<: *wms
+    environment:
+      <<: *wms-env
+    command: ["python", "-m", "app.workers.wb_reconcile"]
+    depends_on: {wms: {condition: service_healthy}}
+
+  # События из outbox в шину, плюс партиции и ретеншен. На проде
+  # integration_outbox дорос до 136 210 записей без чистки (раздел 3.6).
+  wms-outbox:
+    <<: *wms
+    environment:
+      <<: *wms-env
+    command: ["python", "-m", "app.workers.outbox_publisher"]
+    depends_on: {wms: {condition: service_healthy}}

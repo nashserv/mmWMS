@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import base64
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -144,9 +146,10 @@ def test_registering_a_client_twice_does_not_create_a_second_one(client: TestCli
     """Инвариант 5. Новый owner_id обесценил бы уже выпущенные события."""
     first = call(client, "/sellers", {"seller_external_id": "twice", "name": "Первый"})
     second = call(client, "/sellers", {"seller_external_id": "twice", "name": "Второй"})
-    assert first["seller"]["owner_id"] == second["seller"]["owner_id"]
-    assert sum(1 for owner in second["sellers"]
-               if owner["seller_external_id"] == "twice") == 1
+    # Форма — SellerResult: один владелец, а не список (контракт не знает
+    # списка вовсе). Тот же owner_id и `created: false` на повторе.
+    assert first["owner_id"] == second["owner_id"]
+    assert first["created"] is True and second["created"] is False
 
 
 def test_opening_document_is_idempotent_by_reference(client: TestClient) -> None:
@@ -160,7 +163,10 @@ def test_opening_document_is_idempotent_by_reference(client: TestClient) -> None
                          "cell_address": "FR-01-02"}]}
     first = call(client, "/warehouse/documents", params)
     second = call(client, "/warehouse/documents", params)
-    assert first["document_id"] == second["document_id"]
+    # Форма — WarehouseDocumentResult: внутреннего document_id клиент не
+    # видит, идемпотентность доказывает `reference` и неизменившийся остаток.
+    assert first["reference"] == second["reference"]
+    assert first["state"] == second["state"] == "applied"
 
     stocks = call(client, "/catalog/stocks/bulk",
                   {"seller_external_id": "open-twice"})["stocks"]
@@ -261,8 +267,12 @@ def test_label_is_local_before_packing(client: TestClient) -> None:
     """Инвариант 9: стикер лежит локально до того, как человек нажал печать."""
     task_id = reserve(client, "2000000000011", order_id=8001)["task_id"]
     label = call(client, f"/tasks/{task_id}/label")
-    assert label["content_type"] == "zplv"
-    assert label["payload"].startswith("^XA")
+    # `content_type` — MIME-тип, имя формата лежит в `format`. `payload` —
+    # base64: контракт объявляет `contentEncoding: base64`, и клиент,
+    # выучивший у заглушки сырой ZPL, споткнулся бы на настоящем сервисе.
+    assert label["content_type"] == "application/x-zpl"
+    assert label["format"] == "zplv"
+    assert base64.b64decode(label["payload"]).decode("utf-8").startswith("^XA")
     assert len(label["checksum"]) == 64
 
 
@@ -271,7 +281,9 @@ def test_cancel_invalidates_the_label(client: TestClient) -> None:
     task_id = reserve(client, "2000000000011", order_id=8002)["task_id"]
     result = call(client, f"/tasks/{task_id}/cancel",
                   {"reason": "клиент отменил", "cancellation_event_id": "evt-1"})
-    assert result["status"] == "cancelled"
+    # Форма — TaskCancelResult: состояние в `state`, причина обязательна.
+    assert result["state"] == "cancelled"
+    assert result["cancel_reason"] == "клиент отменил"
     assert result["label_invalidated"] is True
     assert call(client, f"/tasks/{task_id}/label")["error_code"] == "LABEL_NOT_READY"
 
@@ -321,8 +333,14 @@ def test_receipt_shortage_creates_a_discrepancy(client: TestClient) -> None:
     result = call(client, "/receipts", {
         "seller_external_id": "seller-a", "warehouse_code": "RUM", "reference": "RCP-0002",
         "lines": [{"barcode": "2000000000011", "expected_qty": 10, "actual_qty": 7}]})
-    assert result["discrepancies"] == [
-        {"barcode": "2000000000011", "kind": "shortage", "qty": 3, "decision": "pending"}]
+    # Расхождение несёт ещё и свой идентификатор, адрес и время: экран
+    # начальника склада читает их по /discrepancies, и без них расхождение
+    # неадресно (раздел 6.5).
+    assert len(result["discrepancies"]) == 1
+    row = result["discrepancies"][0]
+    assert (row["barcode"], row["kind"], row["qty"], row["decision"]) == (
+        "2000000000011", "shortage", 3, "pending")
+    assert row["discrepancy_id"] and row["created_at"]
 
 
 # ------------------------------------------------------------------ коробки
