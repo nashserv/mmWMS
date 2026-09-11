@@ -494,3 +494,48 @@ def test_a_cancellation_while_the_sticker_is_being_fetched_does_not_revive_the_t
     label = rows(pool, "SELECT invalidated_at FROM wb_label WHERE task_id = %s", (task_id,))
     assert not label or label[0]["invalidated_at"] is not None, (
         "стикер отменённого задания снова действителен — его напечатают и наклеят")
+
+
+def test_skipped_states_are_not_even_asked_about(
+        pool: ConnectionPool, cabinet: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`WB_RECONCILE_SKIP_STATES` убирает состояние из сверки целиком.
+
+    В shadow это `manual_review`: у нас задание заведено, а маппинга товара
+    нет — оно и не обязано сходиться с WB. Без пропуска ежедневный отчёт
+    расхождений состоит ИЗ ОДНИХ таких заданий, и вопрос недели наблюдения
+    («убывает ли разница») по нему не задать.
+
+    Спрашивать о них WB тоже незачем: бюджет лимита кабинета общий.
+    """
+    from app.workers import wb_reconcile as module
+
+    order_ids = seed(cabinet["account"], 2, cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[cabinet["account"]]).tick()
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "UPDATE wms_task SET state = 'manual_review', "
+                "       manual_review_code = 'PRODUCT_MAPPING_MISSING' "
+                " WHERE wb_order_id = %s", (order_ids[0],))
+
+    asked: list[list[int]] = []
+    real_status = WbClient.orders_status
+
+    def watch(self, order_ids_arg):
+        asked.append([int(value) for value in order_ids_arg])
+        return real_status(self, order_ids_arg)
+
+    monkeypatch.setattr(module, "SKIP_STATES", frozenset({"manual_review"}))
+    monkeypatch.setattr(WbClient, "orders_status", watch)
+    WbReconcileWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    assert asked, "сверка не спросила статусы вовсе"
+    assert order_ids[0] not in asked[0], (
+        "о задании в manual_review спросили WB: бюджет лимита кабинета общий, "
+        "и тратить его на то, что сверять не будут, нельзя")
+    assert order_ids[1] in asked[0], "здоровое задание выпало из сверки вместе с ним"
+
+    states = {row["wb_order_id"]: row["state"] for row in rows(
+        pool, "SELECT wb_order_id, state FROM wms_task WHERE wb_order_id = ANY(%s)",
+        (order_ids,))}
+    assert states[order_ids[0]] == "manual_review", "пропущенное задание тронули"

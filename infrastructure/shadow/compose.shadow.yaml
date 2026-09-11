@@ -53,7 +53,22 @@ x-shadow: &shadow
     WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
     TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms}
 
+    # Сверка пропускает `manual_review`. Задание с этим состоянием у нас
+    # заведено, а маппинга товара нет — оно и не обязано сходиться с WB.
+    # Без пропуска ежедневный отчёт в shadow состоит ИЗ ОДНИХ таких заданий
+    # (`docs/05-shadow-readiness.md`), и вопрос недели — «убывает ли
+    # разница» — задать по нему нельзя.
+    WB_RECONCILE_SKIP_STATES: ${WB_RECONCILE_SKIP_STATES:-manual_review}
+
     # RABBITMQ_URL не задан НАМЕРЕННО. См. шапку файла.
+
+  # Каталог с файлом секрета — ТОЛЬКО НА ЧТЕНИЕ.
+  #
+  # `:ro` здесь не перестраховка: контейнер, который может писать в каталог
+  # секретов, может и перезаписать токен клиента. Читать его должен весь
+  # контур, менять — человек снаружи.
+  volumes: &shadow-secrets
+    - ${WB_SECRET_HOST_DIR:?путь к каталогу секрета, задаётся снаружи Git}:${WB_SECRET_DIR:-/run/secrets/wb}:ro
 
 services:
 
@@ -93,6 +108,7 @@ services:
     environment:
       <<: *shadow-env
       WMS_ROLE: api
+    volumes: *shadow-secrets
     command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8080"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
@@ -108,6 +124,7 @@ services:
     environment:
       <<: *shadow-env
       WMS_ROLE: wb-sync
+    volumes: *shadow-secrets
     command: ["python", "-m", "app.workers.wb_sync"]
     depends_on:
       wms: {condition: service_healthy}
@@ -119,6 +136,7 @@ services:
     environment:
       <<: *shadow-env
       WMS_ROLE: wb-reconcile
+    volumes: *shadow-secrets
     command: ["python", "-m", "app.workers.wb_reconcile"]
     depends_on:
       wms: {condition: service_healthy}

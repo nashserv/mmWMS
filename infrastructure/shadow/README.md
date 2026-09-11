@@ -39,9 +39,14 @@
 ```bash
 cd infrastructure/shadow
 cp .env.example .env      # заполнить
-set -a && . ./.env && set +a
 ./scripts/preflight.sh
 ```
+
+`.env` в оболочку **не подгружать**. `set -a && . ./.env` кладёт токены и
+пароли в окружение вашей оболочки и оттуда — в историю, в дочерние процессы, в
+дамп при отладке. Compose читает `.env` сам; preflight читает конфигурацию
+через `docker compose config` и спрашивает секрет у самого сервиса, а не у
+вашей оболочки.
 
 Девять проверок. Одна не прошла — не поднимать.
 
@@ -73,13 +78,65 @@ UPDATE owner SET allow_ledger_short = false;
 выключенным задание встанет в состояние `short`: видимое, счётное и ровно
 такое, какое и должно быть, когда товара по учёту нет.
 
-**4. Преflight, потом подъём.**
+**4. Положить файл секрета.**
+
+Токен лежит файлом в каталоге, который монтируется контуру **на чтение**.
+Имя файла — это `secret_ref` кабинета, приведённый к имени файла: из
+`vault://mmx/wb/seller-42` получается `mmx-wb-seller-42`.
+
+```bash
+mkdir -p /srv/mmwms-shadow-secrets
+umask 077
+printf '%s' '<токен кабинета>' > /srv/mmwms-shadow-secrets/mmx-wb-seller-42
+# В .env: WB_SECRET_HOST_DIR=/srv/mmwms-shadow-secrets
+```
+
+Каталог не в Git и не в репозитории вовсе. `printf` без перевода строки:
+лишний `\n` в конце токена — это 401 от Wildberries и полдня поисков.
+
+**5. Завести клиента и кабинет — через API, не SQL.**
+
+Контур поднимается пустым: миграции создают схему, данных в ней нет. Владелец
+и кабинет заводятся теми же маршрутами, что и везде, на петлевом адресе:
+
+```bash
+BASE=http://127.0.0.1:18080/api/mmx/wms/v1
+call() { curl -sS -X POST "$BASE$1" -H 'content-type: application/json' \
+              -H "authorization: Bearer $SHADOW_SERVICE_TOKEN" \
+              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"params\":$2}"; }
+
+call /sellers '{"seller_external_id":"seller-42","name":"ИП Иванов"}'
+call /wb/accounts '{"op":"upsert","external_id":"wb-42",
+                    "seller_external_id":"seller-42",
+                    "display_name":"Кабинет 42",
+                    "secret_ref":"vault://mmx/wb/seller-42",
+                    "mode":"shadow","status":"ACTIVE"}'
+```
+
+`mode: shadow` обязателен. `secret_ref` — ссылка, не токен: схема не примет
+значение формы JWT.
+
+**6. Импортировать каталог кабинета.**
+
+Без товаров каждое теневое задание встанет в `manual_review` («товара нет у
+владельца»), и отчёт расхождений будет состоять из них одних — см.
+`docs/05-shadow-readiness.md`.
+
+```bash
+# Карточки кабинета из Content API — это ЧТЕНИЕ, в shadow разрешено.
+call /catalog/wb-cards '{"seller_external_id":"seller-42","limit":500}'
+# Завести товары по штрихкодам из ответа:
+call /catalog/products/ensure '{"seller_external_id":"seller-42",
+                                "barcode":"4600000000011"}'
+```
+
+**7. Преflight, потом подъём.**
 
 ```bash
 ./scripts/preflight.sh && docker compose -f compose.shadow.yaml up -d
 ```
 
-**5. Читать отчёт расхождений. Минимум неделя** (раздел 11).
+**8. Читать отчёт расхождений. Минимум неделя** (раздел 11).
 
 Отчёт ложится в таблицу `shadow_divergence_report`, а не только в лог: неделю
 наблюдения сравнивают посуточно, а лог ротируется и исчезает вместе с

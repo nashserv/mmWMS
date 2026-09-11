@@ -36,9 +36,21 @@ def main() -> int:
                              "Нужен: у WB есть burst и штраф — 409 стоит десяти запросов")
     parser.add_argument("--cabinets", type=int, default=1,
                         help="сколько кабинетов опрашивает shadow (раздел 11: на шаге 2 — один)")
+    parser.add_argument("--only-max-rpm", action="store_true",
+                        help="напечатать одно число: допустимый предел запросов в минуту "
+                             "на кабинет. Нужен preflight'у — тот сравнивает с ним "
+                             "настроенный интервал, а не с числом, взятым из воздуха")
     args = parser.parse_args()
 
     share = WB_LIMIT_RPM - args.prod_rpm - args.margin
+    if args.only_max_rpm:
+        # Машиночитаемый ответ: целое число, без объяснений. Пустой вывод и
+        # код 1 значат «нельзя вовсе» — preflight отличит это от нуля.
+        per_cabinet = share / max(1, args.cabinets)
+        if per_cabinet <= 0:
+            return 1
+        print(int(per_cabinet))
+        return 0
     print(f"Лимит кабинета:            {WB_LIMIT_RPM:6.0f} запросов/мин (приложение D)")
     print(f"Тратит боевой шлюз:        {args.prod_rpm:6.0f}")
     print(f"Запас, не трогает никто:   {args.margin:6.0f}")

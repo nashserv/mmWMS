@@ -1952,7 +1952,8 @@ def accounts_due_for_reconcile(cursor: Cursor, *, limit: int, older_than_seconds
 
 
 def open_tasks_of_account(cursor: Cursor, account_id: uuid.UUID, *,
-                          limit: int) -> list[int]:
+                          limit: int,
+                          skip_states: Sequence[str] | frozenset[str] = ()) -> list[int]:
     """Номера незакрытых заданий кабинета — то, о чём надо спросить WB.
 
     Сверка читала первую страницу `GET /api/v3/orders`. Эта страница — начало
@@ -1967,8 +1968,11 @@ def open_tasks_of_account(cursor: Cursor, account_id: uuid.UUID, *,
         "SELECT wb_order_id FROM wms_task "
         " WHERE wb_account_id = %s AND wb_order_id IS NOT NULL "
         "   AND state NOT IN ('cancelled', 'accepted', 'diverged') "
+        # Пропущенные состояния не спрашиваются у WB вовсе: бюджет лимита
+        # кабинета общий, и тратить его на то, что сверять не будут, нельзя.
+        "   AND NOT (state = ANY(%s)) "
         " ORDER BY COALESCE(last_reconciled_at, to_timestamp(0)), wb_order_id "
-        " LIMIT %s", (account_id, limit))
+        " LIMIT %s", (account_id, list(skip_states), limit))
     return [int(row["wb_order_id"]) for row in cursor.fetchall()]
 
 

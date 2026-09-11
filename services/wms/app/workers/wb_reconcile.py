@@ -56,6 +56,16 @@ ACCOUNTS_PER_TICK = int(os.getenv("WB_RECONCILE_ACCOUNTS_PER_TICK", "4"))
 PAGE = int(os.getenv("WB_RECONCILE_PAGE", "1000"))
 # Пачка `POST /api/v3/orders/status`: у Wildberries предел 1000 номеров.
 STATUS_BATCH = 1000
+
+# Состояния, которые сверка не трогает вовсе.
+#
+# В shadow сюда попадает `manual_review`: у нас задание заведено, а маппинга
+# товара нет — оно и не обязано сходиться с WB. Без пропуска ежедневный отчёт
+# расхождений состоит ИЗ ОДНИХ таких заданий, и вопрос недели наблюдения —
+# «убывает ли разница» — по нему не задать (`docs/05-shadow-readiness.md`).
+SKIP_STATES = frozenset(
+    value.strip() for value in os.getenv("WB_RECONCILE_SKIP_STATES", "").split(",")
+    if value.strip())
 # Ежедневный отчёт расхождений по owner × sku (раздел 11, шаг 2).
 REPORT_INTERVAL = float(os.getenv("WB_RECONCILE_REPORT_SECONDS", "86400"))
 # Сколько держать служебные журналы лимита и публикаций остатка.
@@ -160,7 +170,8 @@ class WbReconcileWorker:
         # никогда, и его расхождения не видит никто.
         with self._pool.connection() as connection:
             with single(connection) as cursor:
-                wanted = repo.open_tasks_of_account(cursor, account["id"], limit=PAGE)
+                wanted = repo.open_tasks_of_account(cursor, account["id"], limit=PAGE,
+                                                   skip_states=SKIP_STATES)
         if not wanted:
             return 0
 
@@ -203,6 +214,8 @@ class WbReconcileWorker:
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
                 for task in repo.tasks_for_reconcile(cursor, list(statuses)):
+                    if task["state"] in SKIP_STATES:
+                        continue
                     wb_status = statuses.get(int(task["wb_order_id"]))
                     checked += 1
                     if wb_status == "cancel" and task["state"] in CANCELLABLE_ON_WB_CANCEL:
