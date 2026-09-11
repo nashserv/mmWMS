@@ -539,3 +539,46 @@ def test_skipped_states_are_not_even_asked_about(
         pool, "SELECT wb_order_id, state FROM wms_task WHERE wb_order_id = ANY(%s)",
         (order_ids,))}
     assert states[order_ids[0]] == "manual_review", "пропущенное задание тронули"
+
+
+def test_the_missing_gauge_returns_to_zero_when_there_is_nothing_to_check(
+        pool: ConnectionPool, cabinet: dict) -> None:
+    """Датчик, не возвращающийся к нулю, — вечно горящий алерт.
+
+    Последнее ненулевое значение оставалось навсегда: сверка выходила рано,
+    когда сверять нечего, и счётчик пропавших у WB заданий так и держался.
+    Дежурный приходит к исправному складу, а после пары таких вызовов
+    уведомления выключают — и молчит уже всё.
+    """
+    from app.metrics import WB_ORDERS_MISSING
+
+    seed(cabinet["account"], 1, cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    ghost = 990_000_000 + uuid.uuid4().int % 9_000_000
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "UPDATE wms_task SET wb_order_id = %s, last_reconciled_at = NULL "
+                "  WHERE wb_account_id = (SELECT id FROM wb_account WHERE external_id = %s)",
+                (ghost, cabinet["account"]))
+
+    WbReconcileWorker(pool, only_accounts=[cabinet["account"]]).tick()
+    gauge = WB_ORDERS_MISSING.labels(account=cabinet["account"])
+    assert gauge._value.get() >= 1, "сцена не собрана: пропавшее задание не посчитано"
+
+    # Задания закрылись — сверять больше нечего.
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "UPDATE wms_task SET state = 'accepted' "
+                "  WHERE wb_account_id = (SELECT id FROM wb_account WHERE external_id = %s)",
+                (cabinet["account"],))
+
+    worker = WbReconcileWorker(pool, only_accounts=[cabinet["account"]])
+    worker._next_allowed.clear()
+    worker.tick()
+
+    assert gauge._value.get() == 0, (
+        f"счётчик пропавших остался {gauge._value.get()} при пустой очереди сверки: "
+        f"алерт будет гореть вечно")

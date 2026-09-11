@@ -113,6 +113,7 @@ class WbReconcileWorker:
         for account in due:
             self._next_allowed[account["id"]] = time.monotonic() + INTERVAL
         self._refresh_gauge()
+        self._clear_settled_accounts()
         if time.monotonic() >= self._next_sweep:
             self._republish_everything()
             self._next_sweep = time.monotonic() + SWEEP_INTERVAL
@@ -173,6 +174,7 @@ class WbReconcileWorker:
                 wanted = repo.open_tasks_of_account(cursor, account["id"], limit=PAGE,
                                                    skip_states=SKIP_STATES)
         if not wanted:
+            self._note_missing(account["external_id"], 0)
             return 0
 
         calls = max(1, (len(wanted) + STATUS_BATCH - 1) // STATUS_BATCH)
@@ -198,9 +200,9 @@ class WbReconcileWorker:
         if missing:
             log.error("кабинет %s: Wildberries не знает %d наших заданий, первое — заказ %s",
                       account["external_id"], len(missing), missing[0])
-            WB_ORDERS_MISSING.labels(account=str(account["external_id"])).set(len(missing))
+            self._note_missing(account["external_id"], len(missing))
         else:
-            WB_ORDERS_MISSING.labels(account=str(account["external_id"])).set(0)
+            self._note_missing(account["external_id"], 0)
         if not statuses:
             return 0
 
@@ -297,6 +299,37 @@ class WbReconcileWorker:
                       line["seller_external_id"], line["barcode"] or "—",
                       line["state"], line["wb_status"] or "—", int(line["tasks"]),
                       line["oldest"])
+
+    def _note_missing(self, account: Any, count: int) -> None:
+        """Сколько наших заданий Wildberries не знает у этого кабинета."""
+        WB_ORDERS_MISSING.labels(account=str(account)).set(count)
+
+    def _clear_settled_accounts(self) -> None:
+        """Обнулить счётчик у кабинетов, которым сверять больше нечего.
+
+        Датчик, не возвращающийся к нулю, — это вечно горящий алерт:
+        последнее ненулевое значение остаётся навсегда, дежурный приходит к
+        исправному складу, и после пары таких вызовов уведомления выключают.
+        Молчащий датчик и датчик, орущий всегда, одинаково бесполезны.
+
+        Кабинет перестаёт попадать в выборку сверки, как только все его
+        задания закрыты, — и обнулять счётчик оказывается некому. Поэтому
+        обход идёт по ВСЕМ кабинетам, а не по тем, что попались этому
+        процессу: перезапущенный воркер иначе не обнулил бы ничего.
+        """
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                cursor.execute(
+                    "SELECT a.external_id, "
+                    "       EXISTS (SELECT 1 FROM wms_task t "
+                    "                WHERE t.wb_account_id = a.id "
+                    "                  AND t.state NOT IN ('cancelled', 'accepted', "
+                    "                                      'diverged')) AS busy "
+                    "  FROM wb_account a")
+                rows = cursor.fetchall()
+        for row in rows:
+            if not row["busy"]:
+                WB_ORDERS_MISSING.labels(account=str(row["external_id"])).set(0)
 
     def _refresh_gauge(self) -> None:
         with self._pool.connection() as connection:
