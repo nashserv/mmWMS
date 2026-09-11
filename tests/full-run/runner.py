@@ -15,10 +15,11 @@ import os
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from urllib.parse import urlparse
 
 import httpx
@@ -178,6 +179,22 @@ class Db:
                 cursor.execute(sql, tuple(params))
         except Exception as failure:  # noqa: BLE001
             not_ready(f"запрос к базе не выполнился ({failure})")
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Несколько операторов одной транзакцией, каждый со своими параметрами.
+
+        `execute_script` для этого не годится: как только у скрипта появляются
+        параметры, psycopg переходит на расширенный протокол, а тот не
+        принимает несколько команд в одном запросе. Собирать список значений
+        в текст запроса руками, чтобы обойти это, — ровно та подстановка, от
+        которой параметры и защищают.
+        """
+        connection = self._connect()
+        # `transaction()` открывает явный блок и в режиме автокоммита: до
+        # выхода из него ничего не зафиксировано, на выходе — всё сразу.
+        with connection.transaction():
+            yield
 
     def execute_script(self, sql: str, params: dict[str, Any] | None = None) -> None:
         """Выполнить многооператорный скрипт одной транзакцией.
@@ -343,9 +360,23 @@ class TxnWatch:
     # описанию — пять операторов между BEGIN и COMMIT, — и бэкенд честно сидит
     # `idle in transaction`, пока клиент готовит следующий оператор.
     # Наблюдатель с шагом 5 мс попадает в такие промежутки неизбежно.
-    # Вызов в Wildberries занимает около 500 мс и проходит через порог с
-    # запасом; промежуток между операторами — нет.
-    IDLE_LIMIT_MS = 50.0
+    #
+    # Было 50 мс, и на загруженном стенде порог ловил не сеть, а планировщик:
+    # прогон покраснел на образце 51.1 мс, где транзакцию держал `INSERT INTO
+    # outbox` — последний оператор перед коммитом, после которого никакого
+    # HTTP-вызова нет и быть не может. Полтора процента сверх порога — это не
+    # разговор с Wildberries.
+    #
+    # 250 мс: на порядок выше дрожания планировщика и вдвое ниже вызова в WB
+    # (≈500 мс, раздел 6.4). Разделяющая способность от этого не страдает —
+    # между двумя населениями почти десятикратный разрыв.
+    #
+    # Чего проверка по-прежнему НЕ видит, и это сказано в описании класса:
+    # вызов в локальный симулятор занимает около 10 мс и не перешагнёт ни
+    # старый порог, ни новый. Наблюдение калибровано на настоящий шлюз;
+    # строгая проверка «в спане транзакции нет дочерних HTTP-спанов» ждёт
+    # трассировки от потока A.
+    IDLE_LIMIT_MS = 250.0
 
     @property
     def idle_in_transaction(self) -> list[TxnSample]:

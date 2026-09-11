@@ -229,13 +229,19 @@ def _purge_run_data(db: Db, when: str) -> None:
                    "SELECT unnest(%s::text[]) AS seller_external_id", (sellers,))
         db.execute("CREATE TEMP TABLE run_owner AS SELECT id FROM owner "
                    " WHERE seller_external_id = ANY(%s)", (sellers,))
+        # Идентификаторы владельцев запоминаются ДО удаления: в биллинге
+        # кабинет прогона заведён на `owner_id` из события, а не на
+        # `full-run-seller`. Уборка по внешнему имени клиента этих начислений
+        # не видела вовсе — так их и накопилось 975 к концу аудита, по
+        # кабинету на каждый запуск.
+        owners = [str(row["id"]) for row in db.rows("SELECT id FROM run_owner")]
         db.execute_script(script)
         db.execute_script("DROP TABLE IF EXISTS run_owner; "
                           "DROP TABLE IF EXISTS run_owner_name;")
     except Exception as failure:  # noqa: BLE001 — уборка не имеет права ронять прогон
         print(f"\nуборка {when}: не удалось убрать данные прогона ({failure})")
         return
-    _purge_billing(sellers, when)
+    _purge_billing(sellers + owners, when)
     print(f"\nуборка {when}: данные прогона удалены")
 
 
@@ -258,24 +264,79 @@ def _purge_billing(sellers: list[str], when: str) -> None:
         # Клиенты прогона и всё, что от них осталось. `billing_accrual`
         # трогаем тоже: это деньги, но деньги синтетического клиента, и
         # следующий прогон посчитает их заново.
-        billing.execute(
-            "DELETE FROM billing_unbilled "
-            " WHERE COALESCE(payload->>'seller_id', payload->>'seller_external_id') "
-            "       = ANY(%s)", (sellers,))
-        billing.execute(
-            "DELETE FROM billing_commission WHERE accrual_id IN ("
-            "  SELECT a.id FROM billing_accrual a "
-            "   WHERE a.seller_external_id = ANY(%s))", (sellers,))
-        billing.execute(
-            "DELETE FROM billing_accrual WHERE seller_external_id = ANY(%s)", (sellers,))
-        billing.execute(
-            "DELETE FROM billing_inbox WHERE payload->>'seller_id' = ANY(%s)", (sellers,))
-        billing.execute(
-            "DELETE FROM cabinet WHERE seller_external_id = ANY(%s) "
-            "  AND NOT EXISTS (SELECT 1 FROM billing_accrual a "
-            "                   WHERE a.cabinet_id = cabinet.id)", (sellers,))
+        #
+        # ОДНОЙ транзакцией, и порядок здесь не косметика. Отложенный триггер
+        # `billing_commission_matches_accrual` проверяет раскладку на коммите:
+        # удалить комиссии отдельным оператором нельзя — на коммите он увидит
+        # начисление с наценкой 15.00 и раскладкой 0.00 и откажет. Пятью
+        # автокоммитами уборка падала на втором, а `except` ниже гасил жалобу
+        # в невидимый при зелёном прогоне `print`. Так в биллинге стенда
+        # накопилось 267 начислений клиента прогона за сутки с лишним.
+        #
+        # Внутри одной транзакции проверять нечего: к коммиту начисления уже
+        # нет, и триггер выходит по `total IS NULL`.
+        with billing.transaction():
+            billing.execute(
+                "DELETE FROM billing_unbilled "
+                " WHERE COALESCE(payload->>'seller_id', payload->>'seller_external_id') "
+                "       = ANY(%s)", (sellers,))
+            billing.execute(
+                "DELETE FROM billing_commission WHERE accrual_id IN ("
+                "  SELECT a.id FROM billing_accrual a "
+                "   WHERE a.seller_external_id = ANY(%s))", (sellers,))
+            billing.execute(
+                "DELETE FROM billing_accrual WHERE seller_external_id = ANY(%s)",
+                (sellers,))
+            billing.execute(
+                "DELETE FROM billing_inbox WHERE payload->>'seller_id' = ANY(%s)",
+                (sellers,))
     except Exception as failure:  # noqa: BLE001
         print(f"\nуборка {when}: биллинг не убран ({failure})")
+    finally:
+        billing.close()
+
+    _forget_the_cabinets_of_the_run(sellers, when)
+
+
+def _forget_the_cabinets_of_the_run(sellers: list[str], when: str) -> None:
+    """Кабинеты, заведённые прогоном, — ОТДЕЛЬНОЙ транзакцией.
+
+    Биллинг заводит кабинет на `owner_id` из события, а владелец у каждого
+    запуска свой: кабинет не переиспользуется, а копится — 155 штук к концу
+    аудита, и с каждым закрепление менеджера.
+
+    Почему отдельно от денег. На кабинет ссылаются десять таблиц: договор,
+    тарифное назначение, закреплённый менеджер, счёт, ценовой слой. У кабинета
+    прогона живым бывает только закрепление, но появись завтра одиннадцатая
+    ссылка — удаление упадёт. В одной транзакции с деньгами это откатило бы и
+    деньги: мусор бы остался весь, а не частью. Поэтому деньги фиксируются
+    первыми и живут своей жизнью.
+
+    Кабинет по внешнему имени клиента (`full-run-seller`) НЕ трогается: это
+    строка справочника, одна на все запуски, и следующий прогон её
+    переиспользует.
+    """
+    from scenario import LOAD_SELLER, SELLER
+
+    owners = [name for name in sellers if name not in (SELLER, LOAD_SELLER)]
+    if not owners:
+        return
+    dsn = os.getenv("BILLING_DATABASE_URL")
+    if not dsn:
+        return
+    billing = Db(dsn)
+    try:
+        with billing.transaction():
+            billing.execute(
+                "DELETE FROM cabinet_assignment WHERE cabinet_id IN ("
+                "  SELECT id FROM cabinet WHERE seller_external_id = ANY(%s))",
+                (owners,))
+            billing.execute(
+                "DELETE FROM cabinet WHERE seller_external_id = ANY(%s)", (owners,))
+    except Exception as failure:  # noqa: BLE001
+        # Деньги к этому моменту уже удалены своей транзакцией — сообщение
+        # должно говорить, что именно осталось, а не «биллинг не убран».
+        print(f"\nуборка {when}: кабинеты прогона остались ({failure})")
     finally:
         billing.close()
 

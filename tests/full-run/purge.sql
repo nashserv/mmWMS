@@ -34,7 +34,26 @@ UPDATE wms_task SET label_id = NULL, reservation_id = NULL
  WHERE owner_id IN (SELECT id FROM run_owner);
 
 DELETE FROM wb_label   WHERE task_id IN (SELECT id FROM wms_task WHERE owner_id IN (SELECT id FROM run_owner));
+
+-- Сессии подбора запоминаются ДО удаления строк: клиент у сессии не записан,
+-- и связь с прогоном живёт только в `pick_line.owner_id`. Удалить строки, а
+-- потом искать сессии, уже нечем — они становятся сиротами, неотличимыми от
+-- настоящих. Так их и накопилось 195 к концу аудита: шаг 8 открывает пять
+-- сессий за прогон, и ни одна не убиралась.
+CREATE TEMP TABLE run_session ON COMMIT DROP AS
+SELECT DISTINCT session_id AS id FROM pick_line
+ WHERE owner_id IN (SELECT id FROM run_owner);
+
 DELETE FROM pick_line  WHERE owner_id IN (SELECT id FROM run_owner);
+DELETE FROM pick_session WHERE id IN (SELECT id FROM run_session);
+
+-- Сессия без единой строки следа в `pick_line` не оставляет, и по владельцу
+-- её не найти вовсе: шаг 8 открывает пять сессий, а задание достаётся не
+-- каждой. Час — с запасом: живая сессия набирает строки в первые секунды,
+-- пустая через час означает, что сборщик ушёл, ничего не взяв.
+DELETE FROM pick_session s
+ WHERE NOT EXISTS (SELECT 1 FROM pick_line l WHERE l.session_id = s.id)
+   AND s.started_at < now() - interval '1 hour';
 DELETE FROM discrepancy WHERE owner_id IN (SELECT id FROM run_owner);
 DELETE FROM reservation WHERE owner_id IN (SELECT id FROM run_owner);
 DELETE FROM wms_return  WHERE owner_id IN (SELECT id FROM run_owner);
