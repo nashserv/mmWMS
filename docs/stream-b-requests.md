@@ -240,23 +240,26 @@ KeyError: 'state'
 >
 > Заодно нашлось, что `Dockerfile` не копировал `agent/`: фрагмент не мог
 > подняться контейнером ни разу.
+>
+> **ЗАКРЫТО ПОЛНОСТЬЮ (этап 5.1 аудита, 11.09.2026).** До него перенос был
+> наполовину: сервис в compose стоял, а `workstation-alerts.yml` в Prometheus
+> не подключался и `workstation-scrape.yml` не был влит — правила лежали в
+> репозитории и не действовали нигде. «Фрагменты перенесены» значило
+> «скопированы», а не «работают».
+>
+> Теперь: цели рабочего места и агента печати — в
+> `infrastructure/stand/prometheus/prometheus.yml`, файл правил монтируется
+> контейнеру Prometheus, `alertmanager` поднят и получает сработавшие алерты.
+> В job рабочего места добавлен Postgres: набор `@pytest.mark.stand` без базы
+> пропускался целиком, а именно он проверяет каждый запрос `Store` на
+> настоящем SQL.
 
 Плюс job в `.github/workflows/ci.yml` — тесты рабочего места:
 
-```yaml
-  workstation:
-    name: Тесты рабочего места
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: "3.13"}
-      - run: pip install --no-cache-dir -r services/fbs-operator-workstation/requirements-bus.txt pytest
-      - name: pytest
-        working-directory: services/fbs-operator-workstation
-        env: {APP_ENV: test}
-        run: python -m pytest -q
-```
+Job в `.github/workflows/ci.yml` заведён и с версии этапа 5.3 поднимает
+Postgres: без базы набор `@pytest.mark.stand` пропускается целиком, а именно
+он ловит опечатку в имени колонки, забытый `RETURNING` и значение вне `CHECK`.
+Смотреть — `ci.yml`, job `workstation`.
 
 И `PRINT_AGENT_STATS_URL` для шага 10 полного прогона — телеметрию записи в
 устройство отдают оба конца, любой на выбор:

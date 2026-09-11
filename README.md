@@ -18,12 +18,12 @@
 
 | Что | Где |
 |---|---|
-| Схема базы `wms` | [services/wms/migrations/](services/wms/migrations/) — 7 миграций, инварианты раздела 8 держат триггеры и constraint'ы |
+| Схема базы `wms` | [services/wms/migrations/](services/wms/migrations/) — 9 миграций, инварианты раздела 8 держат триггеры и constraint'ы |
 | Решения по схеме и отклонения от раздела 7 | **[docs/schema-decisions.md](docs/schema-decisions.md)** — читать вместе с миграциями |
-| Контракт API | [services/wms/contracts/openapi.yaml](services/wms/contracts/openapi.yaml) — 29 маршрутов приложения B + 6 новых |
+| Контракт API | [services/wms/contracts/openapi.yaml](services/wms/contracts/openapi.yaml) — 38 маршрутов, версия 1.3.0 ([changelog](services/wms/contracts/CHANGELOG.md)) |
 | Каталог событий | [services/wms/contracts/asyncapi.yaml](services/wms/contracts/asyncapi.yaml) |
 | Таблица маппинга статусов | **[docs/state-mapping.md](docs/state-mapping.md)** — на неё ссылаются все три потока |
-| Mock сервиса `wms` | [services/wms/app/](services/wms/app/) — потоки B и C работают против него, пока поток A не готов |
+| Сервис `wms` | [services/wms/app/](services/wms/app/) — настоящий; заглушка осталась под флагом `WMS_MOCK` и снимается им, а не пересборкой |
 | Стенд | [infrastructure/stand/](infrastructure/stand/) — `docker compose up -d`, см. [README стенда](infrastructure/stand/README.md) |
 | Скрипт полного прогона | [tests/full-run/](tests/full-run/) — 16 проверок раздела 9.6 |
 | Проверка контрактов | `bash scripts/validate-contracts.sh` |
@@ -34,9 +34,11 @@
   схемами из самого `asyncapi.yaml`
   ([тест](services/wms/tests/test_contract_conformance.py)). Заглушка, шлющая
   не ту форму, учит консьюмеры неправильному формату — это хуже её отсутствия.
-- **Красный прогон на старте — норма.** `wms` пока заглушка, поэтому шаги,
-  требующие настоящей транзакции и нагрузки, падают. Скрипт показывает, чего
-  именно ещё нет, и зеленеет по мере готовности потоков.
+- **Полный прогон зелёный целиком.** 16 из 16 проверок раздела 9.6 против
+  настоящего `wms`. Гоняется каждую ночь сам
+  ([таймер](infrastructure/stand/systemd/), отчёты в
+  `tests/full-run/reports/`): прогон, который гоняют руками, гоняют перед
+  демонстрацией.
 
 ## Справочные материалы
 
