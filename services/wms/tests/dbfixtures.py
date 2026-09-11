@@ -78,3 +78,14 @@ def unique(prefix: str) -> str:
     сервис и будет жить.
     """
     return f"utest-{prefix}-{uuid.uuid4().hex[:12]}"
+
+# Тесты зовут `wms` как соседний сервис, а не как человек: сервисный токен —
+# ровно тот путь, которым в него ходят рабочее место, каталог и возвраты.
+SERVICE_TOKEN = "test-service-token-not-a-secret"
+
+
+def service_headers() -> dict[str, str]:
+    import os
+
+    os.environ.setdefault("SERVICE_TOKEN", SERVICE_TOKEN)
+    return {"Authorization": f"Bearer {os.environ['SERVICE_TOKEN']}"}

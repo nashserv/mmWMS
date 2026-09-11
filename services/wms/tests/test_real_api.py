@@ -16,7 +16,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from dbfixtures import require_database, unique
+from dbfixtures import require_database, service_headers, unique
 
 BASE = "/api/mmx/wms/v1"
 
@@ -38,7 +38,7 @@ def client() -> TestClient:
 
 
 def call(client: TestClient, path: str, params: dict | None = None) -> dict:
-    response = client.post(f"{BASE}{path}",
+    response = client.post(f"{BASE}{path}", headers=service_headers(),
                            json={"jsonrpc": "2.0", "method": "call",
                                  "params": params or {}, "id": 7})
     assert response.status_code == 200, response.text
@@ -171,7 +171,7 @@ def test_wb_account_never_returns_a_token(client: TestClient, seller: dict) -> N
 
 def test_a_live_token_is_refused_as_a_secret_ref(client: TestClient, seller: dict) -> None:
     """Раздел 12: живой токен на стенде отправил бы команды в кабинет клиента."""
-    response = client.post(f"{BASE}/wb/accounts", json={
+    response = client.post(f"{BASE}/wb/accounts", headers=service_headers(), json={
         "jsonrpc": "2.0", "method": "call", "id": 3,
         "params": {"op": "upsert", "external_id": unique("wb"),
                    "seller_external_id": seller["seller"], "display_name": "нельзя",

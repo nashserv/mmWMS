@@ -145,7 +145,7 @@ class Walk:
     def post(self, template: str, path: str | None = None,
              params: dict | None = None) -> dict:
         response = self._client.post(
-            f"{BASE}{path or template}",
+            f"{BASE}{path or template}", headers=dbfixtures.service_headers(),
             json={"jsonrpc": "2.0", "method": "call", "params": params or {}, "id": 1})
         assert response.status_code == 200, f"{template}: HTTP {response.status_code} — {response.text[:300]}"
         body = response.json()
@@ -363,7 +363,7 @@ def test_the_stub_respects_claim_false(client: TestClient) -> None:
     нет» — неотличимо от «новые заказы не падают в приложение».
     """
     for order in (7201, 7202, 7203, 7204):
-        client.post(f"{BASE}/reservations", json={
+        client.post(f"{BASE}/reservations", headers=dbfixtures.service_headers(), json={
             "jsonrpc": "2.0", "method": "call", "id": 1,
             "params": {"seller_external_id": "seller-a", "barcode": "2000000000011",
                        "quantity": 1, "wb_order_id": order,
@@ -373,7 +373,7 @@ def test_the_stub_respects_claim_false(client: TestClient) -> None:
         params: dict[str, Any] = {"limit": 2, "claim": claim}
         if assignee:
             params["assignee"] = assignee
-        body = client.post(f"{BASE}/tasks/pull", json={
+        body = client.post(f"{BASE}/tasks/pull", headers=dbfixtures.service_headers(), json={
             "jsonrpc": "2.0", "method": "call", "id": 1,
             "params": params}).json()["result"]
         return [item["task"]["task_id"] for item in body["tasks"]]
@@ -394,7 +394,7 @@ def test_the_stub_respects_claim_false(client: TestClient) -> None:
 def test_the_stub_respects_the_states_filter(client: TestClient) -> None:
     """Заявка 2 потока B: без фильтра задания в работе не видны вовсе."""
     order = walk_state_setup(client)
-    in_work = client.post(f"{BASE}/tasks/pull", json={
+    in_work = client.post(f"{BASE}/tasks/pull", headers=dbfixtures.service_headers(), json={
         "jsonrpc": "2.0", "method": "call", "id": 1,
         "params": {"limit": 50, "claim": False,
                    "states": ["picking"]}}).json()["result"]["tasks"]
@@ -405,12 +405,12 @@ def test_the_stub_respects_the_states_filter(client: TestClient) -> None:
 
 def walk_state_setup(client: TestClient) -> str:
     """Заводит задание и переводит его в `picking`."""
-    task_id = client.post(f"{BASE}/reservations", json={
+    task_id = client.post(f"{BASE}/reservations", headers=dbfixtures.service_headers(), json={
         "jsonrpc": "2.0", "method": "call", "id": 1,
         "params": {"seller_external_id": "seller-a", "barcode": "2000000000011",
                    "quantity": 1, "wb_order_id": 7301,
                    "correlation_id": "states-7301"}}).json()["result"]["task_id"]
-    client.post(f"{BASE}/tasks/pull", json={
+    client.post(f"{BASE}/tasks/pull", headers=dbfixtures.service_headers(), json={
         "jsonrpc": "2.0", "method": "call", "id": 1,
         "params": {"assignee": "bbbbbbbb-0000-4000-8000-000000000009",
                    "limit": 50, "claim": True}})

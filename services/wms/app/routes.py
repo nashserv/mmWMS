@@ -20,6 +20,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from .metrics import observe_http
+from . import auth
 from .postgres import ConnectionPool
 from .stock_push import publisher as stock_publisher_for
 from .supplies import release_from_supply, verify_account
@@ -130,7 +131,39 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     # которого раздел 10 требует «WB → задание» под 2 с. Склад от шины не
     # зависит (раздел 6.1), торопиться с уведомлением незачем.
 
-    def guarded(handler: Callable[[dict[str, Any]], Any]):
+    # ------------------------------------------------------ кто спрашивает
+
+    # Маршруты, которые обязаны отвечать без токена: по ним смотрят, жив ли
+    # сервис, и требовать для этого identity значит связать готовность склада
+    # с готовностью соседа.
+    OPEN_PATHS = frozenset({"/health"})
+
+    # Управление кабинетами WB — отдельная роль (раздел 6.7). За этими
+    # маршрутами стоят токены Wildberries: право их менять не то же самое, что
+    # право собирать заказы.
+    WB_ADMIN_PATHS = ("/wb/accounts",)
+
+    def _roles_for(path: str) -> tuple[str, ...]:
+        if any(path.startswith(prefix) for prefix in WB_ADMIN_PATHS):
+            return ("wb_accounts_admin", "admin")
+        return ()
+
+    def _check(request: Request, path: str) -> JSONResponse | None:
+        """Отказ или None. Сервисный токен разрешён: рабочее место, каталог и
+        возвраты зовут `wms` не от имени человека."""
+        if path in OPEN_PATHS:
+            return None
+        try:
+            auth.require(request.headers, *_roles_for(path), allow_service=True)
+        except auth.AuthError as refused:
+            observe_http(refused.status_code, 0.0)
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": JSONRPC_INVALID_PARAMS, "message": refused.message}},
+                status_code=refused.status_code)
+        return None
+
+    def guarded(handler: Callable[[dict[str, Any]], Any], path: str = ""):
         """Обёртка вокруг обработчика: валидация — 400 по протоколу, сбой — 500.
 
         Разделение принципиальное: прикладной отказ («товар не найден») уезжает
@@ -139,6 +172,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
         """
         async def endpoint(request: Request) -> JSONResponse:
             started = time.monotonic()
+            refused = _check(request, path)
+            if refused is not None:
+                return refused
             body = await _body(request)
             try:
                 payload = handler(_params(body))
@@ -166,7 +202,7 @@ def create_router(pool: ConnectionPool) -> APIRouter:
         return handler
 
     def post(path: str, handler: Callable[[dict[str, Any]], Any]) -> None:
-        router.add_api_route(path, guarded(handler), methods=["POST"])
+        router.add_api_route(path, guarded(handler, path), methods=["POST"])
 
     def post_id(path: str, handler: Callable[..., Any]) -> None:
         """Маршрут с идентификатором в пути: `/tasks/{task_id}/...`.
@@ -176,6 +212,9 @@ def create_router(pool: ConnectionPool) -> APIRouter:
         """
         async def endpoint(request: Request) -> JSONResponse:
             started = time.monotonic()
+            refused = _check(request, path)
+            if refused is not None:
+                return refused
             body = await _body(request)
             # Идентификатор берём из пути сами: у маршрутов возвратов и
             # кабинетов он называется иначе, а обработчик один.
