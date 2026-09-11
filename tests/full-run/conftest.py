@@ -158,16 +158,23 @@ def _wait_for_the_cabinet_limit(db: Db) -> None:
             # — тогда опросчик отодвигает `next_sync_at` и ставит кабинету
             # статус RATE_LIMITED. Ждать надо обе.
             blocked = db.value(
+                # Пауза кабинета живёт в `wb_account.blocked_until` (этап 2.10):
+                # в строке минутного окна она забывалась со сменой минуты.
                 "SELECT GREATEST( "
-                "         COALESCE(MAX(EXTRACT(EPOCH FROM (rl.blocked_until - now()))), 0), "
+                "         COALESCE(MAX(EXTRACT(EPOCH FROM (a.blocked_until - now()))), 0), "
                 "         COALESCE(MAX(EXTRACT(EPOCH FROM (a.next_sync_at - now()))), 0)) AS s "
                 "  FROM wb_account a "
-                "  LEFT JOIN wb_rate_limit rl ON rl.account_id = a.id "
                 " WHERE a.external_id = %s "
-                "   AND (rl.blocked_until > now() "
+                "   AND (a.blocked_until > now() "
                 "        OR (a.sync_error_code IS NOT NULL AND a.next_sync_at > now()))",
                 (WB_ACCOUNT,))
-        except Exception:  # noqa: BLE001 — ожидание не имеет права ронять прогон
+        except Exception as failure:  # noqa: BLE001
+            # Раньше здесь был тихий `return`: сломанный запрос делал вид,
+            # что кабинет свободен, и прогон шёл дальше в лимит — краснея
+            # шагом, который к причине отношения не имеет. Ждать перестаём,
+            # но говорим, почему.
+            print(f"  ВНИМАНИЕ: не удалось узнать, свободен ли кабинет: "
+                  f"{type(failure).__name__}: {failure}")
             return
         if not blocked or float(blocked) <= 0:
             if clear_since is None:

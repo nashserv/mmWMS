@@ -1,0 +1,27 @@
+# Полный прогон раздела 9.6 — каждую ночь, сам.
+#
+# Прогон, который гоняют руками, гоняют перед демонстрацией. Ночной прогон
+# показывает, что сломалось за день, ДО того, как это увидит склад:
+# шестнадцать проверок раздела 9.6 — единственное место, где путь проверяется
+# целиком.
+#
+# Ставится так:
+#   cp infrastructure/stand/systemd/mmwms-full-run.* /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now mmwms-full-run.timer
+
+[Unit]
+Description=mmWMS: полный прогон раздела 9.6
+# Стенд поднимает docker; без него прогону не с чем разговаривать.
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/mmwms-integrator
+# Секреты стенда приходят файлом окружения, а не из юнита: в юните они
+# попали бы в `systemctl cat` и в журнал (инвариант 15).
+EnvironmentFile=/root/mmwms-integrator/infrastructure/stand/.env
+ExecStart=/root/mmwms-integrator/infrastructure/stand/scripts/nightly-full-run.sh
+# Прогон долгий: шестнадцать шагов, нагрузка, выключение шины.
+TimeoutStartSec=3600

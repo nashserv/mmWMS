@@ -31,6 +31,12 @@ from runner import (Db, LoadResult, TxnWatch, Wms, env, lock_hold_histogram,
                     not_ready, percentile_from_buckets, port_is_open,
                     wait_until)
 
+# Формат стикера берётся ИЗ ОКРУЖЕНИЯ, как и у сервиса. Жёстко вписанный
+# `zplv` делал прогон красным ровно в тот день, когда владелец ответит на
+# вопрос 2 раздела 13 и стенд переведут на png: прогон сказал бы «сломано»
+# про исправную настройку.
+STICKER_FORMAT = (os.getenv("WB_STICKER_FORMAT") or "zplv").strip()
+
 # Задержка «WB → доступность в /tasks/pull» — менее 2 с, p99 (раздел 10).
 TASK_VISIBLE_S = 2.0
 
@@ -744,6 +750,28 @@ def test_step_12_every_billable_operation_is_accrued_45_15_30(
     billing = Db(env("BILLING_DATABASE_URL"))
     table = os.getenv("BILLING_ACCRUAL_TABLE", "billing_accrual")
     try:
+        # КАЖДЫЙ тип проверяется отдельно, а не «хоть что-то начислилось».
+        #
+        # Общая проверка зеленела на одной услуге из трёх: упаковка не
+        # тарифицировалась вовсе (включён был `order.packed.v1`, которого
+        # никто не шлёт), а шаг всё равно был зелёным — по отгрузке.
+        seen_types = {event["type"] for event in billable}
+        missing = [name for name in data.BILLABLE_EVENT_TYPES if name not in seen_types]
+        assert not missing, (
+            f"за прогон не пришло ни одного события типов {missing}: услуга "
+            f"делается, а тарифицировать её нечем. Именно так упаковка — самая "
+            f"частая операция склада — шла клиенту бесплатно")
+
+        # Неизвестный тип в списке включённых — тоже находка: он не
+        # тарифицируется, и узнать об этом можно только здесь.
+        enabled = {row["event_type"] for row in billing.rows(
+            "SELECT event_type FROM billing_billable_event WHERE active")}
+        unknown = sorted(enabled - set(data.BILLABLE_EVENT_TYPES))
+        assert not unknown, (
+            f"включены типы, которых прогон не видел ни разу: {unknown}. "
+            f"Либо их никто не издаёт, либо прогон их не покрывает — и то и "
+            f"другое значит невыставленный счёт")
+
         for event in billable:
             accrual = billing.row(
                 f"SELECT * FROM {table} WHERE event_id = %s", (event["event_id"],))  # noqa: S608
@@ -859,6 +887,34 @@ def test_step_14_tasks_keep_arriving_through_tasks_pull_with_the_broker_down(
     finally:
         subprocess.run(start_cmd, shell=True, capture_output=True, text=True, timeout=120)
         wait_until(lambda: port_is_open(rabbit_url), timeout_s=60, interval_s=1.0)
+
+    # Шина вернулась — консьюмер обязан вернуться вместе с ней.
+    #
+    # Проверка «склад работает без шины» без этой половины неполна: она
+    # оставляла консьюмер лежащим, а неоплаченная работа копилась бы дальше
+    # молча. Именно так это и выглядит в боевом контуре — всё «работает», а
+    # счёт не выставляется.
+    billing = Db(env("BILLING_DATABASE_URL"))
+    try:
+        before = int(billing.value(
+            "SELECT count(*) AS n FROM billing_inbox") or 0)
+        order_id = scenario.next_order_id()
+        wms.result("/reservations", {
+            "idempotency_key": scenario.idem(f"after-bus-{order_id}"),
+            "seller_external_id": data.SELLER, "wb_account_external_id": data.WB_ACCOUNT,
+            "wb_order_id": order_id, "sku": data.BARCODES[1], "barcode": data.BARCODES[1],
+            "quantity": 1, "correlation_id": scenario.reference("after-bus")})
+
+        recovered = wait_until(
+            lambda: (int(billing.value("SELECT count(*) AS n FROM billing_inbox") or 0)
+                     > before) or None,
+            timeout_s=90, interval_s=1.0)
+        assert recovered, (
+            "после включения шины консьюмер биллинга не разобрал ни одного "
+            "нового события за полторы минуты: он не переподключился, и "
+            "неоплаченная работа будет копиться молча")
+    finally:
+        billing.close()
 
 
 # ============================================================= шаг 15 (A)

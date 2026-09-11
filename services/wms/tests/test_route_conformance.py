@@ -22,7 +22,8 @@ import os
 import pathlib
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 import pytest
 import yaml
