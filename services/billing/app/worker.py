@@ -93,6 +93,7 @@ class OutboxLoop:
         self._url = url
         self._stopping = stopping
         self._connection: Any = None
+        self._channel: Any = None
 
     def run(self) -> None:
         while not self._stopping.is_set():
@@ -101,6 +102,7 @@ class OutboxLoop:
             except Exception as failure:  # noqa: BLE001
                 log.warning("публикация outbox не прошла: %s", failure)
                 self._connection = None
+                self._channel = None
                 published = 0
             if published == 0:
                 self._stopping.wait(OUTBOX_INTERVAL)
@@ -118,8 +120,20 @@ class OutboxLoop:
 
         if self._connection is None or self._connection.is_closed:
             self._connection = pika.BlockingConnection(pika.URLParameters(self._url))
-        channel = self._connection.channel()
-        channel.exchange_declare(exchange=events_exchange(), exchange_type="topic", durable=True)
+            self._channel = None
+        if self._channel is None or self._channel.is_closed:
+            # Канал переиспользуется, а не создаётся на каждую пачку: лимит
+            # каналов на соединение у RabbitMQ конечен, а пачки идут каждую
+            # секунду.
+            self._channel = self._connection.channel()
+            self._channel.exchange_declare(
+                exchange=events_exchange(), exchange_type="topic", durable=True)
+            # Подтверждения брокера. Без них `basic_publish` возвращается,
+            # как только байты ушли в сокет: событие помечается
+            # опубликованным, из outbox уходит, а RabbitMQ мог его не принять.
+            # Ровно то, что outbox и должен исключать.
+            self._channel.confirm_delivery()
+        channel = self._channel
 
         published = 0
         for row in rows:
@@ -133,7 +147,10 @@ class OutboxLoop:
                     exchange=events_exchange(), routing_key=row["type"],
                     body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                     properties=pika.BasicProperties(content_type="application/json",
-                                                    delivery_mode=2))
+                                                    delivery_mode=2),
+                    # Некуда положить — отказ, а не тишина: событие без очереди
+                    # обмен принимает и выбрасывает.
+                    mandatory=True)
             except Exception as failure:  # noqa: BLE001
                 with self._db.transaction() as cursor:
                     cursor.execute(

@@ -66,11 +66,15 @@ class BillingService:
         except EnvelopeError as error:
             # Конверт неразбираем — записать в inbox нечего (нет ключа), но
             # потерять событие нельзя. Причина видна в billing_unbilled.
-            event_id = str((body or {}).get("event_id") or repo.new_id())
+            # Ключ обязан быть uuid: `billing_unbilled.event_id` — колонка
+            # uuid, и строка «не-uuid» роняла саму запись об отказе. Событие с
+            # мусорным ключом исчезало вместе с объяснением, почему исчезло.
+            given = str((body or {}).get("event_id") or "").strip()
+            event_id, detail = _uuid_or_new(given, str(error))
             with self.db.transaction() as cursor:
                 repo.record_unbilled(
                     cursor, event_id, str((body or {}).get("type") or "?"),
-                    UnbilledReason.BAD_ENVELOPE.value, str(error),
+                    UnbilledReason.BAD_ENVELOPE.value, detail,
                     body if isinstance(body, dict) else {"raw": str(body)}, None, None)
             UNBILLED.labels(reason=UnbilledReason.BAD_ENVELOPE.value).inc()
             return {"outcome": "unbilled", "reason": UnbilledReason.BAD_ENVELOPE.value,
@@ -283,9 +287,15 @@ class BillingService:
         if value is None:
             return None
         try:
-            return Decimal(str(value))
+            quantity = Decimal(str(value))
         except (InvalidOperation, ValueError):
             return None
+        # `Decimal("NaN")` и `Decimal("Infinity")` разбираются успешно, а
+        # дальше превращаются в сумму счёта: `NaN` проходит все сравнения
+        # ложью, и начисление уходит клиенту числом, которого не бывает.
+        if not quantity.is_finite():
+            return None
+        return quantity
 
     @staticmethod
     def _allocation_key(envelope: Envelope) -> str | None:
@@ -447,3 +457,20 @@ class BillingService:
             "branch": rows,
             "branch_total": sum((Decimal(row["amount"]) for row in rows), Decimal("0")),
         }
+
+
+def _uuid_or_new(given: str, error: str) -> tuple[str, str]:
+    """Ключ отказа: сам `event_id`, если он uuid, иначе новый — с оригиналом.
+
+    Оригинал уходит в `detail`: без него разбирать нечего — событие есть,
+    а чьё оно, неизвестно.
+    """
+    import uuid as _uuid
+
+    try:
+        return str(_uuid.UUID(given)), error
+    except (ValueError, AttributeError):
+        replacement = repo.new_id()
+        origin = f"event_id {given!r} не uuid, записан под {replacement}" if given \
+            else "event_id отсутствует"
+        return replacement, f"{error}; {origin}"

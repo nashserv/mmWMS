@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 import psycopg
+from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 
 
@@ -34,6 +35,18 @@ class Database:
     def connection(self) -> Iterator[psycopg.Connection]:
         with self._lock:
             connection = self._free.pop() if self._free else None
+        # `closed` — это то, что МЫ закрыли. Соединение, оборванное со стороны
+        # сервера — перезагрузка Postgres, обрыв сети, `pg_terminate_backend`, —
+        # остаётся `closed == False` и падает только на первом запросе, унося с
+        # собой событие, которое в этот момент обрабатывалось.
+        if connection is not None and not connection.closed:
+            if connection.broken or connection.info.transaction_status not in (
+                    TransactionStatus.IDLE,):
+                try:
+                    connection.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                connection = None
         if connection is None or connection.closed:
             connection = self._open()
         try:
@@ -81,6 +94,21 @@ class Database:
                 return True
         except Exception:
             return False
+
+    def reconnect(self) -> None:
+        """Выбросить пул целиком: за ним больше нет живого сервера.
+
+        Зовётся консьюмером после отказа базы. Оставлять соединения в пуле
+        значит отдать следующему событию то же мёртвое соединение — и получить
+        тот же отказ, только на следующем событии.
+        """
+        with self._lock:
+            stale, self._free = self._free, []
+        for connection in stale:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def close(self) -> None:
         with self._lock:

@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 import pika
+import psycopg
 from prometheus_client import start_http_server
 
 from .config import app_environment, database_url, events_exchange
@@ -47,6 +48,9 @@ class Consumer:
         self._url = url
         self._service = service
         self._stopping = threading.Event()
+        # Сколько отказов базы подряд: пауза растёт, чтобы не долбить
+        # поднимающийся Postgres и не крутить очередь вхолостую.
+        self._outages = 0
 
     def stop(self, *_: Any) -> None:
         self._stopping.set()
@@ -59,6 +63,25 @@ class Consumer:
                 log.warning("шина недоступна (%s), повтор через 5 с", failure)
                 self._stopping.wait(5.0)
 
+    def _remember_failure(self, event: dict, failure: Exception) -> None:
+        """Записать отказ в inbox отдельной транзакцией.
+
+        Отдельной — потому что транзакция, в которой обработчик упал, уже
+        откатилась; писать след в неё значит не писать его вовсе.
+        """
+        event_id = str((event or {}).get("event_id") or "").strip()
+        if not event_id:
+            return
+        try:
+            with self._service.db.transaction() as cursor:
+                cursor.execute(
+                    "UPDATE billing_inbox "
+                    "   SET processed_at = now(), outcome = 'failed', last_error = %s "
+                    " WHERE event_id = %s",
+                    (f"{type(failure).__name__}: {failure}"[:500], event_id))
+        except Exception:  # noqa: BLE001 — след важен, но не важнее работы
+            log.exception("отказ по событию %s не записан в inbox", event_id)
+
     def _consume(self) -> None:
         connection = pika.BlockingConnection(pika.URLParameters(self._url))
         channel = connection.channel()
@@ -70,6 +93,11 @@ class Consumer:
             "x-dead-letter-exchange": "",
             "x-dead-letter-routing-key": DEAD_LETTER_QUEUE,
         })
+        # Очередь мёртвых писем объявляется ЗДЕСЬ. Ссылка на неё в аргументах
+        # очереди выше брокеру ничего не создаёт: если такой очереди нет,
+        # RabbitMQ выбрасывает отвергнутое сообщение молча — и «dead_letters
+        # пуст» значит не «потерь нет», а «терялось в никуда» (раздел 3.5).
+        channel.queue_declare(queue=DEAD_LETTER_QUEUE, durable=True)
         channel.queue_bind(exchange=events_exchange(), queue=QUEUE, routing_key=ROUTING_KEY)
         channel.basic_qos(prefetch_count=32)
         log.info("слушаю %s ← %s (%s)", QUEUE, events_exchange(), ROUTING_KEY)
@@ -93,12 +121,38 @@ class Consumer:
                 elif result.get("outcome") == "unbilled":
                     log.warning("не начислено: %s (%s)", result.get("reason"),
                                 result.get("detail"))
+            except (psycopg.OperationalError, psycopg.InterfaceError) as failure:
+                # База упала, а не событие плохое. Отправлять его в мёртвые
+                # письма значит терять выручку за чужую беду: перезагрузили
+                # Postgres — и вся пачка ушла в разбор вручную.
+                #
+                # Событие возвращается в очередь, пул пересоздаётся, пауза
+                # растёт: 1, 2, 4… до минуты. Дальше — новое соединение с
+                # брокером, потому что канал за это время мог умереть.
+                self._outages += 1
+                wait = min(60.0, 2 ** min(self._outages - 1, 6))
+                log.warning("база недоступна (%s): событие возвращено в очередь, "
+                            "пауза %.0f с (подряд %d)", failure, wait, self._outages)
+                try:
+                    channel.basic_nack(method.delivery_tag, requeue=True)
+                except Exception:  # noqa: BLE001 — канал мог умереть вместе с базой
+                    pass
+                self._service.db.reconnect()
+                self._stopping.wait(wait)
+                break
             except Exception as failure:  # noqa: BLE001
                 # Ошибка обработчика: событие уходит в мёртвые письма с
                 # сохранённым следом в billing_inbox. Тихого ack здесь быть не
                 # может — это ровно та потеря выручки, которую чиним.
+                #
+                # След пишется ОТДЕЛЬНОЙ транзакцией и ДО `nack`: транзакция, в
+                # которой обработчик упал, откатится вместе со следом, и
+                # событие уйдёт в мёртвые письма без единого объяснения.
                 log.exception("обработка события упала: %s", failure)
+                self._remember_failure(event, failure)
                 channel.basic_nack(method.delivery_tag, requeue=False)
+            else:
+                self._outages = 0
 
         try:
             channel.cancel()

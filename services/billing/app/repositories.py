@@ -365,6 +365,14 @@ def claim_event(cursor: Cursor, event_id: str, event_type: str, tenant_id: str,
     Иначе причину устраняют, а событие остаётся невыставленным навсегда:
     ровно так неоплаченная работа копилась и оставалась неоплаченной.
     """
+    # Начисление живёт дольше строки inbox: ретеншен убирает разобранное через
+    # 90 дней, а деньги остаются. Повтор доставки после уборки нашёл бы inbox
+    # пустым и начислил бы второй раз — по событию, за которое клиент уже
+    # заплатил. `billing_accrual.event_id` уникален и служит вторым рубежом.
+    cursor.execute("SELECT 1 FROM billing_accrual WHERE event_id = %s", (event_id,))
+    if cursor.fetchone() is not None:
+        return False
+
     cursor.execute(
         """
         INSERT INTO billing_inbox (event_id, event_type, tenant_id, correlation_id,
