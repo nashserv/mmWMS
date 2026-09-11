@@ -21,7 +21,7 @@ from typing import Any
 from datetime import datetime, timezone
 
 from . import metrics
-from .domain import TERMINAL_STATES
+from .domain import TERMINAL_STATES, assignee_id
 from .projection import SCREEN_STATES, Projection
 from .wms_client import PullBatch, WmsClient, WmsUnavailable
 
@@ -215,7 +215,7 @@ class Poller:
         for actor in sorted(actors):
             try:
                 batch = await self._client.tasks_pull(
-                    limit=self._limit, claim=False, assignee=actor,
+                    limit=self._limit, claim=False, assignee=assignee_id(actor),
                     states=SCREEN_STATES,
                     previous={task.task_id: task for task in self._projection.all()})
             except WmsUnavailable:
@@ -364,8 +364,14 @@ class Poller:
         есть.
         """
         previous = {task.task_id: task for task in self._projection.all()}
+        # Контракт `wms` описывает `assignee` как uuid (версия 1.3.0). На
+        # экране сборщик набирает себя руками, поэтому имя разворачивается в
+        # тот же uuid, что и на стороне `wms`: «за кем задание» остаётся
+        # воспроизводимым, а по значению `picker-1` в базе человека было не
+        # найти.
         batch = await self._client.tasks_pull(
-            assignee=assignee, limit=limit, claim=True, lease_seconds=lease_seconds,
+            assignee=assignee_id(assignee), limit=limit, claim=True,
+            lease_seconds=lease_seconds,
             owner_external_ids=owner_external_ids, previous=previous)
         for task in batch.tasks:
             self._projection.upsert(task)

@@ -454,7 +454,8 @@ class WmsClient:
     async def print_label(self, task_id: str, *, station_id: str, idempotency_key: str,
                           copies: int = 1, reprint: bool = False, reason: str | None = None,
                           actor_id: str | None = None,
-                          expected_order_id: Any = None) -> Label:
+                          expected_order_id: Any = None,
+                          expected_owner: str | None = None) -> Label:
         """Отдать локальный стикер станции и зафиксировать факт печати.
 
         Ни одного вызова в Wildberries на этом пути (инвариант 9) — иначе
@@ -476,6 +477,7 @@ class WmsClient:
                                  attempts=2, metric_route="/labels/{id}/print")
         self._reject_if_error_code("/labels/{id}/print", result)
         label = self._build_label(task_id, result, expected_order_id=expected_order_id,
+                                  expected_owner=expected_owner,
                                   route="/labels/{id}/print")
         label.station_id = str(result.get("station_id") or station_id)
         label.printer_transport = str(result.get("printer_transport") or "agent")
@@ -483,15 +485,36 @@ class WmsClient:
         return label
 
     def _build_label(self, task_id: str, result: dict[str, Any], *,
-                     expected_order_id: Any = None, route: str = "/tasks/{id}/label") -> Label:
+                     expected_order_id: Any = None, expected_owner: str | None = None,
+                     route: str = "/tasks/{id}/label") -> Label:
         body, _how = decode_label_payload(result.get("payload"), result.get("checksum"))
+
+        # Три сверки, и все три об одном: напечатанный чужой стикер отправит
+        # вещь другому покупателю — это хуже, чем ненапечатанный.
+        returned_task = _text_or_none(result.get("task_id"))
+        if returned_task is not None and returned_task != str(task_id):
+            raise LabelUnusable(
+                f"стикер выписан на задание {returned_task}, а печатается "
+                f"{task_id}")
+
+        owner = _text_or_none(result.get("owner_external_id"))
+        if expected_owner and owner and owner != expected_owner:
+            # Изоляция владельца — инвариант, а не предупреждение (инвариант 6).
+            raise LabelUnusable(
+                f"стикер выписан клиенту {owner}, а задание принадлежит "
+                f"{expected_owner}")
+
         order_id = result.get("order_id")
         if expected_order_id is not None and order_id is not None:
             if str(order_id) != str(expected_order_id):
-                # Напечатанный чужой стикер отправит вещь другому покупателю.
                 raise LabelUnusable(
                     f"стикер выписан на заказ {order_id}, а печатается задание "
                     f"с заказом {expected_order_id}")
+        if expected_order_id is not None and order_id is None:
+            # Поле есть в контракте с 1.3.0. Его отсутствие — не повод
+            # печатать вслепую, но и не повод остановить смену: считаем и
+            # показываем, чтобы расхождение контракта было видно.
+            metrics.CONTRACT_FALLBACKS.labels(route=route, field="order_id").inc()
         label_format = _content_type_to_format(result.get("content_type"), result.get("format"))
         return Label(
             task_id=str(result.get("task_id") or task_id),
@@ -530,10 +553,14 @@ class WmsClient:
                      handed_over: bool = False, reason: str | None = None) -> dict[str, Any]:
         """Отмена задания.
 
-        Замороженная форма запроса поля причины не несёт — её выводит сервер.
-        Но своя причина всё равно передаётся и записывается локально: в боевом
-        контуре у всех 2645 отмен `manual_review_reason` был NULL, и разобрать
-        их задним числом стало нечем.
+        `reason` — часть контракта с версии 1.3.0 и передаётся серверу: у
+        отмены с рабочего места причина есть, и она разбираема («брак:
+        порвана упаковка»), а выведенная сервером «отменено по событию
+        ws-cancel-…» — нет. До 1.3.0 поле контрактом не принималось и
+        отправлять его было нельзя.
+
+        В боевом контуре у всех 2645 отмен `cancel_reason` был пуст, и
+        разобрать их задним числом стало нечем.
         """
         params: dict[str, Any] = {
             "cancellation_event_id": cancellation_event_id,

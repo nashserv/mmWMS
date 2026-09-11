@@ -21,6 +21,29 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Пространство имён для идентификатора исполнителя. То же самое, что в
+# `services/wms/app/tasks.py`: имя рабочего места («Иванов», «picker-1»)
+# разворачивается в один и тот же uuid по обе стороны, и «за кем задание»
+# остаётся воспроизводимым от смены к смене.
+#
+# Контракт `wms` описывает `assignee` как uuid (версия 1.3.0), а на экране
+# сборщик по-прежнему набирает себя руками: пользователей и ролей у рабочего
+# места пока нет. Пока их нет, uuid выводится из имени — это допущение
+# интегратора, записанное в разделе 13 мастера.
+ASSIGNEE_NAMESPACE = uuid.UUID("2f1c9a44-7b8e-4d5c-9a3f-1e6b0d8c5a72")
+
+
+def assignee_id(value: str | None) -> str | None:
+    """Имя исполнителя → uuid. Настоящий uuid проходит как есть."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return str(uuid.UUID(text))
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(ASSIGNEE_NAMESPACE, text))
+
+
 def uid() -> str:
     return str(uuid.uuid4())
 

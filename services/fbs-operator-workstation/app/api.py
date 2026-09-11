@@ -148,7 +148,11 @@ class ShelfCommand(BaseModel):
     cell_address: str = Field(min_length=1, max_length=64)
     actor_id: str = Field(min_length=1, max_length=128)
     box_barcode: str | None = None
-    reason: str | None = None
+    # Причина обязательна: возврат без причины — та самая тихая запись,
+    # из-за которой у всех 2645 отмен боевого контура причина пуста.
+    # `wms` отвергнет такой возврат, и отказ дойдёт до сборщика уже после
+    # того, как он отошёл от стойки.
+    reason: str = Field(min_length=1, max_length=512)
 
 
 class ScreenQuery(BaseModel):

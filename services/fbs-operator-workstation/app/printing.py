@@ -86,7 +86,8 @@ class PrintService:
             label = await self._client.print_label(
                 task_id, station_id=station_id, idempotency_key=key, copies=copies,
                 reprint=reprint, reason=reason, actor_id=actor_id,
-                expected_order_id=expected_order)
+                expected_order_id=expected_order,
+                expected_owner=task.owner_external_id if task else None)
         except LabelUnusable as error:
             # Напечатанный чужой стикер отправит вещь другому покупателю —
             # это хуже ненапечатанного.

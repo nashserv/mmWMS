@@ -313,9 +313,14 @@ def test_the_screen_keeps_showing_what_a_picker_is_holding() -> None:
     poller = Poller(client, projection, store=Store())
     asyncio.run(poller.poll_once())
 
-    assert client.asked == [None, "picker-7"], (
+    from app.domain import assignee_id
+
+    assert client.asked == [None, assignee_id("picker-7")], (
         f"опросы {client.asked}: второй опрос по актору с открытой сессией "
         f"не сделан, и задание в руках не попало на экран")
+    assert client.asked[1] != "picker-7", (
+        "исполнитель уехал в wms именем: контракт описывает assignee как uuid, "
+        "и по значению picker-7 в базе человека не найти")
     on_screen = {task.task_id for task in projection.all()}
     assert "held-1" in on_screen, "задание в руках пропало с экрана"
     assert "free-1" in on_screen

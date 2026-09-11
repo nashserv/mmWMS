@@ -233,6 +233,23 @@ PICKING_BODY = """
   </div>
   <div id="cancel-flash" class="flash hidden"></div>
 </div>
+
+<div class="panel noprint">
+  <h2>Вернуть на полку</h2>
+  <p class="note">Сборщик взял вещь и кладёт её обратно. Резерв остаётся: вещь
+     на той же полке и по-прежнему нужна этому заказу. Адрес и причина
+     обязательны — без адреса товар «возвращается» в никуда, без причины
+     непонятно, на какой полке спотыкаются.</p>
+  <div class="row">
+    <div><label>Задание</label><select id="shelf-task"></select></div>
+    <div><label>Ячейка</label><input id="shelf-cell" placeholder="адрес, куда положили"></div>
+    <div><label>Короб (необязательно)</label><input id="shelf-box" placeholder="штрихкод короба"></div>
+    <div style="flex:1"><label>Почему вернули</label>
+      <input id="shelf-reason" style="width:100%" placeholder="без этого возврат не пройдёт"></div>
+    <button class="ghost" id="shelf">Вернуть на полку</button>
+  </div>
+  <div id="shelf-flash" class="flash hidden"></div>
+</div>
 """
 
 PICKING_JS = """
@@ -248,7 +265,8 @@ const renderLines = () => {
   const body = el('lines');
   body.innerHTML = '';
   const pack = el('pack-task'); const cancel = el('cancel-task');
-  pack.innerHTML = ''; cancel.innerHTML = '';
+  const shelf = el('shelf-task');
+  pack.innerHTML = ''; cancel.innerHTML = ''; shelf.innerHTML = '';
   lines.forEach((line, index) => {
     const tr = document.createElement('tr');
     if (line.scan_result === 'ok') tr.className = 'done';
@@ -268,7 +286,7 @@ const renderLines = () => {
       + '<td>' + text(line.owner_external_id) + '</td>'
       + '<td>' + scan + '</td><td>' + label + '</td>';
     body.appendChild(tr);
-    for (const select of [pack, cancel]) {
+    for (const select of [pack, cancel, shelf]) {
       const option = document.createElement('option');
       option.value = line.task_id;
       option.textContent = text(line.name) + ' · ' + line.barcode + ' · ' + text(line.cell_address);
@@ -277,6 +295,7 @@ const renderLines = () => {
   });
   el('print').disabled = lines.length === 0;
   el('reprint').disabled = lines.length === 0;
+  el('shelf').disabled = lines.length === 0;
 };
 
 const loadSession = async () => {
@@ -410,6 +429,21 @@ const doPrint = async (reprint) => {
 };
 el('print').onclick = () => doPrint(false);
 el('reprint').onclick = () => doPrint(true);
+
+el('shelf').onclick = async () => {
+  const cell = el('shelf-cell').value.trim();
+  const reason = el('shelf-reason').value.trim();
+  if (!cell) { flash('shelf-flash', 'err', 'без адреса ячейки товар вернётся в никуда'); return; }
+  if (!reason) { flash('shelf-flash', 'err', 'без причины возврат не разобрать'); return; }
+  const {ok, data} = await api('/api/workstation/v1/return-to-shelf', {
+    task_id: el('shelf-task').value, cell_address: cell,
+    box_barcode: el('shelf-box').value.trim() || null,
+    actor_id: el('actor').value.trim(), reason});
+  if (!ok) { flash('shelf-flash', 'err', data.error || 'возврат не прошёл'); return; }
+  el('shelf-reason').value = '';
+  flash('shelf-flash', 'ok', 'вернули на полку: ' + text(data.cell_address));
+  await loadSession();
+};
 
 el('cancel').onclick = async () => {
   const comment = el('cancel-comment').value.trim();

@@ -374,20 +374,28 @@ class PickingService:
     async def return_to_shelf(self, *, task_id: str, cell_address: str, actor_id: str,
                               box_barcode: str | None = None,
                               reason: str | None = None) -> dict[str, Any]:
-        """Вернуть товар на полку — обязательно с адресом.
+        """Вернуть товар на полку — обязательно с адресом и причиной.
 
         Без адреса товар «возвращается» в никуда, и остаток снова начинает
         врать — та самая беда, из-за которой учёта на складе не было.
+
+        Без причины возврат неразбираем: `wms` его отвергнет (инвариант 11), и
+        отказ дойдёт до сборщика уже после того, как он отошёл от стойки.
+        Спрашиваем здесь, пока он ещё стоит.
         """
         if not (cell_address or "").strip():
             raise PickingRefused("возврат на полку без адреса ячейки не выполняется")
+        if not (reason or "").strip():
+            raise PickingRefused("возврат на полку без причины не выполняется")
         try:
             await self._client.return_to_shelf(
                 task_id, idempotency_key=f"ws-shelf-{task_id}-{uid()[:8]}",
                 cell_address=cell_address, box_barcode=box_barcode,
                 reason=reason, actor_id=actor_id)
         except WmsRejected as error:
-            raise PickingRefused(f"wms не принял возврат: {error.code}") from error
+            # Текст отказа — человеку как есть: в нём написано, что не так.
+            raise PickingRefused(
+                f"wms не принял возврат: {error.message or error.code}") from error
         except WmsUnavailable as error:
             raise PickingRefused(f"wms недоступен: {error}") from error
         await self._refresh(task_id)

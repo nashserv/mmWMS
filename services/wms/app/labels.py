@@ -128,6 +128,9 @@ class LabelOperations:
         return {
             "task_id": str(task["id"]),
             "owner_external_id": task.get("seller_external_id"),
+            # Номер заказа WB: рабочее место сверяет его перед печатью.
+            # Напечатанный чужой стикер отправит вещь другому покупателю.
+            "order_id": int(task["wb_order_id"]) if task.get("wb_order_id") else None,
             "format": label["format"],
             "content_type": CONTENT_TYPES.get(label["format"], "application/octet-stream"),
             "payload": base64.b64encode(payload).decode("ascii"),

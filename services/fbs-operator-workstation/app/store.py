@@ -250,6 +250,7 @@ class Store:
             (picklist_barcode,), fetch="one", operation="session_by_barcode")
 
     async def open_sessions(self) -> list[dict[str, Any]]:
+        """Открытые сессии подбора. `actor_id` здесь — имя с экрана."""
         rows = await self.execute(
             "SELECT s.id, s.actor_id, s.station_id, s.state, s.picklist_barcode, s.started_at, "
             "count(l.id) AS lines_total, "
