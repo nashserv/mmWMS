@@ -176,8 +176,13 @@ async def assign_cabinet(cabinet_id: str, request: Request) -> JSONResponse:
             as_date(body.get("from_date"), today()), comment=body.get("comment"))
     except repo.AssignmentConflict as error:
         return ok({"error": str(error)}, 409)
-    except ValueError as error:
-        return ok({"error": str(error)}, 400)
+    except Exception as error:  # noqa: BLE001 — конфликт схемы это 409, не 500
+        conflict = _conflict_or_raise(error)
+        if conflict is not None:
+            return conflict
+        if isinstance(error, ValueError):
+            return ok({"error": str(error)}, 400)
+        raise
     return ok({"assignment": assignment}, 201)
 
 
@@ -201,10 +206,15 @@ async def onboard(request: Request) -> JSONResponse:
             from_date=as_date(body.get("from_date"), today()))
     except KeyError as error:
         return ok({"error": f"не хватает поля {error}"}, 400)
-    except repo.AssignmentConflict as error:
+    except (repo.AssignmentConflict, InvoiceConflict) as error:
         return ok({"error": str(error)}, 409)
-    except (OnboardingError, ValueError) as error:
-        return ok({"error": str(error)}, 400)
+    except Exception as error:  # noqa: BLE001 — конфликт схемы это 409, не 500
+        conflict = _conflict_or_raise(error)
+        if conflict is not None:
+            return conflict
+        if isinstance(error, (OnboardingError, ValueError)):
+            return ok({"error": str(error)}, 400)
+        raise
     return ok(result, 201 if result["state"] == "ok" else 202)
 
 
@@ -316,17 +326,88 @@ async def replay_unbilled(event_id: str, request: Request) -> JSONResponse:
                "previous_outcome": stored["outcome"], "result": outcome})
 
 
-@router.get("/accruals")
-async def accruals(request: Request, cabinet_id: str | None = None, period: str | None = None,
-                   limit: int = 200) -> JSONResponse:
-    """Расшифровка начислений с видимой наценкой партнёра (файл 04, «ЛК клиента»).
+@router.get("/accruals/summary")
+async def accruals_summary(request: Request, period: str | None = None,
+                           seller: str | None = None,
+                           cabinet_id: str | None = None) -> JSONResponse:
+    """Итог периода одним числом — посчитанным базой.
 
-    Клиент обязан видеть 45 и понимать, что 30 идёт MM-Express, 15 партнёру, —
-    а не считать нас источником завышенной цены.
+    Портал и админка складывали начисления сами, каждая по своей странице: на
+    полутора тысячах строк с `limit=1000` они показывали РАЗНЫЕ суммы, и обе
+    расходились со счётом. Спор «сколько я должен» решается не тем, кто
+    аккуратнее сложил, а тем, что складывают в одном месте.
+
+    Если счёт за период выставлен, его итог приезжает рядом: это та самая
+    бумага, с которой сравнивают.
     """
     with database.cursor() as cursor:
         visible = visible_cabinet_ids(cursor, caller(request))
         cursor.execute(
+            """
+            SELECT COALESCE(sum(a.amount), 0)         AS amount,
+                   COALESCE(sum(a.partner_amount), 0) AS partner_amount,
+                   COALESCE(sum(a.net_amount), 0)     AS net_amount,
+                   count(*)                           AS operations
+              FROM billing_accrual a
+              JOIN cabinet c ON c.id = a.cabinet_id
+             WHERE (%(period)s::text IS NULL OR a.period = %(period)s::text)
+               AND (%(seller)s::text IS NULL OR c.seller_external_id = %(seller)s::text)
+               AND (%(cabinet)s::uuid IS NULL OR a.cabinet_id = %(cabinet)s::uuid)
+               AND (%(visible)s::uuid[] IS NULL OR a.cabinet_id = ANY(%(visible)s::uuid[]))
+            """,
+            {"period": period, "seller": seller, "cabinet": cabinet_id,
+             "visible": visible})
+        totals = dict(cursor.fetchone())
+
+        cursor.execute(
+            """
+            SELECT i.number, i.state, i.total_amount, i.partner_total, i.net_total,
+                   i.issued_at, i.paid_at
+              FROM billing_invoice i
+              JOIN cabinet c ON c.id = i.cabinet_id
+             WHERE (%(period)s::text IS NULL OR i.period = %(period)s::text)
+               AND (%(seller)s::text IS NULL OR c.seller_external_id = %(seller)s::text)
+               AND (%(cabinet)s::uuid IS NULL OR i.cabinet_id = %(cabinet)s::uuid)
+               AND (%(visible)s::uuid[] IS NULL OR i.cabinet_id = ANY(%(visible)s::uuid[]))
+             ORDER BY i.issued_at DESC LIMIT 1
+            """,
+            {"period": period, "seller": seller, "cabinet": cabinet_id,
+             "visible": visible})
+        invoice = cursor.fetchone()
+
+    return ok({
+        "period": period,
+        "seller_external_id": seller,
+        "totals": {
+            "amount": str(totals["amount"]),
+            "partner_amount": str(totals["partner_amount"]),
+            "net_amount": str(totals["net_amount"]),
+            "operations": int(totals["operations"]),
+        },
+        "invoice": dict(invoice) if invoice else None,
+    })
+
+
+@router.get("/accruals")
+async def accruals(request: Request, cabinet_id: str | None = None, period: str | None = None,
+                   limit: int = 200, cursor_after: str | None = None) -> JSONResponse:
+    """Расшифровка начислений с видимой наценкой партнёра (файл 04, «ЛК клиента»).
+
+    Клиент обязан видеть 45 и понимать, что 30 идёт MM-Express, 15 партнёру, —
+    а не считать нас источником завышенной цены.
+
+    Пагинация курсорная, а не «сколько влезло в limit». Клиент с полутора
+    тысячами операций видел первую тысячу и не знал об этом: страница
+    заканчивалась молча, а итог, сложенный по ней, расходился со счётом.
+    Итог за период спрашивают у `/accruals/summary` — его считает база.
+
+    `cursor_after` — значение `next_cursor` предыдущей страницы.
+    """
+    page = max(1, min(limit, 1000))
+    after = _decode_cursor(cursor_after)
+    with database.cursor() as handle:
+        visible = visible_cabinet_ids(handle, caller(request))
+        handle.execute(
             """
             SELECT a.*, c.seller_external_id AS cabinet_seller, p.name AS partner_name
               FROM billing_accrual a
@@ -335,13 +416,54 @@ async def accruals(request: Request, cabinet_id: str | None = None, period: str 
              WHERE (%(cabinet)s::uuid IS NULL OR a.cabinet_id = %(cabinet)s::uuid)
                AND (%(period)s::text IS NULL OR a.period = %(period)s::text)
                AND (%(visible)s::uuid[] IS NULL OR a.cabinet_id = ANY(%(visible)s::uuid[]))
-             ORDER BY a.occurred_on DESC, a.created_at DESC
+               AND (%(after_on)s::date IS NULL
+                    OR (a.occurred_on, a.created_at, a.id)
+                        < (%(after_on)s::date, %(after_at)s::timestamptz, %(after_id)s::uuid))
+             ORDER BY a.occurred_on DESC, a.created_at DESC, a.id DESC
              LIMIT %(limit)s
             """,
             {"cabinet": cabinet_id, "period": period, "visible": visible,
-             "limit": max(1, min(limit, 1000))})
-        rows = [dict(row) for row in cursor.fetchall()]
-    return ok({"accruals": rows, "count": len(rows)})
+             "limit": page + 1,
+             "after_on": after[0] if after else None,
+             "after_at": after[1] if after else None,
+             "after_id": after[2] if after else None})
+        rows = [dict(row) for row in handle.fetchall()]
+
+    # Лишняя строка запрошена намеренно: по ней видно, что страница не
+    # последняя. «Пришло ровно limit» об этом не говорит ничего.
+    has_more = len(rows) > page
+    rows = rows[:page]
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = _encode_cursor(last["occurred_on"], last["created_at"], last["id"])
+    return ok({"accruals": rows, "count": len(rows), "next_cursor": next_cursor})
+
+
+def _encode_cursor(occurred_on: Any, created_at: Any, row_id: Any) -> str:
+    import base64
+
+    raw = f"{occurred_on.isoformat()}|{created_at.isoformat()}|{row_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(value: str | None) -> tuple[str, str, str] | None:
+    """Курсор предыдущей страницы. Мусор — как будто курсора нет.
+
+    Отказывать на испорченном курсоре незачем: он приходит из нашего же
+    ответа, и единственная причина испортиться — кто-то правил ссылку руками.
+    Отдать первую страницу честнее, чем 400 на пустом месте.
+    """
+    if not value:
+        return None
+    import base64
+
+    try:
+        raw = base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
+        occurred_on, created_at, row_id = raw.split("|", 2)
+        return occurred_on, created_at, row_id
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # -------------------------------------------------------------------- отчёты
@@ -411,6 +533,29 @@ async def add_expense(request: Request) -> JSONResponse:
     except (KeyError, OnboardingError, ValueError) as error:
         return ok({"error": str(error)}, 400)
     return ok({"expense": expense}, 201)
+
+
+def _conflict_or_raise(error: Exception) -> JSONResponse | None:
+    """Конфликт схемы — это 409, а не 500.
+
+    `ExclusionViolation` на закреплении означает «этот кабинет уже закреплён
+    на эти даты», `UniqueViolation` — «такая запись уже есть». Оба — ответ
+    человеку, а не сбой сервиса: 500 отправляет его чинить то, что не
+    сломано.
+    """
+    import psycopg
+
+    if isinstance(error, (psycopg.errors.ExclusionViolation,
+                          psycopg.errors.UniqueViolation)):
+        return ok({"error": _conflict_text(error)}, 409)
+    return None
+
+
+def _conflict_text(error: Exception) -> str:
+    detail = getattr(getattr(error, "diag", None), "constraint_name", None)
+    if detail:
+        return f"запись конфликтует с уже существующей ({detail})"
+    return "запись конфликтует с уже существующей"
 
 
 @router.post("/invoices")

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import importlib
+import uuid
+from decimal import Decimal
 from typing import Any, Iterator
 
 import pytest
@@ -89,3 +91,45 @@ def test_cabinets_that_arrived_by_event_are_listed_for_onboarding(
                 json=event("wms.packing.completed.v1", {"seller_id": "seller-мимо-процесса"}))
     body = client.get("/api/billing/v1/cabinets", params={"needs_onboarding": True}).json()
     assert [row["seller_external_id"] for row in body["cabinets"]] == ["seller-мимо-процесса"]
+
+
+def test_the_total_of_a_long_period_is_one_number_for_everyone(
+        client, database: Database, stand: dict[str, Any]) -> None:
+    """Полторы тысячи начислений — и одно число во всех трёх местах.
+
+    Портал и админка складывали каждая свою страницу с `limit=1000`: на
+    полутора тысячах операций они показывали разные суммы, и обе расходились
+    со счётом. Спор «сколько я должен» решается тем, что складывают в одном
+    месте, а не тем, кто аккуратнее сложил.
+    """
+    with database.transaction() as cursor:
+        cursor.executemany(
+            "INSERT INTO billing_accrual (id, event_id, event_type, tenant_id, cabinet_id, "
+            "  seller_external_id, service, quantity, unit_price, markup, amount, "
+            "  partner_amount, occurred_on, partner_id) "
+            "VALUES (%s, %s, 'wms.packing.completed.v1', 'mm-express', %s, 'seller-1', "
+            "        'packing', 1, 30.00, 15.00, 45.00, 15.00, "
+            "        DATE '2026-09-10', %s)",
+            [(str(uuid.uuid4()), str(uuid.uuid4()), stand["cabinet"], stand["senior"])
+             for _ in range(1500)])
+
+    page = client.get("/api/billing/v1/accruals",
+                      params={"period": "2026-09", "limit": 1000}).json()
+    assert len(page["accruals"]) == 1000
+    assert page["next_cursor"], (
+        "страница кончилась молча: клиент не узнает, что видит не всё")
+
+    summary = client.get("/api/billing/v1/accruals/summary",
+                         params={"period": "2026-09"}).json()
+    assert summary["totals"]["operations"] == 1500, (
+        f"итог посчитан по странице: {summary['totals']}")
+    assert Decimal(summary["totals"]["amount"]) == Decimal("67500.00")
+
+    # Вторая страница добирает остаток — и ровно его, без повторов.
+    rest = client.get("/api/billing/v1/accruals",
+                      params={"period": "2026-09", "limit": 1000,
+                              "cursor_after": page["next_cursor"]}).json()
+    assert len(rest["accruals"]) == 500, f"во второй странице {len(rest['accruals'])} строк"
+    assert rest["next_cursor"] is None
+    seen = {row["id"] for row in page["accruals"]} | {row["id"] for row in rest["accruals"]}
+    assert len(seen) == 1500, "страницы пересеклись: часть начислений посчитана дважды"

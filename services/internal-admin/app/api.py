@@ -248,11 +248,30 @@ async def approve(version_id: str, request: Request) -> JSONResponse:
 
 @router.get("/accruals")
 async def accruals(request: Request, cabinet_id: str | None = None,
-                   period: str | None = None) -> JSONResponse:
+                   period: str | None = None,
+                   cursor_after: str | None = None) -> JSONResponse:
+    """Начисления страницей — и итог периода рядом.
+
+    Итог НЕ складывается здесь. Админка и ЛК клиента складывали каждая свою
+    страницу и показывали разные числа: спор «сколько я должен» решался тем,
+    кто аккуратнее сложил, а не тем, что сложено в одном месте.
+    """
     params = {key: value for key, value in
-              (("cabinet_id", cabinet_id), ("period", period)) if value}
+              (("cabinet_id", cabinet_id), ("period", period),
+               ("cursor_after", cursor_after)) if value}
     status, body = billing.get("/api/billing/v1/accruals", token_of(request), params)
-    return ok(body, status)
+    if status >= 400:
+        return ok(body, status)
+    totals_params = {key: value for key, value in
+                     (("cabinet_id", cabinet_id), ("period", period)) if value}
+    summary_status, summary = billing.get("/api/billing/v1/accruals/summary",
+                                          token_of(request), totals_params)
+    if summary_status >= 400:
+        return ok(summary, summary_status)
+    answer = dict(body)
+    answer["totals"] = summary.get("totals", {})
+    answer["invoice"] = summary.get("invoice")
+    return ok(answer, status)
 
 
 @router.get("/reports/unbilled")

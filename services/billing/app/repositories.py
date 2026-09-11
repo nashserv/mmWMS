@@ -169,11 +169,19 @@ def assign_cabinet(cursor: Cursor, cabinet_id: str, partner_id: str, role: str,
     Закрепление задним числом позади уже заведённого будущего — отказ: молча
     подвинуть будущего партнёра значит переписать деньги, которых ещё нет.
     """
+    # `FOR UPDATE` на текущем закреплении.
+    #
+    # Два онбординга одного кабинета одновременно — обычное дело: человек
+    # нажал дважды, сеть моргнула, консьюмер переигрывает. Без блокировки оба
+    # читали «закрепления нет» и заводили по одному: два партнёра на один
+    # день — два счёта на одну операцию. Ограничение исключения ловило это
+    # уже как ошибку базы, а ошибка базы на онбординге выглядит как
+    # «не работает».
     cursor.execute(
         """
         SELECT * FROM cabinet_assignment
          WHERE cabinet_id = %s AND role = %s AND to_date IS NULL
-         ORDER BY from_date DESC LIMIT 1
+         ORDER BY from_date DESC LIMIT 1 FOR UPDATE
         """,
         (cabinet_id, role))
     current = cursor.fetchone()

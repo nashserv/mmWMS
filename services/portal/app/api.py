@@ -14,11 +14,21 @@
 from __future__ import annotations
 
 import csv
+import os
 import io
 import pathlib
 import time
-from datetime import date
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
+
+# Та же зона, что в биллинге: период в ЛК и период в счёте обязаны быть одним
+# и тем же месяцем. По UTC ночная смена первого числа попадала в разные.
+WAREHOUSE_ZONE = ZoneInfo(os.getenv("BILLING_TIMEZONE", "Europe/Moscow"))
+
+
+def today() -> date:
+    return datetime.now(timezone.utc).astimezone(WAREHOUSE_ZONE).date()
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
@@ -137,21 +147,28 @@ async def accruals(request: Request, period: str | None = None) -> JSONResponse:
     что 30 — наши, 15 — того, кто привёл клиента.
     """
     client = client_of(request)
-    month = period or date.today().strftime("%Y-%m")
+    month = period or today().strftime("%Y-%m")
     status, body = billing.get("/api/billing/v1/accruals", token_of(request),
-                               {"period": month, "limit": 1000})
+                               {"period": month, "limit": 1000,
+                                "seller": client["seller"]})
     if status >= 400:
         return ok(body, status)
     rows = body.get("accruals", [])
+
+    # Итог НЕ складывается здесь. На полутора тысячах операций страница
+    # заканчивалась на тысяче, и сумма по ней расходилась и со счётом, и с
+    # админкой — каждая показывала своё число, и спор «сколько я должен»
+    # решался тем, кто аккуратнее сложил.
+    status, summary = billing.get("/api/billing/v1/accruals/summary", token_of(request),
+                                  {"period": month, "seller": client["seller"]})
+    if status >= 400:
+        return ok(summary, status)
     return ok({
         "period": month,
         "accruals": rows,
-        "totals": {
-            "amount": sum(float(row["amount"]) for row in rows),
-            "partner_amount": sum(float(row["partner_amount"]) for row in rows),
-            "net_amount": sum(float(row["net_amount"]) for row in rows),
-            "operations": len(rows),
-        },
+        "next_cursor": body.get("next_cursor"),
+        "totals": summary.get("totals", {}),
+        "invoice": summary.get("invoice"),
         "explanation": "Клиент платит тариф MM-Express плюс наценку партнёра, "
                        "который ведёт кабинет. Обе части показаны отдельно.",
     })
@@ -161,7 +178,7 @@ async def accruals(request: Request, period: str | None = None) -> JSONResponse:
 async def accruals_csv(request: Request, period: str | None = None) -> Response:
     """Акт за период. Клиент выгружает сам, без участия бухгалтера (файл 04)."""
     client = client_of(request)
-    month = period or date.today().strftime("%Y-%m")
+    month = period or today().strftime("%Y-%m")
     status, body = billing.get("/api/billing/v1/accruals", token_of(request),
                                {"period": month, "limit": 1000})
     if status >= 400:
@@ -173,14 +190,18 @@ async def accruals_csv(request: Request, period: str | None = None) -> Response:
     writer.writerow(["дата", "услуга", "количество", "цена MM-Express", "наценка партнёра",
                      "к оплате", "из них MM-Express", "из них партнёру", "партнёр"])
     for row in rows:
-        writer.writerow([row["occurred_on"], row["service"], row["quantity"], row["unit_price"],
-                         row["markup"], row["amount"], row["net_amount"], row["partner_amount"],
-                         row.get("partner_name") or ""])
+        writer.writerow(_safe([
+            row["occurred_on"], row["service"], row["quantity"], row["unit_price"],
+            row["markup"], row["amount"], row["net_amount"], row["partner_amount"],
+            row.get("partner_name") or ""]))
+    # Итог в акте — тот же, что в ЛК и в счёте: считает его база.
+    status, summary = billing.get("/api/billing/v1/accruals/summary", token_of(request),
+                                  {"period": month, "seller": client["seller"]})
+    totals = summary.get("totals", {}) if status < 400 else {}
     writer.writerow([])
-    writer.writerow(["итого", "", len(rows), "", "",
-                     f"{sum(float(row['amount']) for row in rows):.2f}",
-                     f"{sum(float(row['net_amount']) for row in rows):.2f}",
-                     f"{sum(float(row['partner_amount']) for row in rows):.2f}", ""])
+    writer.writerow(["итого", "", totals.get("operations", len(rows)), "", "",
+                     totals.get("amount", ""), totals.get("net_amount", ""),
+                     totals.get("partner_amount", ""), ""])
 
     record_export(str(client["user_id"]), client["seller"], "act", month, len(rows))
     # Windows-1251 не используем: файл читают и на Linux, и в браузере. BOM —
@@ -252,3 +273,19 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+# Значение, начинающееся с `=`, `+`, `-`, `@`, Excel считает ФОРМУЛОЙ и
+# выполняет при открытии файла. Название услуги и имя партнёра приходят из
+# базы, а туда — из онбординга: достаточно назвать партнёра
+# `=HYPERLINK(...)`, чтобы акт клиента стал исполняемым.
+_FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe(values: list[Any]) -> list[Any]:
+    """Обезвреживает значения, которые Excel принял бы за формулу."""
+    guarded: list[Any] = []
+    for value in values:
+        text = "" if value is None else str(value)
+        guarded.append("'" + text if text.startswith(_FORMULA_STARTS) else value)
+    return guarded
