@@ -33,7 +33,7 @@ x-logging: &logging
 # compose.stream-c.yaml.
 x-billing-env: &billing-env
   APP_ENV: development
-  DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/billing
+  DATABASE_URL: postgresql://svc_billing:${SERVICE_DB_PASSWORD_BILLING:?set outside Git}@postgres:5432/billing
   RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:?set outside Git}@rabbitmq:5672/
   MMX_EVENTS_EXCHANGE: mmx.events
   MMX_TENANT_ID: mm-express
@@ -230,7 +230,7 @@ services:
       # можно переменной, а не пересборкой (правило 9.5.4).
       WMS_MOCK: ${WMS_MOCK:-false}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms
+      DATABASE_URL: postgresql://svc_wms:${SERVICE_DB_PASSWORD_WMS:?set outside Git}@postgres:5432/wms
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:?set outside Git}@rabbitmq:5672/
       MMX_EVENTS_EXCHANGE: mmx.events
       MMX_TENANT_ID: mm-express
@@ -280,7 +280,7 @@ services:
       APP_ENV: development
       WMS_MOCK: ${WMS_MOCK:-false}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms
+      DATABASE_URL: postgresql://svc_wms:${SERVICE_DB_PASSWORD_WMS:?set outside Git}@postgres:5432/wms
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:?set outside Git}@rabbitmq:5672/
       MMX_EVENTS_EXCHANGE: mmx.events
       MMX_TENANT_ID: mm-express
@@ -494,7 +494,7 @@ services:
       SERVICE_TOKEN: ${SERVICE_TOKEN:?set outside Git}
       IDENTITY_URL: http://identity:8080
 
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/workstation
+      DATABASE_URL: postgresql://svc_workstation:${SERVICE_DB_PASSWORD_WORKSTATION:?set outside Git}@postgres:5432/workstation
 
       # Шина — ускоритель экрана, не источник истины (раздел 6.1). Убрать эту
       # строку целиком — законная конфигурация: рабочее место продолжит
@@ -618,7 +618,7 @@ services:
       identity-seed: {condition: service_completed_successfully}
     environment:
       APP_ENV: development
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/identity
+      DATABASE_URL: postgresql://svc_identity:${SERVICE_DB_PASSWORD_IDENTITY:?set outside Git}@postgres:5432/identity
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
       # Пусто — на стенде боевого identity нет, и стендовые токены stand:<uuid>
       # разрешены только потому, что APP_ENV локальный. В защищённой среде
@@ -820,7 +820,7 @@ services:
       identity: {condition: service_healthy}
     environment:
       APP_ENV: development
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/internal_admin
+      DATABASE_URL: postgresql://svc_admin:${SERVICE_DB_PASSWORD_ADMIN:?set outside Git}@postgres:5432/internal_admin
       BILLING_URL: http://billing:8080
       IDENTITY_URL: http://identity:8080
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
@@ -859,7 +859,7 @@ services:
       identity: {condition: service_healthy}
     environment:
       APP_ENV: development
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/portal
+      DATABASE_URL: postgresql://svc_portal:${SERVICE_DB_PASSWORD_PORTAL:?set outside Git}@postgres:5432/portal
       BILLING_URL: http://billing:8080
       IDENTITY_URL: http://identity:8080
       WMS_BASE_URL: http://wms:8080

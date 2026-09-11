@@ -26,6 +26,29 @@ curl -s http://127.0.0.1:8080/readyz
 
 ---
 
+## Роли Postgres
+
+Каждый сервис ходит в свою базу под собственной ролью `svc_<сервис>`, не под
+владельцем. Пароли — в `.env`, по одному на сервис, вне Git.
+
+```bash
+docker run --rm --network mmx-stand_default -v "$PWD/scripts:/scripts:ro" \
+  -e PGHOST=postgres -e PGPASSWORD="$POSTGRES_PASSWORD" \
+  -e SERVICE_DB_PASSWORD_WMS -e SERVICE_DB_PASSWORD_BILLING \
+  -e SERVICE_DB_PASSWORD_IDENTITY -e SERVICE_DB_PASSWORD_PORTAL \
+  -e SERVICE_DB_PASSWORD_ADMIN -e SERVICE_DB_PASSWORD_WORKSTATION \
+  --entrypoint bash postgres:16.10-alpine3.22 /scripts/create-roles.sh
+```
+
+Скрипт идемпотентен. Миграции и сиды остаются под владельцем: они создают
+таблицы, и роли сервиса этого делать нельзя — в этом и смысл.
+
+**Префикс `svc_` обязателен.** Владелец баз зовётся `wms`; роль для склада,
+названная просто `wms`, — тот же объект, и смена её пароля переписала бы
+пароль суперпользователя. Скрипт при этом отработал бы «успешно», а отвалилось
+бы всё, что ходит по `POSTGRES_PASSWORD`. Проверяется `tests/full-run/test_roles.py`
+по живым подключениям, а не по конфигурации.
+
 ## Бэкап и возвращение из него
 
 Дампы всех баз снимаются ежедневно с ротацией в четырнадцать дней
