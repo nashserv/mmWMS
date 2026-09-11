@@ -526,6 +526,31 @@ class WmsClient:
             owner_external_id=_text_or_none(result.get("owner_external_id")),
         )
 
+    async def discrepancies(self, *, kinds: Iterable[str] | None = None,
+                            decisions: Iterable[str] | None = None,
+                            owner_external_id: str | None = None,
+                            since: str | None = None,
+                            limit: int = 100) -> list[dict[str, Any]]:
+        """Расхождения вне контекста приёмки — экран начальника склада.
+
+        Сюда попадает клапан «собрать без остатка» (`ledger_short`, раздел
+        6.5): он рождается на резерве, `receipt_id` у него пуст, и в
+        `/receipts/screen` он не попадёт никогда.
+        """
+        params: dict[str, Any] = {"limit": int(limit)}
+        if kinds:
+            params["kinds"] = list(kinds)
+        if decisions:
+            params["decisions"] = list(decisions)
+        if owner_external_id:
+            params["owner_external_id"] = owner_external_id
+        if since:
+            params["since"] = since
+        result = await self.call("/discrepancies", params,
+                                 attempts=2, metric_route="/discrepancies")
+        rows = result.get("discrepancies")
+        return list(rows) if isinstance(rows, list) else []
+
     async def return_to_shelf(self, task_id: str, *, idempotency_key: str,
                               cell_address: str | None = None,
                               box_barcode: str | None = None,

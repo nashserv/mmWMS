@@ -17,26 +17,25 @@ from .domain import now
 from .projection import Projection
 from .receiving import ReceivingRefused, ReceivingService
 from .store import Store
+from .wms_client import WmsUnavailable
 
-# Заявка потоку 0. Схема wms ведёт `discrepancy(kind='ledger_short')` и даже
-# держит под неё индекс с комментарием «экран начальника склада» — но маршрута,
-# которым этот список можно прочитать, в замороженном контракте нет.
-# Полностью — docs/stream-b-requests.md, заявка 1.
-LEDGER_SHORT_GAP = (
-    "Клапан «собрать без остатка» (раздел 6.5) пишет discrepancy(kind='ledger_short'), "
-    "но прочитать их контрактом нечем: /receipts/screen отдаёт только расхождения "
-    "приёмки, у ledger_short receipt_id пуст. Нужен маршрут /discrepancies "
-    "(заявка потоку 0). До него этот блок пуст не потому, что сборок без остатка "
-    "нет, а потому, что их нечем прочитать."
-)
+# Маршрут `/discrepancies` появился в потоке 0 по заявке 1
+# (`docs/stream-b-requests.md`). До него клапан «собрать без остатка» нечем
+# было прочитать: `ledger_short` рождается на резерве, `receipt_id` у него
+# пуст, и в `/receipts/screen` он не попадал никогда — блок на экране
+# начальника склада был пуст не потому, что сборок без остатка нет.
 
 
 class SupervisorService:
     def __init__(self, projection: Projection, store: Store,
-                 receiving: ReceivingService) -> None:
+                 receiving: ReceivingService, wms: Any = None) -> None:
         self._projection = projection
         self._store = store
         self._receiving = receiving
+        # Клиент wms: клапан «собрать без остатка» читается маршрутом
+        # `/discrepancies`, а не через приёмку — у `ledger_short` `receipt_id`
+        # пуст по построению.
+        self._wms = wms if wms is not None else receiving._client
 
     async def screen(self) -> dict[str, Any]:
         return {
@@ -113,7 +112,15 @@ class SupervisorService:
         без объяснения читался бы как «таких случаев не было» — а это ровно та
         тишина, которую чиним.
         """
-        return {"available": False, "items": [], "reason": LEDGER_SHORT_GAP}
+        try:
+            rows = await self._wms.discrepancies(
+                kinds=["ledger_short"], decisions=["pending"], limit=50)
+        except WmsUnavailable as error:
+            # Пустой список без объяснения читался бы как «таких случаев не
+            # было» — а это ровно та тишина, которую чиним (инвариант 12).
+            return {"available": False, "items": [],
+                    "reason": f"wms недоступен, список сборок без остатка не прочитан: {error}"}
+        return {"available": True, "items": rows}
 
     async def _printing(self) -> dict[str, Any]:
         stats = await self._store.print_stats() or {}

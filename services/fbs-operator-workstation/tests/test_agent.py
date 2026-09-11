@@ -37,7 +37,7 @@ class RecordingSocket:
 
 def build(confirmed: str | None = None):
     printer = RecordingPrinter()
-    agent = PrintAgent(url="ws://x/y", station_id="st-1", station_name="Станция 1",
+    agent = PrintAgent(url="ws://x/y", station_id="11111111-1111-4111-8111-111111111111", station_name="Станция 1",
                        printer=printer, confirmed_format=confirmed, stats=Stats())
     return agent, printer, RecordingSocket()
 

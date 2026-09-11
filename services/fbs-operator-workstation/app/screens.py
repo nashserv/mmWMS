@@ -89,7 +89,14 @@ const api = async (path, body) => {
   return {ok: response.ok, status: response.status, data};
 };
 const el = (id) => document.getElementById(id);
-const text = (value) => (value === null || value === undefined || value === '') ? '—' : String(value);
+// Экранирование обязательно: `text()` подставляется в innerHTML, а название
+// товара приходит из карточки Wildberries — его пишет продавец. Товар с
+// именем `<img src=x onerror=...>` выполнял бы этот код на экране сборщика,
+// в браузере, у которого открыт весь склад.
+const esc = (value) => String(value)
+  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+const text = (value) => (value === null || value === undefined || value === '') ? '—' : esc(value);
 const flash = (target, kind, message) => {
   const box = el(target);
   if (!box) return;
@@ -504,19 +511,34 @@ RECEIVING_JS = """
 el('actor').value = recall('actor', '');
 el('seller').value = recall('seller', '');
 
+// Строка собирается узлами, а значение кладётся в `input.value`, а не в
+// атрибут HTML. Кавычка в названии товара закрывала атрибут и остальное имя
+// становилось разметкой — в том числе обработчиком события.
 const addLine = (values) => {
   const tr = document.createElement('tr');
-  const cell = (name, type, value) =>
-    '<td><input data-name="' + name + '" type="' + type + '" value="' + (value || '') + '"></td>';
-  tr.innerHTML = cell('barcode', 'text', values && values.barcode)
-    + cell('name', 'text', values && values.name)
-    + cell('expected_qty', 'number', values && values.expected_qty)
-    + cell('actual_qty', 'number', values && values.actual_qty)
-    + cell('box_barcode', 'text', values && values.box_barcode)
-    + cell('cell_address', 'text', values && values.cell_address)
-    + cell('comment', 'text', values && values.comment)
-    + '<td><button class="ghost">убрать</button></td>';
-  tr.querySelector('button').onclick = () => tr.remove();
+  const cell = (name, type, value) => {
+    const td = document.createElement('td');
+    const input = document.createElement('input');
+    input.dataset.name = name;
+    input.type = type;
+    input.value = (value === null || value === undefined) ? '' : String(value);
+    td.appendChild(input);
+    return td;
+  };
+  for (const [name, type, key] of [
+      ['barcode', 'text', 'barcode'], ['name', 'text', 'name'],
+      ['expected_qty', 'number', 'expected_qty'], ['actual_qty', 'number', 'actual_qty'],
+      ['box_barcode', 'text', 'box_barcode'], ['cell_address', 'text', 'cell_address'],
+      ['comment', 'text', 'comment']]) {
+    tr.appendChild(cell(name, type, values && values[key]));
+  }
+  const actions = document.createElement('td');
+  const remove = document.createElement('button');
+  remove.className = 'ghost';
+  remove.textContent = 'убрать';
+  remove.onclick = () => tr.remove();
+  actions.appendChild(remove);
+  tr.appendChild(actions);
   el('lines').appendChild(tr);
 };
 el('add').onclick = () => addLine();
@@ -629,19 +651,25 @@ el('load').onclick = async () => {
   if (!items.length) { box.innerHTML = '<p class="note">разложить нечего</p>'; return; }
   box.innerHTML = '<table><thead><tr><th>Владелец</th><th>Штрихкод</th><th>Товар</th>'
     + '<th>Разложить</th><th>Куда положить</th><th></th></tr></thead><tbody>'
-    + items.map((item) => {
+    + items.map((item, index) => {
         const cells = (item.suggested_cells || []).map((cell) =>
           '<span class="pill' + (cell.holds_same_sku ? ' ok' : '') + '">' + text(cell.cell_address)
           + (cell.free_capacity != null ? ' · свободно ' + cell.free_capacity : '') + '</span>').join(' ');
         return '<tr><td>' + text(item.owner_external_id) + '</td><td class="mono">' + text(item.barcode)
           + '</td><td>' + text(item.name) + '</td><td>' + text(item.qty_to_place) + '</td><td>'
           + (cells || '<span class="note">подсказок нет</span>') + '</td>'
-          + '<td><button class="ghost" onclick="pick(' + JSON.stringify(JSON.stringify(item)).replace(/"/g, '&quot;') + ')">Взять</button></td></tr>';
+          + '<td><button class="ghost" data-pick="' + index + '">Взять</button></td></tr>';
       }).join('') + '</tbody></table>';
+  // Обработчик вешается кодом, а не строкой в атрибуте: объект товара в
+  // `onclick=` означает, что его поля становятся кодом.
+  box.querySelectorAll('button[data-pick]').forEach((button) => {
+    button.onclick = () => pick(items[Number(button.dataset.pick)]);
+  });
 };
 
-window.pick = (payload) => {
-  const item = JSON.parse(payload);
+// Принимает сам объект, а не его JSON-строку: строка была нужна только
+// затем, чтобы уехать в атрибут `onclick`, а это и есть отверстие.
+window.pick = (item) => {
   el('product').value = item.barcode || '';
   el('qty').value = item.qty_to_place || 0;
   el('seller').value = item.owner_external_id || el('seller').value;

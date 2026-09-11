@@ -59,6 +59,12 @@ class AgentSession:
         }
 
 
+# Период heartbeat агента (`agent/print_agent.py`). Молчание дольше трёх
+# периодов значит, что агента нет, даже если сокет формально открыт.
+HEARTBEAT_SECONDS = 20.0
+SILENCE_SECONDS = 3 * HEARTBEAT_SECONDS
+
+
 class AgentBusy(RuntimeError):
     """Агент станции не подключён или оборвал соединение.
 
@@ -109,6 +115,44 @@ class AgentHub:
                 pass
         metrics.AGENTS_CONNECTED.set(len(self._agents))
         logger.info("агент станции %s подключён (%s)", session.station_name, session.station_id)
+
+    async def reap_silent(self, *, silence_seconds: float = SILENCE_SECONDS) -> int:
+        """Закрывает сессии агентов, которые перестали присылать heartbeat.
+
+        Оборванный сокет не всегда закрывается: провод выдернули, ноутбук
+        станции ушёл в сон, сеть склада моргнула. Сессия при этом остаётся в
+        реестре, `hub.get` возвращает её, печать уходит в мёртвый сокет и
+        ждёт подтверждения до таймаута — по этикетке на каждое нажатие.
+
+        Молчание дольше трёх периодов heartbeat — это и есть «агента нет».
+        """
+        now = time.time()
+        async with self._lock:
+            dead = [session for session in self._agents.values()
+                    if now - session.last_seen_at > silence_seconds]
+            for session in dead:
+                self._agents.pop(session.station_id, None)
+        for session in dead:
+            logger.warning("агент станции %s молчит %.0f с — сессия закрыта",
+                           session.station_id, now - session.last_seen_at)
+            try:
+                await session.websocket.close()
+            except Exception:  # noqa: BLE001 — сокет и так мёртв
+                pass
+        if dead:
+            metrics.AGENTS_CONNECTED.set(len(self._agents))
+        return len(dead)
+
+    async def reaper(self, *, interval_seconds: float = SILENCE_SECONDS / 3) -> None:
+        """Фоновая уборка молчащих сессий. Останавливается отменой задачи."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self.reap_silent()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — уборка не роняет сервис
+                logger.exception("уборка молчащих агентов не удалась")
 
     async def unregister(self, station_id: str, websocket: Any = None) -> None:
         async with self._lock:

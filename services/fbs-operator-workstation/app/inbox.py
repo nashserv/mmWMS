@@ -117,7 +117,16 @@ class InboxConsumer:
         try:
             channel = self._connection.channel()
             channel.exchange_declare(exchange=self._exchange, exchange_type="topic", durable=True)
-            channel.queue_declare(queue=QUEUE, durable=True)
+            # Границы очереди обязательны. Событие для рабочего места — это
+            # повод сходить за данными, и живёт оно секунды: опрос всё равно
+            # идёт раз в секунду. Без границ очередь копится, пока рабочее
+            # место лежит, и после подъёма оно разбирает вчерашние поводы,
+            # а брокер к тому времени упирается в диск.
+            channel.queue_declare(queue=QUEUE, durable=True, arguments={
+                "x-message-ttl": 60_000,      # минута: дольше повод не нужен
+                "x-max-length": 1_000,        # тысячи поводов хватит на любой всплеск
+                "x-overflow": "drop-head",    # выбрасываем старые, а не отказываем издателю
+            })
             channel.queue_bind(queue=QUEUE, exchange=self._exchange, routing_key="#")
             # Небольшой prefetch: сообщения тут ничего не стоят, но и копить их
             # незачем — важен факт «что-то произошло», а не глубина очереди.

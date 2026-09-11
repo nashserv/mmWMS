@@ -435,10 +435,20 @@ class Store:
         Формат этикетки не решается в конфиге: он проверяется на живом
         принтере и записывается вместе с датой проверки.
         """
+        # Upsert, а не UPDATE. Станцию заводит её же агент при первом
+        # подключении — а проверка принтера приходит от агента и может
+        # обогнать эту запись: `UPDATE` тогда не меняет ни строки, и
+        # подтверждённый формат теряется молча. Вопрос 2 раздела 13 при этом
+        # остаётся открытым, хотя ответ был получен.
         await self.execute(
-            "UPDATE workstation_printer SET confirmed_format = %s, probed_at = now(), "
-            "probe_note = %s WHERE station_id = %s",
-            (confirmed_format, note, station_id), operation="record_probe")
+            "INSERT INTO workstation_printer (station_id, station_name, confirmed_format, "
+            "                                 probed_at, probe_note) "
+            "VALUES (%s, %s, %s, now(), %s) "
+            "ON CONFLICT (station_id) DO UPDATE SET "
+            "    confirmed_format = EXCLUDED.confirmed_format, "
+            "    probed_at = EXCLUDED.probed_at, "
+            "    probe_note = EXCLUDED.probe_note",
+            (station_id, station_id, confirmed_format, note), operation="record_probe")
 
     async def printers(self) -> list[dict[str, Any]]:
         rows = await self.execute(

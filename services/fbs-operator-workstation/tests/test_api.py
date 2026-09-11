@@ -114,29 +114,63 @@ def test_an_unknown_picklist_says_so_instead_of_showing_an_empty_sheet(client):
     assert client.get("/picklist/нет-такой").status_code == 404
 
 
-def test_supervisor_screen_never_shows_a_silent_empty_block(client, wms: FakeWms):
-    """Ложное «всё хорошо» опаснее честного «проверить нечем»."""
+def test_supervisor_screen_reads_the_valve_instead_of_saying_it_cannot(
+        client, wms: FakeWms):
+    """Клапан «собрать без остатка» читается маршрутом, а не объясняется словами.
+
+    Раньше блок честно говорил «прочитать нечем»: `ledger_short` рождается на
+    резерве, `receipt_id` у него пуст, и в `/receipts/screen` он не попадал
+    никогда. Маршрут `/discrepancies` появился в потоке 0 — и блок обязан
+    показывать случаи, а не заявку на маршрут.
+    """
     wms.on("/receipts/screen", lambda params: {"receipts": [],
                                                "generated_at": "2026-09-10T10:00:00+00:00"})
+    wms.on("/discrepancies", lambda params: {
+        "discrepancies": [{"discrepancy_id": "d-1", "kind": "ledger_short",
+                           "owner_external_id": "seller-1", "qty": 2,
+                           "decision": "pending"}],
+        "generated_at": "2026-09-10T10:00:00+00:00"})
+
     body = client.post("/api/workstation/v1/supervisor/screen", json={}).json()
+
+    ledger = body["ledger_short"]
+    assert ledger["available"] is True, (
+        f"клапан по-прежнему не читается: {ledger.get('reason')}")
+    assert [item["discrepancy_id"] for item in ledger["items"]] == ["d-1"]
+    assert body["cancellations"]["without_reason"] == 0
+
+    asked = [params for route, params in wms.calls if route == "/discrepancies"]
+    assert asked and asked[0]["kinds"] == ["ledger_short"], (
+        "экран просит не тот вид расхождений")
+
+
+def test_a_silent_wms_does_not_look_like_a_quiet_shift(client, wms: FakeWms):
+    """Ложное «всё хорошо» опаснее честного «проверить нечем» (инвариант 12)."""
+    wms.on("/receipts/screen", lambda params: {"receipts": [],
+                                               "generated_at": "2026-09-10T10:00:00+00:00"})
+    wms.status_code = 503
+
+    body = client.post("/api/workstation/v1/supervisor/screen", json={}).json()
+
     ledger = body["ledger_short"]
     assert ledger["available"] is False
-    assert "ledger_short" in ledger["reason"]
-    assert body["cancellations"]["without_reason"] == 0
+    assert ledger["items"] == []
+    assert "wms" in ledger["reason"].lower(), (
+        "пустой блок без объяснения читается как «таких случаев не было»")
 
 
 def test_probe_confirmation_is_recorded_with_who_saw_what(client, store: FakeStore):
     response = client.post("/api/workstation/v1/print/probe/confirm", json={
-        "station_id": "st-1", "confirmed_format": "zplv",
+        "station_id": "11111111-1111-4111-8111-111111111111", "confirmed_format": "zplv",
         "note": "из XP-420B вышла этикетка ZPL OK"})
     assert response.status_code == 200
-    assert store.printers_by_id["st-1"]["confirmed_format"] == "zplv"
-    assert store.printers_by_id["st-1"]["probed_at"]
+    assert store.printers_by_id["11111111-1111-4111-8111-111111111111"]["confirmed_format"] == "zplv"
+    assert store.printers_by_id["11111111-1111-4111-8111-111111111111"]["probed_at"]
 
 
 def test_probe_confirmation_refuses_an_invented_format(client):
     response = client.post("/api/workstation/v1/print/probe/confirm", json={
-        "station_id": "st-1", "confirmed_format": "лазерный"})
+        "station_id": "11111111-1111-4111-8111-111111111111", "confirmed_format": "лазерный"})
     assert response.status_code == 422
 
 
@@ -223,3 +257,38 @@ def test_an_unknown_paper_sheet_says_so(client):
     response = client.post("/api/workstation/v1/sessions/by-barcode",
                            json={"picklist_barcode": "PL-нет-такого"})
     assert response.status_code == 404
+
+
+# --------------------------------------------------- название товара как код
+
+def test_a_product_name_cannot_become_code_on_the_screen() -> None:
+    """Название товара пишет продавец, а экран подставляет его в разметку.
+
+    Товар с именем `<img src=x onerror=...>` выполнял бы этот код в браузере
+    сборщика — в браузере, у которого открыт весь склад: выдача заданий,
+    отмена, печать.
+    """
+    from app import screens
+
+    source = screens.PICKING_JS + screens.RECEIVING_JS + screens.PUTAWAY_JS
+
+    assert "const esc = (value) =>" in screens.BASE_JS, (
+        "в экранах нет экранирования вовсе")
+    assert "esc(value)" in screens.BASE_JS, "text() не экранирует значение"
+
+    # Атрибут, собранный конкатенацией, — то же отверстие, что и innerHTML:
+    # кавычка в значении закрывает атрибут, и остальное становится разметкой.
+    assert 'value="' + "' + " not in source, (
+        "значение подставляется в атрибут value строкой — кавычка в названии "
+        "товара закроет атрибут")
+    assert "onclick=\"pick(" not in source, (
+        "объект товара уезжает в атрибут onclick: его поля становятся кодом")
+
+
+def test_escaping_covers_the_characters_that_matter() -> None:
+    """Экранируются и кавычки: значения подставляются и в текст, и в атрибуты."""
+    from app import screens
+
+    body = screens.BASE_JS
+    for character in ("'&'", "'<'", "'>'", "'\"'", '"\'"'):
+        assert character in body, f"не экранируется {character}"

@@ -129,7 +129,7 @@ def _collect_calls() -> list[tuple[str, dict[str, Any]]]:
                                                       "owner_external_id": "seller-1",
                                                       "version": 5, "duplicate": False})
     wms.on("/labels/a/print", lambda params: dict(
-        label_result(), task_id="a", station_id="st-1", order_id=123456))
+        label_result(), task_id="a", station_id="11111111-1111-4111-8111-111111111111", order_id=123456))
     wms.on("/storage/lookup", lambda params: {"seller_external_id": "seller-1",
                                               "barcode": "4600000000011",
                                               "placements": []})
@@ -149,13 +149,13 @@ def _collect_calls() -> list[tuple[str, dict[str, Any]]]:
         async def send_json(self, message: dict) -> None:
             if message.get("type") == "print":
                 hub.resolve(message["job_id"], {"ok": True, "write_ms": 2.0},
-                            station_id="st-1")
+                            station_id="11111111-1111-4111-8111-111111111111")
 
         async def close(self) -> None:
             return None
 
     async def scenario() -> None:
-        await hub.register(AgentSession(station_id="st-1", station_name="Станция 1",
+        await hub.register(AgentSession(station_id="11111111-1111-4111-8111-111111111111", station_name="Станция 1",
                                         websocket=Socket()))
         poller = Poller(client, projection, interval_seconds=60, limit=50)
         picking = PickingService(client, projection, store, poller)
@@ -163,13 +163,13 @@ def _collect_calls() -> list[tuple[str, dict[str, Any]]]:
         receiving = ReceivingService(client)
 
         await poller.poll_once()
-        await picking.start_session(actor_id="picker-1", station_id="st-1",
+        await picking.start_session(actor_id="picker-1", station_id="11111111-1111-4111-8111-111111111111",
                                     limit=10, lease_seconds=900)
         await picking.scan_at_rack(task_id="a", barcode="4600000000011",
-                                   actor_id="picker-1", station_id="st-1")
+                                   actor_id="picker-1", station_id="11111111-1111-4111-8111-111111111111")
         await picking.pack(task_id="a", control_barcode="4600000000011",
-                           actor_id="picker-1", station_id="st-1")
-        await printing.print_label(task_id="a", station_id="st-1")
+                           actor_id="picker-1", station_id="11111111-1111-4111-8111-111111111111")
+        await printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111")
         await picking.return_to_shelf(task_id="a", cell_address="A-01-01",
                                       actor_id="picker-1", reason="коробка не открывается")
         await picking.cancel(task_id="a", reason_code="operator_damaged",

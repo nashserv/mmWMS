@@ -278,6 +278,48 @@ def test_the_workaround_never_hands_one_task_to_two_pickers(wms: FakeWms):
     assert second == [], "второму сборщику то же задание не достаётся"
 
 
+def test_the_workaround_turns_itself_off_when_wms_behaves(wms: FakeWms):
+    """Флаг нарушения снимается сам, а не живёт до перезапуска.
+
+    Иначе рабочее место раздаёт задания в обход неделями после того, как
+    сервис починили: обходной путь становится основным и незаметно.
+    """
+    claimed = task_projection("a", assignee=SCREEN_ASSIGNEE, state="picking")
+    wms.on("/tasks/pull", lambda params: pull_result(claimed))
+    wms.on("/tasks/a", lambda params: claimed)
+    poller = Poller(wms.client(), Projection(), interval_seconds=60, limit=50)
+    run(poller.poll_once())
+    assert poller.claim_ignored is True
+
+    # Сервис починили: задания приходят свободными.
+    wms.on("/tasks/pull", lambda params: pull_result(task_projection("b")))
+    for _ in range(9):
+        run(poller.poll_once())
+        assert poller.claim_ignored is True, "флаг снят раньше десяти чистых опросов"
+    run(poller.poll_once())
+    assert poller.claim_ignored is False, (
+        "флаг нарушения не снялся после десяти чистых опросов — обходной путь "
+        "останется основным до перезапуска")
+
+
+def test_a_leased_task_of_our_own_picker_is_not_a_violation(wms: FakeWms):
+    """Лизинг в ответе на чтение — не признак нарушения с версии 1.3.0.
+
+    Чтение с заполненным `assignee` законно отдаёт задания в руках у этого
+    сборщика вместе с их лизингом. Считать это нарушением значит включить
+    обходной путь на исправном сервисе и раздать сборщику чужую работу.
+    """
+    mine = task_projection("a", assignee="picker-1", state="picking")
+    wms.on("/tasks/pull", lambda params: pull_result(
+        mine, leased_until="2026-09-10T10:15:00+00:00"))
+    poller = Poller(wms.client(), Projection(), interval_seconds=60, limit=50)
+    run(poller.poll_once())
+
+    assert poller.claim_ignored is False, (
+        "лизинг чужого задания принят за нарушение контракта: рабочее место "
+        "начнёт раздавать сборщикам чужую работу")
+
+
 # --------------------------------------------- задания в руках и старение
 
 def test_the_screen_keeps_showing_what_a_picker_is_holding() -> None:

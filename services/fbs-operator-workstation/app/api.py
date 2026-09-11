@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
@@ -95,7 +96,9 @@ class TasksQuery(BaseModel):
 
 class SessionStart(BaseModel):
     actor_id: str = Field(min_length=1, max_length=128)
-    station_id: str | None = None
+    # uuid, а не строка: станция — это конкретный принтер, и опечатка в
+    # её имени отправляла этикетку в никуда молча.
+    station_id: uuid.UUID | None = None
     limit: int = Field(default=20, ge=1, le=200)
     owner_external_ids: list[str] | None = None
 
@@ -109,21 +112,25 @@ class ScanCommand(BaseModel):
     barcode: str = Field(min_length=1, max_length=64)
     actor_id: str = Field(min_length=1, max_length=128)
     session_id: str | None = None
-    station_id: str | None = None
+    # uuid, а не строка: станция — это конкретный принтер, и опечатка в
+    # её имени отправляла этикетку в никуда молча.
+    station_id: uuid.UUID | None = None
 
 
 class PackCommand(BaseModel):
     task_id: str = Field(min_length=1)
     control_barcode: str = Field(min_length=1, max_length=64)
     actor_id: str = Field(min_length=1, max_length=128)
-    station_id: str | None = None
+    # uuid, а не строка: станция — это конкретный принтер, и опечатка в
+    # её имени отправляла этикетку в никуда молча.
+    station_id: uuid.UUID | None = None
     box_barcode: str | None = None
     session_id: str | None = None
 
 
 class PrintCommand(BaseModel):
     task_id: str = Field(min_length=1)
-    station_id: str = Field(min_length=1)
+    station_id: uuid.UUID
     actor_id: str | None = None
     reprint: bool = False
     reason: str | None = None
@@ -209,11 +216,11 @@ class ShipmentCommand(BaseModel):
 
 
 class ProbeCommand(BaseModel):
-    station_id: str = Field(min_length=1)
+    station_id: uuid.UUID
 
 
 class ProbeConfirm(BaseModel):
-    station_id: str = Field(min_length=1)
+    station_id: uuid.UUID
     # Что реально вылезло из принтера. Определить это может только человек,
     # стоящий рядом: агент печатает оба теста и молчит о результате.
     confirmed_format: str = Field(pattern="^(zplv|zplh|tspl|png)$")
@@ -274,7 +281,7 @@ async def poll_now() -> dict[str, Any]:
 async def session_start(command: SessionStart) -> JSONResponse:
     try:
         result = await state.picking.start_session(
-            actor_id=command.actor_id, station_id=command.station_id,
+            actor_id=command.actor_id, station_id=_station(command.station_id),
             limit=command.limit, lease_seconds=config.lease_seconds(),
             owner_external_ids=command.owner_external_ids)
     except PickingRefused as error:
@@ -310,7 +317,7 @@ async def scan(command: ScanCommand) -> JSONResponse:
     try:
         result = await state.picking.scan_at_rack(
             task_id=command.task_id, barcode=command.barcode, actor_id=command.actor_id,
-            session_id=command.session_id, station_id=command.station_id)
+            session_id=command.session_id, station_id=_station(command.station_id))
     except PickingRefused as error:
         return _refused(error)
     return _ok(result)
@@ -326,7 +333,7 @@ async def pack(command: PackCommand) -> JSONResponse:
     try:
         result = await state.picking.pack(
             task_id=command.task_id, control_barcode=command.control_barcode,
-            actor_id=command.actor_id, station_id=command.station_id,
+            actor_id=command.actor_id, station_id=_station(command.station_id),
             box_barcode=command.box_barcode, session_id=command.session_id)
     except PickingRefused as error:
         return _refused(error)
@@ -363,7 +370,7 @@ async def return_to_shelf(command: ShelfCommand) -> JSONResponse:
 async def print_label(command: PrintCommand) -> JSONResponse:
     try:
         result = await state.printing.print_label(
-            task_id=command.task_id, station_id=command.station_id,
+            task_id=command.task_id, station_id=_station(command.station_id),
             actor_id=command.actor_id, reprint=command.reprint,
             reason=command.reason, copies=command.copies,
             idempotency_key=command.idempotency_key)
@@ -385,7 +392,7 @@ async def print_probe(command: ProbeCommand) -> JSONResponse:
     умолчанию в конфиге.
     """
     try:
-        return _ok(await state.printing.probe_printer(command.station_id))
+        return _ok(await state.printing.probe_printer(_station(command.station_id)))
     except AgentBusy as error:
         return _refused(error)
 
@@ -401,9 +408,9 @@ async def print_probe_confirm(command: ProbeConfirm) -> JSONResponse:
     if state.store is None:
         return _refused(RuntimeError("база рабочего места недоступна"), status_code=503)
     await state.store.record_probe(
-        station_id=command.station_id, confirmed_format=command.confirmed_format,
+        station_id=_station(command.station_id), confirmed_format=command.confirmed_format,
         note=command.note or "подтверждено человеком у принтера")
-    agent = state.hub.get(command.station_id)
+    agent = state.hub.get(_station(command.station_id))
     if agent is not None:
         agent.confirmed_format = command.confirmed_format
         # Агент обязан узнать сразу: от формата зависит, перекладывать ли
@@ -413,7 +420,7 @@ async def print_probe_confirm(command: ProbeConfirm) -> JSONResponse:
                                              "confirmed_format": command.confirmed_format})
         except Exception:  # noqa: BLE001 — агент отвалился, запись всё равно сделана
             pass
-    return _ok({"ok": True, "station_id": command.station_id,
+    return _ok({"ok": True, "station_id": _station(command.station_id),
                 "confirmed_format": command.confirmed_format})
 
 
@@ -654,6 +661,16 @@ def _refused(error: Exception, status_code: int = 409) -> JSONResponse:
     return JSONResponse({"ok": False, "error": str(error)}, status_code=status_code)
 
 
+def _station(value: Any) -> str | None:
+    """Станция наружу — uuid, внутрь — строка.
+
+    Модели приняли `uuid.UUID`, чтобы опечатка в имени станции не уезжала
+    молча. Реестр агентов и база знают станцию строкой: нормализуем здесь,
+    в одном месте, а не в каждом сервисе.
+    """
+    return None if value is None else str(value)
+
+
 def _text(value: Any) -> str | None:
     if value is None:
         return None
@@ -674,7 +691,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.picking = PickingService(state.client, state.projection, state.store, state.poller)
     state.printing = PrintService(state.client, state.hub, state.store, state.projection)
     state.receiving = ReceivingService(state.client)
-    state.supervisor = SupervisorService(state.projection, state.store, state.receiving)
+    state.supervisor = SupervisorService(state.projection, state.store, state.receiving,
+                                         wms=state.client)
 
     await state.store.ping()
     # Задания открытых сессий возвращаются на экран ДО первого опроса.
@@ -682,6 +700,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # обходу, а экран показывал бы им «работы нет».
     await state.poller.restore_open_sessions()
     state.poller.start()
+    # Уборка молчащих агентов: оборванный сокет не всегда закрывается, а
+    # печать в мёртвую сессию ждёт подтверждения до таймаута.
+    reaper = asyncio.create_task(state.hub.reaper(), name="workstation-agent-reaper")
 
     bus_url = config.rabbitmq_url()
     if bus_url:
@@ -697,6 +718,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        reaper.cancel()
         state.inbox.stop()
         if state.poller is not None:
             await state.poller.stop()

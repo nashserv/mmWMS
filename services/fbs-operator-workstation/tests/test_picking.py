@@ -223,7 +223,7 @@ def test_a_broken_store_does_not_take_tasks_nobody_can_pick(wms: FakeWms):
     picking, _poller = build(wms, BrokenStore())
 
     with pytest.raises(PickingRefused) as refused:
-        run(picking.start_session(actor_id="picker-1", station_id="st-1",
+        run(picking.start_session(actor_id="picker-1", station_id="11111111-1111-4111-8111-111111111111",
                                   limit=10, lease_seconds=900))
 
     assert "база рабочего места недоступна" in str(refused.value)

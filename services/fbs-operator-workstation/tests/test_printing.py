@@ -47,7 +47,7 @@ def build(wms: FakeWms, store: FakeStore, *, connected: bool = True, **agent_kwa
     hub = AgentHub()
     socket = FakeAgentSocket(hub, **agent_kwargs)
     if connected:
-        run(hub.register(AgentSession(station_id="st-1", station_name="Станция 1",
+        run(hub.register(AgentSession(station_id="11111111-1111-4111-8111-111111111111", station_name="Станция 1",
                                       websocket=socket)))
     return PrintService(wms.client(), hub, store, Projection()), hub, socket
 
@@ -55,11 +55,11 @@ def build(wms: FakeWms, store: FakeStore, *, connected: bool = True, **agent_kwa
 def test_print_sends_raw_bytes_to_the_station_agent(wms: FakeWms, store: FakeStore):
     payload = b"^XA^FDlabel^FS^XZ"
     wms.on("/labels/a/print", lambda params: dict(
-        label_result(payload), task_id="a", station_id="st-1",
+        label_result(payload), task_id="a", station_id="11111111-1111-4111-8111-111111111111",
         printer_transport="agent"))
     printing, _hub, socket = build(wms, store)
 
-    result = run(printing.print_label(task_id="a", station_id="st-1", actor_id="Иванов"))
+    result = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111", actor_id="Иванов"))
     assert result["ok"] is True
     assert result["agent_write_ms"] == 3.5
     assert socket.sent[0]["type"] == "print"
@@ -70,29 +70,29 @@ def test_print_sends_raw_bytes_to_the_station_agent(wms: FakeWms, store: FakeSto
 def test_print_never_touches_wildberries(wms: FakeWms, store: FakeStore):
     """Инвариант 9: стикер лежит локально, запрос к WB в момент упаковки запрещён."""
     wms.on("/labels/a/print", lambda params: dict(label_result(), task_id="a",
-                                                  station_id="st-1"))
+                                                  station_id="11111111-1111-4111-8111-111111111111"))
     printing, _hub, _socket = build(wms, store)
-    run(printing.print_label(task_id="a", station_id="st-1"))
+    run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     assert [route for route, _ in wms.calls] == ["/labels/a/print"], (
         "на пути печати ровно один вызов — за локальным стикером")
 
 
 def test_print_is_refused_when_the_checksum_does_not_match(wms: FakeWms, store: FakeStore):
     wms.on("/labels/a/print", lambda params: dict(
-        label_result(), task_id="a", station_id="st-1", checksum="0" * 64))
+        label_result(), task_id="a", station_id="11111111-1111-4111-8111-111111111111", checksum="0" * 64))
     printing, _hub, socket = build(wms, store)
     with pytest.raises(PrintRefused):
-        run(printing.print_label(task_id="a", station_id="st-1"))
+        run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     assert not socket.sent, "испорченный стикер до принтера не доходит"
 
 
 def test_print_without_an_agent_says_so_instead_of_pretending(wms: FakeWms,
                                                               store: FakeStore):
     wms.on("/labels/a/print", lambda params: dict(label_result(), task_id="a",
-                                                  station_id="st-1"))
+                                                  station_id="11111111-1111-4111-8111-111111111111"))
     printing, _hub, _socket = build(wms, store, connected=False)
     with pytest.raises(PrintRefused) as failure:
-        run(printing.print_label(task_id="a", station_id="st-1"))
+        run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     assert "агента печати" in str(failure.value)
     # Отказ случается ДО вызова в wms: стикер не запрашивается, печати нет, и
     # записывать нечего. Раньше стикер запрашивался, в wms проставлялась
@@ -105,25 +105,25 @@ def test_print_without_an_agent_says_so_instead_of_pretending(wms: FakeWms,
 
 def test_a_failing_printer_is_reported_not_swallowed(wms: FakeWms, store: FakeStore):
     wms.on("/labels/a/print", lambda params: dict(label_result(), task_id="a",
-                                                  station_id="st-1"))
+                                                  station_id="11111111-1111-4111-8111-111111111111"))
     printing, _hub, _socket = build(wms, store, ok=False)
     with pytest.raises(PrintRefused):
-        run(printing.print_label(task_id="a", station_id="st-1"))
+        run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
 
 
 def test_reprint_without_a_reason_is_refused_before_any_call(wms: FakeWms,
                                                              store: FakeStore):
     printing, _hub, _socket = build(wms, store)
     with pytest.raises(PrintRefused):
-        run(printing.print_label(task_id="a", station_id="st-1", reprint=True, reason=""))
+        run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111", reprint=True, reason=""))
     assert not wms.calls
 
 
 def test_print_records_both_halves_of_the_budget(wms: FakeWms, store: FakeStore):
     wms.on("/labels/a/print", lambda params: dict(label_result(), task_id="a",
-                                                  station_id="st-1"))
+                                                  station_id="11111111-1111-4111-8111-111111111111"))
     printing, _hub, _socket = build(wms, store)
-    result = run(printing.print_label(task_id="a", station_id="st-1",
+    result = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111",
                                       idempotency_key="print-a-1"))
     job = run(store.print_job("print-a-1"))
     assert job["outcome"] == "written"
@@ -136,9 +136,9 @@ def test_a_png_label_reaches_the_agent_untouched(wms: FakeWms, store: FakeStore)
     png = b"\x89PNG\r\n\x1a\n" + b"payload"
     wms.on("/labels/a/print", lambda params: dict(
         label_result(png, content_type="image/png", format="png"),
-        task_id="a", station_id="st-1"))
+        task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     printing, _hub, socket = build(wms, store)
-    result = run(printing.print_label(task_id="a", station_id="st-1"))
+    result = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     assert result["label_format"] == "png"
     assert socket.sent[0]["format"] == "png"
     assert base64.b64decode(socket.sent[0]["payload_b64"]) == png
@@ -147,7 +147,7 @@ def test_a_png_label_reaches_the_agent_untouched(wms: FakeWms, store: FakeStore)
 def test_agent_write_telemetry_is_kept_for_the_full_run(wms: FakeWms, store: FakeStore):
     """Шаг 10 прогона читает это число по PRINT_AGENT_STATS_URL."""
     hub = AgentHub()
-    hub.note_write(task_id="a", station_id="st-1", write_ms=12.4, label_format="zplv")
+    hub.note_write(task_id="a", station_id="11111111-1111-4111-8111-111111111111", write_ms=12.4, label_format="zplv")
     assert hub.last_write["last_write_ms"] == 12.4
     assert hub.last_write["task_id"] == "a"
 
@@ -175,11 +175,11 @@ def test_a_double_click_prints_once(wms: FakeWms, store: FakeStore):
     вторую на следующую — то есть отправлял чужой заказ.
     """
     wms.on("/labels/a/print", lambda params: dict(
-        label_result(), task_id="a", station_id="st-1"))
+        label_result(), task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     printing, _hub, socket = build(wms, store)
 
-    first = run(printing.print_label(task_id="a", station_id="st-1"))
-    second = run(printing.print_label(task_id="a", station_id="st-1"))
+    first = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
+    second = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
 
     assert first["idempotency_key"] == second["idempotency_key"], (
         f"ключи печати разные ({first['idempotency_key']} и "
@@ -196,13 +196,13 @@ def test_a_reprint_always_gets_its_own_key(wms: FakeWms, store: FakeStore):
     зажёванную этикетку.
     """
     wms.on("/labels/a/print", lambda params: dict(
-        label_result(), task_id="a", station_id="st-1"))
+        label_result(), task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     printing, _hub, _socket = build(wms, store)
 
-    first = run(printing.print_label(task_id="a", station_id="st-1"))
-    again = run(printing.print_label(task_id="a", station_id="st-1",
+    first = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
+    again = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111",
                                      reprint=True, reason="ленту зажевало"))
-    third = run(printing.print_label(task_id="a", station_id="st-1",
+    third = run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111",
                                      reprint=True, reason="ленту зажевало снова"))
 
     assert again["idempotency_key"].startswith("reprint-a-")
@@ -220,7 +220,7 @@ def test_a_silent_agent_gives_unknown_not_failed(wms: FakeWms, store: FakeStore)
     from app.printing import PrintUnknown
 
     wms.on("/labels/a/print", lambda params: dict(
-        label_result(), task_id="a", station_id="st-1"))
+        label_result(), task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
 
     class SilentSocket(FakeAgentSocket):
         async def send_json(self, message: dict) -> None:
@@ -228,7 +228,7 @@ def test_a_silent_agent_gives_unknown_not_failed(wms: FakeWms, store: FakeStore)
 
     hub = AgentHub()
     socket = SilentSocket(hub)
-    run(hub.register(AgentSession(station_id="st-1", station_name="Станция 1",
+    run(hub.register(AgentSession(station_id="11111111-1111-4111-8111-111111111111", station_name="Станция 1",
                                   websocket=socket)))
     printing = PrintService(wms.client(), hub, store, Projection())
 
@@ -237,7 +237,7 @@ def test_a_silent_agent_gives_unknown_not_failed(wms: FakeWms, store: FakeStore)
     agent_hub.ACK_TIMEOUT_SECONDS = 0.05
     try:
         with pytest.raises(PrintUnknown) as failure:
-            run(printing.print_label(task_id="a", station_id="st-1"))
+            run(printing.print_label(task_id="a", station_id="11111111-1111-4111-8111-111111111111"))
     finally:
         agent_hub.ACK_TIMEOUT_SECONDS = previous
 
@@ -246,7 +246,7 @@ def test_a_silent_agent_gives_unknown_not_failed(wms: FakeWms, store: FakeStore)
     assert job["outcome"] == "unknown", (
         f"исход записан как {job['outcome']}: «неизвестно» и «не напечатано» — "
         f"разные ответы человеку")
-    assert hub.get("st-1") is None, (
+    assert hub.get("11111111-1111-4111-8111-111111111111") is None, (
         "молчащая сессия агента осталась в реестре: следующая печать уйдёт "
         "в тот же немой сокет")
 
@@ -266,21 +266,21 @@ def test_an_acknowledgement_from_another_station_is_refused():
 
     hub = AgentHub()
     ours, theirs = QuietSocket(hub), QuietSocket(hub)
-    run(hub.register(AgentSession(station_id="st-1", station_name="Наша",
+    run(hub.register(AgentSession(station_id="11111111-1111-4111-8111-111111111111", station_name="Наша",
                                   websocket=ours)))
-    run(hub.register(AgentSession(station_id="st-2", station_name="Соседняя",
+    run(hub.register(AgentSession(station_id="22222222-2222-4222-8222-222222222222", station_name="Соседняя",
                                   websocket=theirs)))
 
     async def scenario():
         sending = asyncio.create_task(hub.send_print(
-            station_id="st-1", job_id="job-1", task_id="a",
+            station_id="11111111-1111-4111-8111-111111111111", job_id="job-1", task_id="a",
             payload=b"^XA^XZ", label_format="zplv",
             content_type="application/x-zpl"))
         await asyncio.sleep(0)
         foreign = hub.resolve("job-1", {"ok": True, "write_ms": 1.0},
-                              station_id="st-2")
+                              station_id="22222222-2222-4222-8222-222222222222")
         mine = hub.resolve("job-1", {"ok": True, "write_ms": 2.0},
-                           station_id="st-1")
+                           station_id="11111111-1111-4111-8111-111111111111")
         return foreign, mine, await sending
 
     foreign, mine, ack = run(scenario())

@@ -52,6 +52,14 @@ VERIFY_PER_POLL = 25
 # `_verify_missing`; эти двое терминальными не являются и висели вечно.
 STALE_SHIPPED_SECONDS = 6 * 3600.0
 
+# Сколько чистых опросов подряд нужно, чтобы снять флаг нарушения контракта.
+# Десять секунд исправной работы — достаточно, чтобы не считать одну
+# случайную строку поводом раздавать задания в обход до перезапуска.
+CLEAN_POLLS_TO_FORGIVE = 10
+
+# Минимальный промежуток между пробуждениями опроса по событию с шины.
+NUDGE_MIN_INTERVAL = 0.3
+
 
 class Poller:
     """Цикл опроса. Один на сервис, а не один на экран.
@@ -77,6 +85,10 @@ class Poller:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._adopt_lock = asyncio.Lock()
+        # Опрос идёт по одному: цикл, шина и ручной /poll зовут его разом.
+        self._poll_lock = asyncio.Lock()
+        # Когда шине можно будить опрос в следующий раз.
+        self._nudge_allowed_at = 0.0
         # Кому отдано задание в обход (см. claim_ignored). Держится здесь,
         # потому что следующий ответ wms придёт с прежним assignee и затрёт
         # local-выдачу — а задание, потерявшее хозяина, уйдёт второму
@@ -90,6 +102,8 @@ class Poller:
         # по настройке: против исправного сервиса он никогда не включится.
         self.claim_ignored = False
         self.claim_ignored_since: str | None = None
+        # Сколько опросов подряд сервис вёл себя правильно.
+        self._clean_polls = 0
 
     # ------------------------------------------------------------ жизненный цикл
 
@@ -115,7 +129,17 @@ class Poller:
 
         Единственное, что событию позволено сделать с проекцией. Оно не
         приносит данные — оно приносит повод сходить за ними.
+
+        Не чаще раза в 300 мс. Пачка из двухсот событий приходит за
+        миллисекунды — по одному на заказ, — и без порога каждое из них
+        будило бы отдельный опрос: двести запросов к `wms` там, где нужен
+        один, и это по всей очереди сразу.
         """
+        now = time.monotonic()
+        if now < self._nudge_allowed_at:
+            metrics.BUS_NUDGES.labels(outcome="throttled").inc()
+            return
+        self._nudge_allowed_at = now + NUDGE_MIN_INTERVAL
         metrics.BUS_NUDGES.labels(outcome=source).inc()
         self._wake.set()
 
@@ -146,7 +170,17 @@ class Poller:
         `claim: false` здесь принципиально: экран обновляется чаще, чем человек
         берёт работу, и занимать задание при каждом обновлении значит
         разложить всю очередь по пустым сессиям.
+
+        Под замком: цикл, `nudge` с шины и ручной `/poll` с экрана зовут это
+        одновременно, а `Projection.apply` считает новыми те задания, которых
+        в ней ещё нет. Два опроса внахлёст — и одно и то же задание дважды
+        попадало в метрику «новых на экране», а `_verify_missing` спрашивал
+        `wms` об одном и том же по два раза.
         """
+        async with self._poll_lock:
+            return await self._poll_once_locked()
+
+    async def _poll_once_locked(self) -> PullBatch:
         started = time.perf_counter()
         previous = {task.task_id: task for task in self._projection.all()}
         try:
@@ -314,11 +348,27 @@ class Poller:
         симптом выглядит как «заданий нет», то есть ровно как та беда,
         которую чиним.
         """
-        stolen = [task for task in batch.tasks
-                  if task.assignee == SCREEN_ASSIGNEE
-                  or batch.leased_until.get(task.task_id)]
+        # Признак — ТОЛЬКО наше собственное имя экрана в `assignee`.
+        #
+        # `leased_until` больше не признак: с версии контракта 1.3.0 чтение с
+        # заполненным `assignee` законно отдаёт задания в руках у этого
+        # сборщика — вместе с их лизингом. Считать это нарушением значит
+        # включать обходной путь на исправном сервисе и раздавать сборщику
+        # чужую работу.
+        stolen = [task for task in batch.tasks if task.assignee == SCREEN_ASSIGNEE]
         if not stolen:
+            # Десять чистых опросов подряд — и флаг снимается. Иначе он
+            # оставался поднятым до перезапуска: сервис давно починили, а
+            # рабочее место всё ещё раздаёт задания в обход.
+            self._clean_polls += 1
+            if self.claim_ignored and self._clean_polls >= CLEAN_POLLS_TO_FORGIVE:
+                self.claim_ignored = False
+                self.claim_ignored_since = None
+                self._adopted.clear()
+                logger.info("wms больше не занимает задания при `claim: false` — "
+                            "обходной путь выключен")
             return
+        self._clean_polls = 0
         metrics.CONTRACT_FALLBACKS.labels(route="/tasks/pull", field="claim_ignored").inc()
         if not self.claim_ignored:
             self.claim_ignored = True
