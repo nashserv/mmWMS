@@ -272,14 +272,55 @@ class PrintAgent:
         logger.error("печать не удалась: %s", error)
 
 
+def _prometheus(stats: Stats) -> bytes:
+    """Те же числа в формате Prometheus.
+
+    Время записи в устройство — единственное число, которое не измерить
+    снаружи станции: от рабочего места видно только «отправлено агенту».
+    Без этой ручки Prometheus забирал JSON и отбрасывал его как неизвестный
+    формат — цель числилась живой ровно до первой попытки прочитать.
+
+    Формат текстовый и написан руками: `prometheus_client` на складской ПК не
+    ставится, у агента вообще нет зависимостей кроме стандартной библиотеки.
+    """
+    snapshot = stats.snapshot()
+    lines = [
+        "# HELP mmx_print_agent_writes_total Labels written into the device.",
+        "# TYPE mmx_print_agent_writes_total counter",
+        f"mmx_print_agent_writes_total {int(snapshot.get('writes') or 0)}",
+        "# HELP mmx_print_agent_failures_total Print jobs the agent could not write.",
+        "# TYPE mmx_print_agent_failures_total counter",
+        f"mmx_print_agent_failures_total {int(snapshot.get('failures') or 0)}",
+    ]
+    last = snapshot.get("last_write_ms")
+    if last is not None:
+        lines += [
+            "# HELP mmx_print_agent_last_write_seconds Duration of the most recent RAW write.",
+            "# TYPE mmx_print_agent_last_write_seconds gauge",
+            f"mmx_print_agent_last_write_seconds {float(last) / 1000.0:.6f}",
+        ]
+    at = snapshot.get("at")
+    if at is not None:
+        lines += [
+            "# HELP mmx_print_agent_last_write_timestamp_seconds When the last write happened.",
+            "# TYPE mmx_print_agent_last_write_timestamp_seconds gauge",
+            f"mmx_print_agent_last_write_timestamp_seconds {float(at):.3f}",
+        ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def start_stats_server(stats: Stats, port: int) -> HTTPServer:
     """HTTP с одним числом — временем последней записи в устройство."""
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 — имя задано базовым классом
-            body = json.dumps(stats.snapshot(), ensure_ascii=False).encode("utf-8")
+            if self.path.rstrip("/") == "/metrics":
+                body, content_type = _prometheus(stats), "text/plain; version=0.0.4"
+            else:
+                body = json.dumps(stats.snapshot(), ensure_ascii=False).encode("utf-8")
+                content_type = "application/json; charset=utf-8"
             self.send_response(200)
-            self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("content-type", content_type)
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

@@ -428,12 +428,20 @@ services:
     volumes:
       - ./prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
-    command:
-      - "--config.file=/etc/alertmanager/alertmanager.yml"
-      - "--storage.path=/alertmanager"
-      # Адрес приёмника подставляется из окружения: в нём токен, и в Git его
-      # быть не должно (инвариант 15).
-      - "--config.expand-env=true"
+    # Адрес приёмника подставляется в конфигурацию НА СТАРТЕ, а не хранится
+    # в Git: в нём токен бота (инвариант 15). Alertmanager своей подстановки
+    # переменных не умеет, поэтому её делает entrypoint — в копию, а не в
+    # смонтированный файл: тот только на чтение.
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - |
+        set -e
+        sed "s|[$]ALERTMANAGER_WEBHOOK|$$ALERTMANAGER_WEBHOOK|g" \
+            /etc/alertmanager/alertmanager.yml > /alertmanager/alertmanager.yml
+        exec /bin/alertmanager \
+            --config.file=/alertmanager/alertmanager.yml \
+            --storage.path=/alertmanager
     ports: ["127.0.0.1:9093:9093"]
 
   grafana:

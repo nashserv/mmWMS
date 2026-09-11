@@ -426,7 +426,35 @@ async def seed_cards(request: Request) -> Any:
     return {"created": len(created), "cards": created}
 
 
+# Приёмник алертов стенда. У Wildberries его, разумеется, нет.
+#
+# Нужен затем, чтобы «алерт сработал» можно было ПРОВЕРИТЬ, а не поверить.
+# Правило, которое горит в интерфейсе Prometheus, и правило, которое дошло до
+# дежурного, — разные вещи, и в боевом контуре разница между ними стоила
+# месяцев молчания (раздел 3.5).
+_alerts: list[dict[str, Any]] = []
+
+
+@app.post("/__stand__/alerts")
+async def receive_alert(request: Request) -> Any:
+    body = await request.json()
+    with simulator._lock:
+        _alerts.append({"at": time.time(), "body": body})
+        # Держим последние двести: это стенд, а не хранилище инцидентов.
+        del _alerts[:-200]
+    return {"received": len(body.get("alerts") or [])}
+
+
+@app.get("/__stand__/alerts")
+async def list_alerts() -> Any:
+    """Что дошло до приёмника. Пусто — значит не дошло ничего."""
+    with simulator._lock:
+        return {"alerts": list(_alerts), "count": len(_alerts)}
+
+
 @app.post("/__stand__/reset")
 async def reset() -> dict[str, str]:
     simulator.reset()
+    with simulator._lock:
+        _alerts.clear()
     return {"status": "reset"}

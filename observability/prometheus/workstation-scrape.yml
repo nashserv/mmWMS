@@ -14,6 +14,6 @@
 # которое не измерить снаружи станции. На стенде агент один; в бою их пять,
 # по одному на рабочее место (решение владельца 14).
 - job_name: workstation-print-agent
-  metrics_path: /
+  metrics_path: /metrics
   static_configs:
     - targets: ["workstation-agent:8091"]
