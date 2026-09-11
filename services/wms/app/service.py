@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,8 @@ from .domain import ErrorCode, EventEnvelope, TaskState
 from .events import assert_no_secrets
 from .metrics import STOCK_SHORTFALL, track_lock
 from .postgres import ConnectionPool, is_retryable, single, transaction
+
+log = logging.getLogger("wms.service")
 
 TENANT_ID = os.getenv("MMX_TENANT_ID", "mm-express")
 
@@ -199,7 +202,18 @@ class WmsService:
             # заказу (инвариант 6). Названный и не найденный — всегда отказ.
             owner = repo.owner_by_id(cursor, account_hint["owner_id"])
             seller = owner["seller_external_id"] if owner else seller
-        if owner is None or not owner["active"]:
+        if owner is not None and not owner["active"]:
+            # Владелец есть, но отключён. Задание завести МОЖНО — и нужно:
+            # заказ существует у Wildberries, срок по нему идёт, и молчаливый
+            # отказ раз в две секунды не поможет никому. Разбирает человек.
+            return self._manual_review(
+                cursor, code=ErrorCode.OWNER_INACTIVE, owner=owner, seller=seller,
+                account=account_hint or repo.sole_account_of_owner(cursor, owner["id"]),
+                wb_order_id=wb_order_id, wb_order_uid=_text(params.get("order_uid")),
+                barcode=barcode or sku_field, quantity=quantity, deadline=params.get("deadline"),
+                reason=f"клиент {seller} отключён: приём его заказов остановлен",
+                correlation_id=correlation_id)
+        if owner is None:
             # Владельца нет — задания тоже не будет: owner_id в схеме NOT NULL,
             # и приписать чужой товар первому попавшемуся клиенту нельзя
             # (инвариант 6).
@@ -350,7 +364,8 @@ class WmsService:
     def _manual_review(self, cursor: psycopg.Cursor, *, code: ErrorCode,
                        owner: dict[str, Any], account: dict[str, Any], wb_order_id: int,
                        wb_order_uid: str | None, barcode: str | None, quantity: int,
-                       deadline: Any, correlation_id: str, seller: str) -> ReservationOutcome:
+                       deadline: Any, correlation_id: str, seller: str,
+                       reason: str | None = None) -> ReservationOutcome:
         """Немаппленный товар становится заданием в manual_review, а не отказом.
 
         В боевом контуре PRODUCT_MAPPING_MISSING уходил в отказ и дальше в
@@ -358,7 +373,7 @@ class WmsService:
         попасть человеку на глаза с кодом; резерв при этом не создаётся, и
         товар без маппинга не превращается в остаток (инвариант 6).
         """
-        reason = {
+        reason = reason or {
             ErrorCode.PRODUCT_MAPPING_MISSING:
                 f"товар {barcode!r} не найден у владельца {seller}",
             ErrorCode.AMBIGUOUS_PRODUCT_MAPPING:
@@ -404,12 +419,23 @@ class WmsService:
             "quantity": max(quantity, 1), "error_code": code.value}
         if seller:
             payload["seller_external_id"] = seller
-        emitted = self._emit(
-            cursor, event_type="wms.reservation.failed.v1", payload=payload,
-            correlation_id=correlation_id, aggregate_id=aggregate)
+        # Событие — только на ПЕРВЫЙ отказ по этому заказу. Раньше оно уходило
+        # при каждом опросе: заказ неизвестного продавца приезжает каждые две
+        # секунды и каждые две секунды рождал событие — сорок тысяч за сутки об
+        # одном заказе, и в этом шуме тонули настоящие отказы.
+        first = repo.remember_rejection(
+            cursor, wb_order_id=int(wb_order_id), error_code=code.value,
+            seller_hint=seller or None)
+        events = []
+        if first:
+            events.append(self._emit(
+                cursor, event_type="wms.reservation.failed.v1", payload=payload,
+                correlation_id=correlation_id, aggregate_id=aggregate))
+            log.warning("заказ %s отвергнут (%s): задание завести не на кого",
+                        wb_order_id, code.value)
         return ReservationOutcome(
             status="rejected", error_code=code.value,
-            owner_external_id=seller or None, events=[emitted])
+            owner_external_id=seller or None, events=events)
 
     def _outcome_for_existing(self, cursor: psycopg.Cursor, task: dict[str, Any],
                               seller: str) -> ReservationOutcome:

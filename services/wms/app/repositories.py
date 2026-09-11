@@ -173,6 +173,30 @@ TASK_COLUMNS = (
     "manual_review_reason, last_reconciled_at, created_at, updated_at, version")
 
 
+def remember_rejection(cursor: Cursor, *, wb_order_id: int, error_code: str,
+                       seller_hint: str | None) -> bool:
+    """Помнит отказ по заказу, для которого нельзя завести задание.
+
+    `True` — отказ новый и о нём стоит сказать наружу. `False` — этот заказ
+    уже отвергали: событие было, и второе такое же никому не нужно.
+
+    Отказ без задания эмитил `wms.reservation.failed.v1` при КАЖДОМ опросе:
+    заказ неизвестного продавца приезжал каждые две секунды и каждые две
+    секунды рождал событие. За сутки — сорок тысяч событий об одном заказе,
+    и в этом шуме тонули настоящие отказы.
+    """
+    cursor.execute(
+        "INSERT INTO wb_order_rejected (wb_order_id, error_code, seller_hint) "
+        "VALUES (%s, %s, %s) "
+        "ON CONFLICT (wb_order_id) DO UPDATE SET "
+        "    last_seen_at = now(), seen = wb_order_rejected.seen + 1, "
+        "    error_code = EXCLUDED.error_code "
+        "RETURNING (xmax = 0) AS created",
+        (wb_order_id, error_code, seller_hint))
+    row = cursor.fetchone()
+    return bool(row and row["created"])
+
+
 def park_unprocessable_order(cursor: Cursor, *, wb_account_id: uuid.UUID,
                             owner_id: uuid.UUID, wb_order_id: int,
                             code: str, reason: str) -> dict[str, Any] | None:

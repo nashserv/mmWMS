@@ -204,6 +204,13 @@ class ErrorCode(str, Enum):
     WAREHOUSE_UNKNOWN = "WAREHOUSE_UNKNOWN"
     INSUFFICIENT_STOCK = "INSUFFICIENT_STOCK"
     SERIALIZATION_RETRY = "SERIALIZATION_RETRY"
+    # Добавлены потоком 0 в версии контракта 1.3.0 (docs/schema-decisions.md).
+    # Клиент отключён: заказ у Wildberries есть, срок по нему идёт, и задание
+    # обязано попасть человеку на глаза, а не отвергаться каждые две секунды.
+    OWNER_INACTIVE = "OWNER_INACTIVE"
+    # Заказ Wildberries не разобран: битая дата, дикое количество, чужое поле.
+    # Один такой ронял весь такт опроса.
+    UNPROCESSABLE_ORDER = "UNPROCESSABLE_ORDER"
 
 
 class DiscrepancyKind(str, Enum):

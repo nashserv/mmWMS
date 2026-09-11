@@ -97,3 +97,19 @@ ALTER TABLE wb_account ADD COLUMN IF NOT EXISTS blocked_until timestamptz;
 -- публикатор в этот момент видит те же строки непубликованными и отправляет
 -- их второй раз. Явный лизинг переживает конец запроса.
 ALTER TABLE outbox ADD COLUMN IF NOT EXISTS claimed_until timestamptz;
+
+-- 9. Отказы по заказам, для которых нельзя завести задание.
+--
+-- Отказ без задания эмитил `wms.reservation.failed.v1` при КАЖДОМ опросе:
+-- заказ неизвестного продавца приезжал каждые две секунды и каждые две
+-- секунды рождал событие. За сутки это сорок тысяч событий об одном заказе.
+-- Задание для него завести не на кого (`owner_id` NOT NULL), поэтому память
+-- об отказе живёт здесь.
+CREATE TABLE IF NOT EXISTS wb_order_rejected (
+    wb_order_id  bigint PRIMARY KEY,
+    error_code   text NOT NULL,
+    seller_hint  text,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    seen         integer NOT NULL DEFAULT 1
+);

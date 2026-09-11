@@ -204,3 +204,81 @@ def test_a_cabinet_without_a_warehouse_is_not_published_silently(
     assert any("wb_warehouse_id" in record.getMessage() for record in caplog.records), (
         "кабинет без склада промолчал: остаток не публикуется, а инвариант 7 "
         "считается выполненным")
+
+
+# ------------------------------------------------------- отказы без задания
+
+def test_a_rejected_order_raises_its_alarm_once_not_every_poll(
+        pool: ConnectionPool) -> None:
+    """Событие отказа — на первый отказ, а не на каждый опрос.
+
+    Заказ неизвестного продавца приезжает каждые две секунды и каждые две
+    секунды рождал `wms.reservation.failed.v1`: сорок тысяч событий об одном
+    заказе за сутки, и в этом шуме тонули настоящие отказы.
+    """
+    wms = WmsService(pool)
+    order_id = uuid.uuid4().int % 10**12
+    params = {
+        "idempotency_key": unique("idem"), "seller_external_id": unique("nobody"),
+        "wb_account_external_id": unique("nowhere"), "wb_order_id": order_id,
+        "sku": "4600000000001", "barcode": "4600000000001", "quantity": 1,
+        "correlation_id": unique("corr")}
+
+    first = wms.reserve(params)
+    assert first.status == "rejected"
+    assert len(first.events) == 1, "первый отказ обязан сказать о себе"
+
+    for _ in range(4):
+        again = wms.reserve(dict(params, idempotency_key=unique("idem")))
+        assert again.status == "rejected"
+        assert again.error_code == first.error_code
+        assert again.events == [], (
+            "повторный опрос того же заказа снова эмитит событие отказа")
+
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute("SELECT seen, error_code FROM wb_order_rejected "
+                           " WHERE wb_order_id = %s", (order_id,))
+            remembered = cursor.fetchone()
+    assert remembered and int(remembered["seen"]) == 5, "отказы не считаются"
+
+
+def test_an_inactive_client_gets_a_task_for_a_human_not_a_silent_refusal(
+        pool: ConnectionPool) -> None:
+    """Клиент отключён — заказ всё равно существует, и срок по нему идёт.
+
+    Молчаливый отказ раз в две секунды не поможет никому: задание обязано
+    попасть человеку на глаза с кодом.
+    """
+    catalog = CatalogOperations(pool)
+    seller, external = unique("seller"), unique("wb")
+    barcode = f"46{uuid.uuid4().int % 10**11:011d}"
+    catalog.upsert_owner({"seller_external_id": seller, "name": "Отключённый"})
+    catalog.upsert_wb_account({
+        "op": "upsert", "external_id": external, "seller_external_id": seller,
+        "display_name": "Кабинет отключённого", "secret_ref": f"vault://mmx/test/{external}",
+        "mode": "live", "status": "ACTIVE", "wb_warehouse_id": 3})
+    catalog.ensure_product({"seller_external_id": seller, "barcode": barcode})
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute("UPDATE owner SET active = false WHERE seller_external_id = %s",
+                           (seller,))
+
+    order_id = uuid.uuid4().int % 10**12
+    outcome = WmsService(pool).reserve({
+        "idempotency_key": unique("idem"), "seller_external_id": seller,
+        "wb_account_external_id": external, "wb_order_id": order_id,
+        "sku": barcode, "barcode": barcode, "quantity": 1,
+        "correlation_id": unique("corr")})
+
+    assert outcome.error_code == "OWNER_INACTIVE"
+    assert outcome.task_id, "задание не заведено — заказ исчез из виду"
+
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute("SELECT state, manual_review_code, manual_review_reason "
+                           "  FROM wms_task WHERE wb_order_id = %s", (order_id,))
+            task = cursor.fetchone()
+    assert task["state"] == "manual_review"
+    assert task["manual_review_code"] == "OWNER_INACTIVE"
+    assert seller in task["manual_review_reason"]
