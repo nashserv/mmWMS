@@ -775,8 +775,7 @@ def test_step_12_every_billable_operation_is_accrued_45_15_30(
         # «не встретилось за прогон» это не «никто не издаёт».
 
         for event in billable:
-            accrual = billing.row(
-                f"SELECT * FROM {table} WHERE event_id = %s", (event["event_id"],))  # noqa: S608
+            accrual = _accrual_of(event["event_id"], billing, table)
             assert accrual, (
                 f"на операцию {event['type']} (event_id={event['event_id']}) "
                 f"нет начисления: физическое действие = движение + событие + начисление "
@@ -1206,6 +1205,33 @@ def test_a_rejected_message_lands_in_dead_letters_not_in_nowhere(
         except Exception:  # noqa: BLE001 — уборка не важнее проверки
             pass
         connection.close()
+
+
+def _accrual_of(event_id: str, billing: Db, table: str) -> dict[str, Any] | None:
+    """Начисление на операцию — ПО КОНТРАКТУ, а не чтением чужой базы.
+
+    Шаг 12 читал `billing_accrual` напрямую: проверял стык, минуя стык.
+    Переименование колонки красило прогон там, где контракт не менялся, а
+    сломанный маршрут прогон не видел вовсе.
+
+    Прямое чтение осталось запасным путём — но громким: если биллинг не
+    ответил по HTTP, прогон говорит об этом вслух, а не подменяет проверку
+    молча.
+    """
+    base = (os.getenv("BILLING_BASE_URL") or "http://127.0.0.1:8082").rstrip("/")
+    token = (os.getenv("SERVICE_TOKEN") or "").strip()
+    try:
+        answer = httpx.get(f"{base}/api/billing/v1/accruals",
+                           params={"event_id": event_id},
+                           headers={"Authorization": f"Bearer {token}"} if token else {},
+                           timeout=10.0)
+        answer.raise_for_status()
+        found = answer.json().get("accruals") or []
+        return found[0] if found else None
+    except Exception as failure:  # noqa: BLE001
+        print(f"\nбиллинг не ответил по контракту ({failure}); читаю базу напрямую")
+        return billing.row(
+            f"SELECT * FROM {table} WHERE event_id = %s", (event_id,))  # noqa: S608
 
 
 # ============================================================= шаг 17 (A, C)

@@ -46,13 +46,20 @@ class Principal:
     # Стенд без identity: доступ открыт, и это обязано быть видно в ответе,
     # а не подразумеваться. В защищённых средах такой принципал не выдаётся.
     open_stand: bool = False
+    # Соседний сервис по общему секрету: не человек, но и не улица. Видит всё,
+    # не пишет ничего. Отдельным полем, а не ролью: роль «читает всё» однажды
+    # выдали бы человеку, а этот принципал получить руками нельзя — только
+    # предъявив SERVICE_TOKEN, который лежит вне Git.
+    service: bool = False
 
     @property
     def unrestricted(self) -> bool:
-        return self.open_stand or bool(self.roles & UNRESTRICTED)
+        return self.open_stand or self.service or bool(self.roles & UNRESTRICTED)
 
     @property
     def may_write(self) -> bool:
+        # `service` здесь НЕТ намеренно: деньги сервисным токеном не пишутся.
+        # Исключение одно — `POST /events`, и там это сказано в самом маршруте.
         return self.open_stand or bool(self.roles & WRITERS)
 
 

@@ -39,12 +39,27 @@ principals = Principals()
 router = APIRouter(prefix=BASE_PATH)
 
 
+#: Сервис, который читает начисления, — не человек и не улица.
+#:
+#: Полный прогон проверяет шаг 12 «начисление есть на каждую операцию». До
+#: этого он читал `billing_accrual` напрямую по `BILLING_DATABASE_URL` — то
+#: есть проверял стык, минуя стык. Любое переименование колонки ломало прогон
+#: там, где контракт не менялся, и наоборот: сломанный маршрут прогон не видел.
+#:
+#: Права только на ЧТЕНИЕ: `may_write` у этого принципала ложно, деньги
+#: сервисным токеном не пишутся ни через один маршрут, кроме `/events`, где это
+#: сказано отдельно.
+SERVICE_READER = Principal(user_id="сервис", roles=frozenset(), service=True)
+
+
 def caller(request: Request) -> Principal:
     """Кто спрашивает. Отказ — исключение, а не пустая выдача.
 
     Пустой список вместо отказа читается как «у вас ничего нет» и прячет
     настоящую причину: человеку не выдали роль либо identity лежит.
     """
+    if auth.service_token_matches(auth.bearer(request.headers)):
+        return SERVICE_READER
     return principals.of(request.headers.get("authorization"))
 
 
@@ -390,6 +405,7 @@ def accruals_summary(request: Request, period: str | None = None,
 
 @router.get("/accruals")
 def accruals(request: Request, cabinet_id: str | None = None, period: str | None = None,
+                   event_id: str | None = None,
                    limit: int = 200, cursor_after: str | None = None) -> JSONResponse:
     """Расшифровка начислений с видимой наценкой партнёра (файл 04, «ЛК клиента»).
 
@@ -402,6 +418,7 @@ def accruals(request: Request, cabinet_id: str | None = None, period: str | None
     Итог за период спрашивают у `/accruals/summary` — его считает база.
 
     `cursor_after` — значение `next_cursor` предыдущей страницы.
+    `event_id` — точечный поиск «есть ли начисление на эту операцию».
     """
     page = max(1, min(limit, 1000))
     after = _decode_cursor(cursor_after)
@@ -415,6 +432,11 @@ def accruals(request: Request, cabinet_id: str | None = None, period: str | None
          LEFT JOIN partner p ON p.id = a.partner_id
              WHERE (%(cabinet)s::uuid IS NULL OR a.cabinet_id = %(cabinet)s::uuid)
                AND (%(period)s::text IS NULL OR a.period = %(period)s::text)
+               -- Поиск по событию: полный прогон спрашивает «есть ли
+               -- начисление на эту операцию» и до 12.09.2026 отвечал себе сам,
+               -- читая billing_accrual напрямую — то есть проверял стык, минуя
+               -- стык.
+               AND (%(event)s::uuid IS NULL OR a.event_id = %(event)s::uuid)
                AND (%(visible)s::uuid[] IS NULL OR a.cabinet_id = ANY(%(visible)s::uuid[]))
                AND (%(after_on)s::date IS NULL
                     OR (a.occurred_on, a.created_at, a.id)
@@ -422,7 +444,8 @@ def accruals(request: Request, cabinet_id: str | None = None, period: str | None
              ORDER BY a.occurred_on DESC, a.created_at DESC, a.id DESC
              LIMIT %(limit)s
             """,
-            {"cabinet": cabinet_id, "period": period, "visible": visible,
+            {"cabinet": cabinet_id, "period": period, "event": event_id,
+             "visible": visible,
              "limit": page + 1,
              "after_on": after[0] if after else None,
              "after_at": after[1] if after else None,

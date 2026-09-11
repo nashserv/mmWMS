@@ -40,6 +40,8 @@ export RABBITMQ_URL="${RABBITMQ_URL:-amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PAS
 export WB_SIMULATOR_URL="${WB_SIMULATOR_URL:-http://127.0.0.1:8090}"
 export PRINT_AGENT_STATS_URL="${PRINT_AGENT_STATS_URL:-http://127.0.0.1:8091/}"
 export WORKSTATION_BASE_URL="${WORKSTATION_BASE_URL:-http://127.0.0.1:8081}"
+# Шаг 12 спрашивает начисления по контракту, а не читает чужую базу.
+export BILLING_BASE_URL="${BILLING_BASE_URL:-http://127.0.0.1:8082}"
 
 REPO_SHA="$(git rev-parse HEAD 2>/dev/null || echo неизвестно)"
 DIRTY=""

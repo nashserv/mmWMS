@@ -258,3 +258,95 @@ def test_a_blocking_handler_is_not_declared_async() -> None:
         assert not offenders, (
             f"{name}: обработчики {offenders} объявлены async, но ничего не ждут — "
             f"их синхронные запросы к базе остановят весь процесс")
+
+
+# --- сервисный токен: читает всё, не пишет ничего ---------------------------
+#
+# Полный прогон проверяет «на каждую операцию есть начисление» и до 12.09.2026
+# читал `billing_accrual` напрямую по BILLING_DATABASE_URL — то есть проверял
+# стык, минуя стык. Переименование колонки ломало прогон там, где контракт не
+# менялся; сломанный маршрут прогон не видел вовсе.
+
+SERVICE_SECRET = "development-only-service-token"
+
+
+@pytest.fixture
+def service_client(database: Database, people: dict[str, Principal],
+                   monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("DATABASE_URL", database.url)
+    monkeypatch.setenv("SERVICE_TOKEN", SERVICE_SECRET)
+    from app import api as api_module
+
+    importlib.reload(api_module)
+    api_module.principals = FakeIdentity(people)
+    with TestClient(api_module.app) as handle:
+        yield handle
+
+
+def _an_accrual(database: Database, stand: dict[str, Any]) -> str:
+    """Начисление, которое потом ищут по событию."""
+    event_id = str(uuid.uuid4())
+    with database.transaction() as cursor:
+        cursor.execute(
+            "INSERT INTO billing_accrual "
+            "  (id, event_id, event_type, tenant_id, cabinet_id, seller_external_id, "
+            "   service, quantity, unit_price, markup, amount, partner_amount, occurred_on) "
+            "VALUES (%s, %s, 'wms.packing.completed.v1', 'test', %s, 'seller-1', "
+            "        'packing', 1, 30.00, 15.00, 45.00, 0, CURRENT_DATE)",
+            (str(uuid.uuid4()), event_id, stand["cabinet"]))
+    return event_id
+
+
+def _service() -> dict[str, str]:
+    return {"Authorization": f"Bearer {SERVICE_SECRET}"}
+
+
+def test_a_service_token_finds_the_accrual_of_one_operation(
+        service_client: TestClient, database: Database, stand: dict[str, Any]) -> None:
+    """Точечный вопрос «есть ли начисление на эту операцию».
+
+    Ровно он нужен шагу 12 прогона, и ровно его не было — поэтому прогон и
+    ходил в базу.
+    """
+    event_id = _an_accrual(database, stand)
+
+    answer = service_client.get("/api/billing/v1/accruals",
+                                params={"event_id": event_id}, headers=_service())
+
+    assert answer.status_code == 200, (
+        f"сервисный токен не пустили к начислениям: {answer.text[:200]}")
+    found = answer.json()["accruals"]
+    assert len(found) == 1, f"поиск по event_id вернул {len(found)} строк вместо одной"
+    assert str(found[0]["event_id"]) == event_id
+
+
+def test_a_service_token_sees_cabinets_that_belong_to_nobody_in_particular(
+        service_client: TestClient, database: Database, stand: dict[str, Any]) -> None:
+    """Сервис не человек: он спрашивает про чужие кабинеты по долгу службы.
+
+    Принципал с пустой видимостью отдал бы пустой список — и прогон решил бы,
+    что начисления нет, вместо того чтобы сказать «меня не пустили».
+    """
+    _an_accrual(database, stand)
+
+    answer = service_client.get("/api/billing/v1/accruals", headers=_service())
+
+    assert answer.status_code == 200
+    assert answer.json()["accruals"], (
+        "сервису видно пусто — он отличит это от «начислений нет» только чудом")
+
+
+def test_a_service_token_cannot_write_money(
+        service_client: TestClient, stand: dict[str, Any]) -> None:
+    """Читает — да, пишет — нет.
+
+    Общий секрет лежит в переменных окружения половины стенда. Дать ему право
+    закрывать периоды значит сделать эту переменную ключом от денег.
+    """
+    answer = service_client.post("/api/billing/v1/periods/2026-09/close",
+                                 headers=_service())
+
+    assert answer.status_code in (401, 403), (
+        f"сервисный токен закрыл период — он получил право писать деньги "
+        f"(ответ {answer.status_code})")
