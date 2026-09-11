@@ -356,6 +356,23 @@ class TaskOperations:
                                     row["id"], int(reservation["qty"]), left)
                     repo.release_reservation(cursor, reservation["id"], release_reason)
                     sku_ids.add(reservation["sku_id"])
+                    # Товар вернулся в `good`, и об этом надо сказать: канал
+                    # `wms.stock.released.v1` был в каталоге с первого дня, а
+                    # издавать его было некому — потребитель узнавал об
+                    # освобождённом товаре только из следующего движения.
+                    self._service.emit_for_aggregate(
+                        cursor, aggregate_id=row["id"],
+                        event_type="wms.stock.released.v1",
+                        # Форма — `StockReleasedPayload` каталога событий.
+                        payload={"task_id": str(row["id"]),
+                                 "reservation_id": str(reservation["id"]),
+                                 "owner_id": str(row["owner_id"]),
+                                 "sku_id": str(reservation["sku_id"]),
+                                 "cell_id": _str_or_none(reservation.get("cell_id")),
+                                 "box_id": _str_or_none(reservation.get("box_id")),
+                                 "qty": int(reservation["qty"]),
+                                 "release_reason": release_reason},
+                        correlation_id=f"release-{reservation['id']}")
 
                 if invalidate_label:
                     repo.invalidate_label(cursor, row["id"])

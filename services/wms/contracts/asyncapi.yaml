@@ -621,14 +621,17 @@ operations:
       $ref: '#/components/operationBindings/persistent'
     tags:
       - name: wb-inherited
-  sendWbOrdersProcessed:
-    action: send
-    channel:
-      $ref: '#/channels/wb.orders.processed.v1'
-    bindings:
-      $ref: '#/components/operationBindings/persistent'
-    tags:
-      - name: wb-inherited
+  # `wb.orders.processed.v1` НЕ издаётся сервисом `wms` (решение потока 0,
+  # версия 1.3.0, docs/stream-c-requests.md пункт 3).
+  #
+  # Канал и форма сообщения остаются: имя унаследованное, его знают
+  # потребители боевого контура, и убирать его из каталога значит ломать их
+  # описание. Но операции `send` у него больше нет — её наличие означало бы,
+  # что `wms` это событие издаёт, а он не издаёт его нигде.
+  #
+  # Физический факт, который оно описывало — «заказы обработаны и уехали», —
+  # издаётся как `wb.supply.shipped.v1` и тарифицируется по тому же полю
+  # `orders`. Две строки на один факт — это два счёта клиенту за одну машину.
   sendWbSupplyShipped:
     action: send
     channel:

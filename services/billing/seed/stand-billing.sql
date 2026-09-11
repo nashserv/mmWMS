@@ -171,7 +171,7 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO billing_billable_event (event_type, service, quantity_path, active, comment) VALUES
     ('wb.supply.shipped.v1', 'shipping', 'orders', true, 'Тарифицируется на проде сегодня. orders — заказов в поставке, тарифицируемое количество (приложение E мастера).'),
     ('order.packed.v1', 'packing', NULL, false, 'ВЫКЛЮЧЕНО. Событие боевого контура: его эмитило старое рабочее место, новый wms не эмитит его никогда. Пока оно было единственным включённым источником упаковки, упаковка не тарифицировалась вовсе — самая частая операция склада шла клиенту бесплатно.'),
-    ('wb.orders.processed.v1', 'order_processing', 'orders', true, 'Тарифицируется на проде сегодня. Количество — orders, форма payload зафиксирована в приложении E мастера (версия 1.3). До неё считали единицей, и при пачке заказов клиент был бы недосчитан.'),
+    ('wb.orders.processed.v1', 'order_processing', 'orders', false, 'ВЫКЛЮЧЕНО решением потока 0 (docs/stream-c-requests.md, пункт 3). Событие боевого контура: новый wms его не эмитит, а физический факт, который оно описывало, уже тарифицирует wb.supply.shipped.v1 по тому же полю orders. Включить значит выставить клиенту дважды за одну машину.'),
     ('wms.label.attached.v1', 'labeling', NULL, true, 'Стикеровка сегодня бесплатна (раздел 3.4). Владелец в payload обязателен с версии 1.3 мастера — до неё строки уходили в billing_unbilled с SELLER_UNKNOWN.'),
     ('wms.return.received.v1', 'returns', NULL, true, 'Возвраты сегодня не тарифицируются (раздел 3.4).'),
     ('wms.packing.completed.v1', 'packing', NULL, true, 'Упаковка. То же физическое действие, что order.packed.v1 боевого контура, — и потому включено ВМЕСТЕ с выключением того: два включённых источника одной упаковки означают двойной счёт клиенту. quantity_path пуст: одно событие — одна упаковка.'),
@@ -188,6 +188,15 @@ ON CONFLICT (event_type) DO NOTHING;
 -- невыставляемой. Обе строки меняются ОДНИМ оператором — промежуточного
 -- состояния «включены обе» не бывает даже на миллисекунду, иначе одно
 -- событие упаковки успело бы начислиться дважды.
+-- И то же самое для order_processing: событие боевого контура выключается на
+-- уже заведённых стендах, где сид применён.
+UPDATE billing_billable_event
+   SET active = false,
+       comment = 'ВЫКЛЮЧЕНО решением потока 0 (stream-c-requests, пункт 3): '
+                 || 'новый wms это событие не эмитит, а факт тарифицирует '
+                 || 'wb.supply.shipped.v1 по тому же полю orders.'
+ WHERE event_type = 'wb.orders.processed.v1';
+
 UPDATE billing_billable_event
    SET active = (event_type = 'wms.packing.completed.v1'),
        comment = CASE event_type

@@ -22,7 +22,7 @@ import os
 import pathlib
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 import yaml
@@ -194,7 +194,19 @@ def walk_every_route(walk: Walk) -> None:
     # контрольный скан честно бы его отверг. Ошибка выглядела бы как поломка
     # упаковки, а сломан был бы тест.
     tag = uuid.uuid4().hex[:8]
-    order = iter(range(7101 + (uuid.uuid4().int % 90000) * 10, 10**9))
+    # Номер заказа уникален в схеме (`wms_task.wb_order_id`), и база у тестов
+    # общая. Диапазон «случайное начало плюс единица» пересекался с прошлым
+    # прогоном примерно раз в сотню: `reserve` возвращал ЧУЖОЕ задание с
+    # другим штрихкодом, и обход падал на контрольном скане — сообщением, по
+    # которому причину не найти. Берём номер из uuid: попасть в занятый можно
+    # разве что назло.
+    def _orders() -> Iterator[int]:
+        base = 100_000_000 + uuid.uuid4().int % 700_000_000
+        while True:
+            yield base
+            base += 1
+
+    order = _orders()
 
     if walk.target.mock:
         seller, barcode = "seller-a", "2000000000011"

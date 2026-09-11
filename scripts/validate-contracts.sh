@@ -42,11 +42,24 @@ else
 fi
 
 step "AsyncAPI валиден"
-if command -v npx >/dev/null 2>&1 && npx -y @asyncapi/cli@latest validate "$ASYNCAPI" 2>/dev/null; then
-    echo "  ok: спецификация валидна"
+# Версия CLI закреплена: `@latest` означает, что вчера зелёный контракт
+# сегодня красный по чужой причине — и проверку начинают пропускать.
+ASYNCAPI_CLI="@asyncapi/cli@3.4.0"
+if command -v npx >/dev/null 2>&1; then
+    # stderr НЕ глушится. `2>/dev/null` прятал и настоящую ошибку контракта:
+    # проверка тихо уходила в запасной путь, а тот проверяет втрое меньше,
+    # и «контракт валиден» значило «до него не дошли руки».
+    if npx -y "$ASYNCAPI_CLI" validate "$ASYNCAPI"; then
+        echo "  ok: спецификация валидна ($ASYNCAPI_CLI)"
+    else
+        echo "  ОШИБКА: $ASYNCAPI_CLI отверг спецификацию" >&2
+        failed=1
+    fi
 else
-    # Запасной путь: парсер как библиотека. CLI требует свежий Node и на
-    # сервере стенда может отсутствовать — но проверка пропускаться не должна.
+    # Запасной путь: парсер как библиотека. CLI требует Node, и на сервере
+    # стенда его может не быть — но проверка пропускаться не должна, и о том,
+    # что она урезана, здесь говорится вслух.
+    echo "  ВНИМАНИЕ: npx недоступен, проверка урезана до конверта и схем" >&2
     if python3 -c "import jsonschema" 2>/dev/null; then
         python3 - "$ASYNCAPI" <<'PY' || failed=1
 import sys, yaml
@@ -98,14 +111,33 @@ extra = doc_states - db_states
 assert not extra, f"состояния есть в state-mapping.md, но не в схеме: {sorted(extra)}"
 print(f"  ok: {len(db_states)} состояний задания совпадают в схеме и таблице маппинга")
 
-# Коды ошибок резерва: приложение C требует сохранить все до единого.
+# Коды ошибок резерва: приложение C требует сохранить все до единого, а
+# добавленные потоком 0 обязаны быть в ОБОИХ контрактах — потребитель
+# разбирает их и по openapi, и по asyncapi.
 spec = yaml.safe_load((root / "services/wms/contracts/openapi.yaml").read_text(encoding="utf-8"))
+events = yaml.safe_load((root / "services/wms/contracts/asyncapi.yaml").read_text(encoding="utf-8"))
 text = yaml.safe_dump(spec, allow_unicode=True)
-for code in ("SELLER_MAPPING_MISSING", "PRODUCT_MAPPING_MISSING",
+events_text = yaml.safe_dump(events, allow_unicode=True)
+inherited = ("SELLER_MAPPING_MISSING", "PRODUCT_MAPPING_MISSING",
              "AMBIGUOUS_PRODUCT_MAPPING", "WAREHOUSE_UNKNOWN",
-             "INSUFFICIENT_STOCK", "SERIALIZATION_RETRY"):
-    assert code in text, f"код ошибки {code} потерялся в контракте"
-print("  ok: все шесть кодов ошибок резерва на месте")
+             "INSUFFICIENT_STOCK", "SERIALIZATION_RETRY")
+added = ("OWNER_INACTIVE", "UNPROCESSABLE_ORDER")
+for code in inherited + added:
+    assert code in text, f"код ошибки {code} потерялся в openapi.yaml"
+    assert code in events_text, f"код ошибки {code} потерялся в asyncapi.yaml"
+print(f"  ok: {len(inherited) + len(added)} кодов отказа резерва на месте в обоих контрактах")
+
+# Версии двух файлов совпадают: клиенту важно, с какой версией СЕРВИСА он
+# говорит, а не какой из двух документов кто-то поправил.
+api_version = str((spec.get("info") or {}).get("version") or "")
+events_version = str((events.get("info") or {}).get("version") or "")
+assert api_version == events_version, (
+    f"версии контрактов разошлись: openapi {api_version}, asyncapi {events_version}")
+changelog = (root / "services/wms/contracts/CHANGELOG.md").read_text(encoding="utf-8")
+assert f"## {api_version}" in changelog, (
+    f"версия {api_version} не описана в contracts/CHANGELOG.md: "
+    f"изменение контракта без записи — это правка, о которой узнают в бою")
+print(f"  ok: версия {api_version} одна на оба файла и описана в changelog")
 PY
 
 echo

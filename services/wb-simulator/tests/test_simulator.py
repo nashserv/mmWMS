@@ -85,7 +85,7 @@ def test_statuses_are_answered_by_name(client: TestClient) -> None:
     """
     orders = seed(client, "acc-1", 2)
     answer = client.post("/api/v3/orders/status",
-                         json={"orders": orders + [999_999_999]},
+                         json={"orders": [*orders, 999_999_999]},
                          headers={"X-Stand-Account": "acc-1"})
 
     assert answer.status_code == 200

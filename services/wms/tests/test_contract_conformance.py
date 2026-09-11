@@ -179,3 +179,43 @@ def test_identifiers_are_real_uuids(client: TestClient) -> None:
             uuid.UUID(str(value))  # бросит ValueError, если не uuid
             checked += 1
     assert checked, "в событиях не оказалось ни одного идентификатора"
+
+
+# ------------------------------------------- каталог событий и список эмиссии
+
+def test_the_catalogue_and_the_emission_list_agree() -> None:
+    """Каждое событие, которое `wms` вправе издать, описано в каталоге.
+
+    Список эмиссии — код, каталог — контракт. Они расходятся молча: событие,
+    которого нет в каталоге, потребитель не разберёт, а канал без эмиссии
+    выглядит рабочим и не даёт ничего. Так `wms.stock.released.v1` год лежал
+    в каталоге, и издавать его было некому.
+    """
+    from app.domain import INVENTORY_EVENT_TYPES, WB_EVENT_TYPES, WMS_EVENT_TYPES
+
+    with CONTRACT.open(encoding="utf-8") as handle:
+        document = yaml.safe_load(handle)
+    channels = {str(name) for name in (document.get("channels") or {})}
+    assert channels, "в каталоге нет ни одного канала"
+
+    emitted = WMS_EVENT_TYPES | INVENTORY_EVENT_TYPES | WB_EVENT_TYPES
+    missing = sorted(emitted - channels)
+    assert not missing, (
+        f"wms вправе издать события, которых нет в каталоге: {missing}. "
+        f"Потребитель их не разберёт")
+
+    # Обратное направление — только для каналов, которые `wms` ОБЪЯВЛЯЕТ
+    # издаваемыми (`action: send`). Каталог описывает всё, что ходит по
+    # `mmx.events`: и унаследованные имена боевого контура, и четыре команды,
+    # которые `wms` принимает, а не издаёт.
+    sent: set[str] = set()
+    for operation in (document.get("operations") or {}).values():
+        if operation.get("action") != "send":
+            continue
+        reference = ((operation.get("channel") or {}).get("$ref") or "")
+        if reference.startswith("#/channels/"):
+            sent.add(reference.removeprefix("#/channels/"))
+    orphaned = sorted(sent - emitted)
+    assert not orphaned, (
+        f"каналы wms без эмиссии: {orphaned}. Канал, который никто не издаёт, "
+        f"выглядит рабочим и не даёт ничего")
