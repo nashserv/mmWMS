@@ -122,6 +122,74 @@ def agrees_with_wb(state: str, wb_status: str | None, *, in_supply: bool = False
     return EXPECTED_WB_STATUS.get(state) == wb_status
 
 
+# --------------------------------------------------- таблица переходов
+#
+# Из каких состояний команда вообще имеет смысл. До этой таблицы каждая
+# команда решала сама, и решала по-разному: `scan` молча считал повтором всё,
+# что уже собрано, `pack` пускал из любого состояния вообще, `hand_over`
+# работал по неотгруженной поставке. Разрешённый переход — это свойство
+# автомата, а не отдельной функции, и жить он обязан в одном месте.
+#
+# Что НЕ входит в таблицу: повторный вызов той же команды. Повтор — не
+# переход, а идемпотентность (инвариант 5): он возвращает тот же ответ и
+# проверяется до таблицы.
+ALLOWED_FROM: dict[str, frozenset[str]] = {
+    # Контрольный скан у стойки. Задание либо лежит зарезервированным, либо
+    # уже в руках сборщика.
+    "scan": frozenset({TaskState.RESERVED.value, TaskState.PICKING.value}),
+    # Упаковка — только после подтверждённого скана.
+    "pack": frozenset({TaskState.PICKED.value}),
+    # Печать стикера. Из `packed` переводит в `labeled`; из состояний подбора
+    # печатать можно (стикер лежит локально с момента резерва, инвариант 9), но
+    # состояние она не меняет — печать не подбор.
+    "print": frozenset({TaskState.RESERVED.value, TaskState.PICKING.value,
+                        TaskState.PICKED.value, TaskState.PACKED.value,
+                        TaskState.LABELED.value}),
+    # Отмена возможна всюду, кроме уехавшего товара: там это разбор возврата,
+    # а не отмена (раздел 2.12).
+    "cancel": frozenset({
+        TaskState.NEW.value, TaskState.RESERVED.value, TaskState.PICKING.value,
+        TaskState.PICKED.value, TaskState.PACKED.value, TaskState.LABELED.value,
+        TaskState.IN_SUPPLY.value, TaskState.SHORT.value,
+        TaskState.MANUAL_REVIEW.value, TaskState.DIVERGED.value}),
+    # Вернуть на полку может только тот, кто держит задание в руках.
+    "return_to_shelf": frozenset({TaskState.PICKING.value, TaskState.PICKED.value}),
+    # Подтверждение передачи ставит человек, и только по уехавшей поставке.
+    "hand_over": frozenset({TaskState.SHIPPED.value}),
+    # Приёмку подтверждает сверка, и только у того, что человек уже передал.
+    "reconcile": frozenset({TaskState.HANDED.value}),
+}
+
+# Печать из состояний подбора законна, но состояние не меняет.
+PRINT_ADVANCES_FROM = frozenset({TaskState.PACKED.value})
+
+
+class TransitionRefused(ValueError):
+    """Команда пришла из состояния, в котором она не имеет смысла.
+
+    Отдельный тип, а не голый `ValueError`: маршруты отвечают на него кодом
+    «неверные параметры», и рабочее место показывает текст человеку как есть,
+    не считая это отказом сервиса (этап 3.4 аудита).
+    """
+
+    def __init__(self, command: str, state: str) -> None:
+        self.command, self.state = command, state
+        allowed = ", ".join(sorted(ALLOWED_FROM.get(command, frozenset()))) or "нет"
+        super().__init__(
+            f"команда {command!r} не выполняется из состояния {state!r}: "
+            f"допустимые состояния — {allowed}")
+
+
+def transition_allowed(command: str, state: str) -> bool:
+    """Разрешён ли переход. Незнакомая команда — не разрешена."""
+    return state in ALLOWED_FROM.get(command, frozenset())
+
+
+def check_transition(command: str, state: str) -> None:
+    if not transition_allowed(command, state):
+        raise TransitionRefused(command, state)
+
+
 class ErrorCode(str, Enum):
     """Коды отказа резерва (приложение C).
 

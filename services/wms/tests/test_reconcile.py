@@ -410,3 +410,47 @@ def test_a_task_wildberries_does_not_know_raises_an_alarm(
     assert any("не знает" in record.getMessage() for record in caplog.records), (
         "пропавшее у WB задание не подняло алерта: "
         f"{[record.getMessage() for record in caplog.records]}")
+
+
+def test_acceptance_is_confirmed_only_by_what_wildberries_actually_says(
+        pool: ConnectionPool, live_cabinet: dict) -> None:
+    """`ACCEPTED_BY_WB` встаёт по фактическому `complete`, а не по нашему слову.
+
+    Раньше `reconcile` просто ставил `accepted` всем заданиям поставки — то
+    есть подтверждал приёмку сам себе. Так в боевом контуре 6072 задания
+    оказались в терминальном успехе, ничего не доказав.
+    """
+    from app.service import WmsService
+    from app.shipments import ShipmentOperations
+    from app.tasks import TaskOperations
+
+    order_ids = seed(live_cabinet["account"], 1, live_cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[live_cabinet["account"]]).tick()
+    WbLabelWorker(pool, only_accounts=[live_cabinet["account"]]).tick()
+
+    task_id = rows(pool, "SELECT id FROM wms_task WHERE wb_order_id = %s",
+                   (order_ids[0],))[0]["id"]
+    tasks = TaskOperations(pool, WmsService(pool))
+    tasks.scan(str(task_id), {"barcode": live_cabinet["barcode"]})
+    tasks.pack(str(task_id), {"idempotency_key": unique("pack"),
+                              "control_scan_barcode": live_cabinet["barcode"]})
+
+    supply = rows(pool, "SELECT s.wb_supply_id FROM wb_supply s JOIN wb_account a "
+                        "    ON a.id = s.wb_account_id WHERE a.external_id = %s",
+                  (live_cabinet["account"],))[0]["wb_supply_id"]
+    shipments = ShipmentOperations(pool, WmsService(pool))
+    shipments.handle({"seller_external_id": live_cabinet["seller"],
+                      "idempotency_key": unique("deliver"), "action": "deliver",
+                      "wb_supply_id": supply})
+    shipments.handle({"seller_external_id": live_cabinet["seller"],
+                      "idempotency_key": unique("hand"), "action": "hand_over",
+                      "wb_supply_id": supply, "handed_over_by": "кладовщик Пётр"})
+
+    accepted = shipments.handle({"seller_external_id": live_cabinet["seller"],
+                                 "idempotency_key": unique("recon"), "action": "reconcile",
+                                 "wb_supply_id": supply})
+    assert accepted["state"] == "accepted_by_wb"
+    assert accepted["accepted_at"], "приёмка без времени сверки"
+
+    task = rows(pool, "SELECT state FROM wms_task WHERE id = %s", (task_id,))[0]
+    assert task["state"] == "accepted", f"состояние задания {task['state']}"

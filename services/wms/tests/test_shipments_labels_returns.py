@@ -122,6 +122,67 @@ def test_a_supply_ships_what_was_assembled_not_what_waits_for_a_sticker(
         "несобранное осталось в поставке — WB ждёт его в машине, а его там нет"
 
 
+def balance_by_state(pool: ConnectionPool, seller: str) -> dict[str, int]:
+    """Остаток владельца по состояниям. `stock_balance` — проекция (инвариант 1)."""
+    return {row["state"]: int(row["qty"]) for row in rows(
+        pool, "SELECT b.state, sum(b.qty) AS qty FROM stock_balance b "
+              "  JOIN owner o ON o.id = b.owner_id "
+              " WHERE o.seller_external_id = %s GROUP BY b.state", (seller,))}
+
+
+def test_delivery_writes_the_goods_out_of_the_warehouse(
+        pool: ConnectionPool, client: dict) -> None:
+    """Инвариант 3: товар уехал — журнал обязан это увидеть.
+
+    `deliver` не писал ни одного движения. Задание закрывалось в `shipped`, а
+    резерв оставался `held` навсегда: в остатке вечно висел `reserved` под
+    заказ, который уже уехал, а `available` считался по складу, половины
+    которого физически нет. Состояние `consumed` стояло в схеме с первого дня
+    и не использовалось нигде.
+    """
+    task_ids = reserve(pool, client, 2)
+    for task_id in task_ids:
+        give_label(pool, task_id)
+        pack(pool, client, task_id)
+
+    before = balance_by_state(pool, client["seller"])
+    assert before.get("reserved") == 2, "резерв не встал — отгружать нечего"
+
+    shipments = ShipmentOperations(pool, WmsService(pool))
+    opened = shipments.handle({"seller_external_id": client["seller"],
+                               "idempotency_key": unique("open"), "action": "open"})
+    shipments.handle({"seller_external_id": client["seller"],
+                      "idempotency_key": unique("add"), "action": "add_orders",
+                      "wb_supply_id": opened["wb_supply_id"], "task_ids": task_ids})
+    shipments.handle({"seller_external_id": client["seller"],
+                      "idempotency_key": unique("deliver"), "action": "deliver",
+                      "wb_supply_id": opened["wb_supply_id"]})
+
+    after = balance_by_state(pool, client["seller"])
+    assert after.get("reserved", 0) == 0, (
+        f"после отгрузки в резерве осталось {after.get('reserved')}: "
+        f"товар уехал, а склад про него ещё помнит")
+    assert after.get("good", 0) == before.get("good", 0), \
+        "отгрузка тронула good — уезжать должен зарезервированный товар"
+
+    reservations = rows(pool, "SELECT state FROM reservation WHERE task_id = ANY(%s)",
+                        ([uuid.UUID(task_id) for task_id in task_ids],))
+    assert reservations and all(row["state"] == "consumed" for row in reservations), (
+        f"состояния резервов {[row['state'] for row in reservations]}: "
+        f"израсходованный резерв — не снятый, товар не вернулся на полку")
+
+    moves = rows(pool, "SELECT m.state_from, m.state_to, m.cell_to, m.qty, m.doc_ref "
+                       "  FROM stock_move m JOIN owner o ON o.id = m.owner_id "
+                       " WHERE o.seller_external_id = %s AND m.doc_type = 'shipment'",
+                 (client["seller"],))
+    assert len(moves) == 2, f"движений выхода {len(moves)} при двух уехавших заданиях"
+    for move in moves:
+        assert move["state_from"] == "reserved", "уехал не зарезервированный товар"
+        assert move["state_to"] is None and move["cell_to"] is None, \
+            "у движения выхода есть сторона `to`: товар остался на складе"
+        assert move["doc_ref"] == opened["wb_supply_id"], "движение не привязано к поставке"
+
+
 def test_the_shipped_event_carries_the_billable_count(
         pool: ConnectionPool, client: dict) -> None:
     """Приложение E: `wb.supply.shipped.v1` — тарифицируемое событие."""
@@ -184,11 +245,48 @@ def test_handover_needs_a_human_and_acceptance_needs_reconciliation(
     assert handed["state"] == "handed_to_wb"
     assert handed["handed_by"], "не сохранён тот, кто подтвердил передачу"
 
-    accepted = shipments.handle({"seller_external_id": client["seller"],
-                                 "idempotency_key": unique("recon"), "action": "reconcile",
-                                 "wb_supply_id": opened["wb_supply_id"]})
-    assert accepted["state"] == "accepted_by_wb"
-    assert accepted["accepted_at"], "приёмка без времени сверки"
+    # Приёмку подтверждает Wildberries, а не мы сами себе. Заказов этой
+    # поставки у WB нет — значит `accepted` не встаёт, и это правильный отказ:
+    # в боевом контуре 6072 задания оказались в терминальном успехе именно
+    # потому, что команда ставила его, ничего не спросив.
+    with pytest.raises(ValueError, match="не подтвердил приёмку"):
+        shipments.handle({"seller_external_id": client["seller"],
+                          "idempotency_key": unique("recon"), "action": "reconcile",
+                          "wb_supply_id": opened["wb_supply_id"]})
+
+    still = rows(pool, "SELECT state FROM wms_task WHERE id = %s", (uuid.UUID(task_id),))[0]
+    assert still["state"] == "handed", (
+        f"состояние {still['state']}: неподтверждённая приёмка изменила задание")
+
+
+def test_handover_is_refused_before_the_supply_has_left(
+        pool: ConnectionPool, client: dict) -> None:
+    """Подписать передачу можно только у того, что уехало.
+
+    Раньше `hand_over` работал по открытой поставке: человек подтверждал
+    передачу машины, которую ещё не собрали, и `handed` вставал у заданий,
+    лежащих на полке.
+    """
+    task_id = reserve(pool, client, 1)[0]
+    give_label(pool, task_id)
+    pack(pool, client, task_id)
+    shipments = ShipmentOperations(pool, WmsService(pool))
+    opened = shipments.handle({"seller_external_id": client["seller"],
+                               "idempotency_key": unique("open"), "action": "open"})
+    shipments.handle({"seller_external_id": client["seller"],
+                      "idempotency_key": unique("add"), "action": "add_orders",
+                      "wb_supply_id": opened["wb_supply_id"], "task_ids": [task_id]})
+
+    with pytest.raises(ValueError, match="только после deliver"):
+        shipments.handle({"seller_external_id": client["seller"],
+                          "idempotency_key": unique("early"), "action": "hand_over",
+                          "wb_supply_id": opened["wb_supply_id"],
+                          "handed_over_by": "кладовщик Пётр"})
+
+    task = rows(pool, "SELECT state FROM wms_task WHERE id = %s",
+                (uuid.UUID(task_id),))[0]
+    assert task["state"] == "packed", (
+        f"состояние {task['state']}: задание лежит на полке, а числится переданным")
 
 
 def test_delivering_an_empty_supply_is_refused(pool: ConnectionPool, client: dict) -> None:

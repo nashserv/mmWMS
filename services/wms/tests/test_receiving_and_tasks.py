@@ -185,6 +185,91 @@ def test_inventory_writes_off_and_takes_on_by_movement(
     assert moves and moves[0]["doc_type"] == "inventory"
 
 
+def test_counting_a_cell_with_a_reservation_does_not_invent_a_surplus(
+        pool: ConnectionPool, client: dict) -> None:
+    """Ожидание пересчёта — `good` плюс `reserved`, а не один `good`.
+
+    Зарезервированная вещь физически лежит в той же ячейке: резерв — это
+    пометка «под заказ», а не перемещение. Считающий видит её и называет в
+    факте. Ожидание по одному `good` делало из неё излишек: пересчёт приходовал
+    товар, которого на складе не появлялось, и `available` рос на ровном месте.
+    """
+    receiving = ReceivingOperations(pool)
+    receiving.receive({
+        "seller_external_id": client["seller"], "reference": unique("stock"),
+        "lines": [{"barcode": client["barcode"], "expected_qty": 10, "actual_qty": 10,
+                   "cell_address": client["cell"], "comment": "под пересчёт с резервом"}]})
+
+    wms = WmsService(pool)
+    for _ in range(3):
+        outcome = wms.reserve({
+            "idempotency_key": unique("idem"), "seller_external_id": client["seller"],
+            "wb_account_external_id": client["account"],
+            "wb_order_id": uuid.uuid4().int % 10**12, "sku": client["barcode"],
+            "barcode": client["barcode"], "quantity": 1, "correlation_id": unique("corr")})
+        assert outcome.status == "reserved", outcome.error_code
+
+    good = balance(pool, client["seller"], client["barcode"], "good")
+    reserved = balance(pool, client["seller"], client["barcode"], "reserved")
+    assert (good, reserved) == (7, 3), f"сцена не собрана: good={good}, reserved={reserved}"
+
+    # Считающий видит в ячейке все десять вещей — и свободные, и под заказ.
+    result = receiving.count({
+        "seller_external_id": client["seller"], "reference": unique("count"),
+        "scope": "partial",
+        "lines": [{"barcode": client["barcode"], "cell_address": client["cell"],
+                   "fact_qty": 10}]})
+
+    assert result["moves"] == 0, (
+        f"пересчёт записал {result['moves']} движений там, где ничего не "
+        f"разошлось: резерв посчитан пропажей, а факт — излишком")
+    assert balance(pool, client["seller"], client["barcode"], "good") == good, \
+        "пересчёт придумал товар: good вырос на величину резерва"
+    assert balance(pool, client["seller"], client["barcode"], "reserved") == reserved, \
+        "пересчёт тронул резерв — он принадлежит заказу, а не складу"
+
+    line = rows(pool, "SELECT l.expected_qty, l.fact_qty FROM inventory_count_line l "
+                      "  JOIN inventory_count c ON c.id = l.count_id "
+                      " WHERE c.reference = %s", (result["reference"],))[0]
+    assert int(line["expected_qty"]) == 10, (
+        f"в строке пересчёта ожидание {line['expected_qty']} вместо 10: "
+        f"человек увидит расхождение, которого нет")
+
+
+def test_counting_a_cell_with_a_reservation_still_finds_a_real_shortage(
+        pool: ConnectionPool, client: dict) -> None:
+    """Настоящая недостача под резервом обязана остаться видимой.
+
+    Проверка идёт парой к предыдущей: сложить `reserved` в ожидание легко
+    так, что пересчёт перестанет замечать что-либо вообще.
+    """
+    receiving = ReceivingOperations(pool)
+    receiving.receive({
+        "seller_external_id": client["seller"], "reference": unique("stock"),
+        "lines": [{"barcode": client["barcode"], "expected_qty": 10, "actual_qty": 10,
+                   "cell_address": client["cell"], "comment": "под недостачу"}]})
+    wms = WmsService(pool)
+    outcome = wms.reserve({
+        "idempotency_key": unique("idem"), "seller_external_id": client["seller"],
+        "wb_account_external_id": client["account"],
+        "wb_order_id": uuid.uuid4().int % 10**12, "sku": client["barcode"],
+        "barcode": client["barcode"], "quantity": 1, "correlation_id": unique("corr")})
+    assert outcome.status == "reserved", outcome.error_code
+
+    # В ячейке лежит восемь вместо десяти: двух вещей нет.
+    result = receiving.count({
+        "seller_external_id": client["seller"], "reference": unique("count"),
+        "scope": "partial",
+        "lines": [{"barcode": client["barcode"], "cell_address": client["cell"],
+                   "fact_qty": 8}]})
+
+    assert result["moves"] == 1, "недостача под резервом осталась незамеченной"
+    assert balance(pool, client["seller"], client["barcode"], "good") == 7, \
+        "недостача списана не из good"
+    assert balance(pool, client["seller"], client["barcode"], "reserved") == 1, \
+        "инвентаризация сняла товар из-под заказа"
+
+
 def test_a_box_with_stock_cannot_be_removed(pool: ConnectionPool, client: dict) -> None:
     """Убранная коробка с товаром — это остаток, которого никто не найдёт."""
     receiving = ReceivingOperations(pool)

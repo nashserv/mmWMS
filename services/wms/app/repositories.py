@@ -451,6 +451,20 @@ def reservation_moves(cursor: Cursor, reservation_id: uuid.UUID) -> list[dict[st
     return cursor.fetchall()
 
 
+def consume_reservation(cursor: Cursor, reservation_id: uuid.UUID) -> None:
+    """Резерв израсходован: товар уехал со склада.
+
+    Отличается от `released` по смыслу и потому отдельным состоянием: снятый
+    резерв означает «товар вернулся на полку», израсходованный — «товара
+    больше нет». Состояние `consumed` стояло в схеме с первого дня и не
+    использовалось нигде: отгрузка закрывала задание, а резерв оставался
+    `held` навсегда, и `reserved` в остатке не убывал.
+    """
+    cursor.execute(
+        "UPDATE reservation SET state = 'consumed' WHERE id = %s AND state = 'held'",
+        (reservation_id,))
+
+
 def release_reservation(cursor: Cursor, reservation_id: uuid.UUID, reason: str) -> None:
     cursor.execute(
         "UPDATE reservation SET state = 'released', released_at = now(), release_reason = %s "
@@ -1201,9 +1215,13 @@ def release_expired_claims(cursor: Cursor) -> int:
     на бумаге: очередь его больше не видит, и никто за ним не пойдёт.
     """
     cursor.execute(
+        # Состояние не ограничивается. Лизинг истёк — значит человека нет, и
+        # держать за ним задание незачем в любом состоянии: `picked` и
+        # `packed` за ушедшим сборщиком прежде висели вечно, потому что
+        # условие перечисляло только `reserved` и `picking`. Задание при этом
+        # остаётся в своём состоянии, освобождается только исполнитель.
         "UPDATE wms_task SET assignee = NULL, claimed_at = NULL, claim_expires_at = NULL "
-        " WHERE assignee IS NOT NULL AND claim_expires_at < now() "
-        "   AND state IN ('reserved', 'picking')")
+        " WHERE assignee IS NOT NULL AND claim_expires_at < now()")
     return cursor.rowcount
 
 

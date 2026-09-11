@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 
 from . import rate_limit, repositories as repo
-from .domain import now
+from .domain import TaskState, check_transition, now
 from .postgres import ConnectionPool, single, transaction
 from .secrets import SecretUnavailable
 from .service import WmsService
@@ -174,6 +174,7 @@ class ShipmentOperations:
                     left_behind.append(int(task["wb_order_id"]))
 
                 for task in assembled:
+                    self._consume_reservation(cursor, task, supply)
                     repo.set_task_state(cursor, task["id"], "shipped")
                 repo.close_supply(cursor, supply["id"], state="delivered")
                 repo.set_shipment_state(cursor, shipment["id"], "closed")
@@ -195,6 +196,41 @@ class ShipmentOperations:
             self._release_left_behind(account, supply["wb_supply_id"], left_behind)
             self._deliver_in_wb(account, supply["wb_supply_id"])
         return self._view(shipment, supply, seller, orders=orders)
+
+    def _consume_reservation(self, cursor: Any, task: dict[str, Any],
+                             supply: dict[str, Any]) -> None:
+        """Товар уехал: журнал обязан это увидеть (инвариант 3).
+
+        До этой правки `deliver` не писал ни одного движения. Задание
+        закрывалось в `shipped`, а резерв оставался `held` навсегда: в
+        `stock_balance` вечно висел `reserved` под заказ, который уже уехал, а
+        `available = good − buffer` считался по складу, половина которого
+        физически отсутствовала. Состояние `consumed` стояло в схеме с первого
+        дня и не использовалось нигде.
+
+        Движение пишется со стороной `to` пустой — именно так журнал
+        записывает уход товара со склада (миграция 004). Раскладка берётся из
+        движений резерва: уехало ровно то и оттуда, откуда его сняли.
+        """
+        reservation = repo.held_reservation(cursor, task["id"], for_update=True)
+        if reservation is None:
+            # Резерва нет — снят отменой или собран по клапану «без остатка».
+            # Отгрузка от этого не останавливается, но молчать тут нельзя.
+            log.warning("задание %s уезжает без действующего резерва: "
+                        "движения выхода не записаны", task["id"])
+            return
+        doc_ref = supply["wb_supply_id"] or str(supply["id"])
+        for index, move in enumerate(repo.reservation_moves(cursor, reservation["id"])):
+            repo.insert_move(
+                cursor, owner_id=reservation["owner_id"], sku_id=reservation["sku_id"],
+                qty=int(move["qty"]),
+                cell_from=move["cell_to"], box_from=move["box_to"],
+                state_from="reserved",
+                # Пусто со стороны `to`: товара на складе больше нет.
+                cell_to=None, box_to=None, state_to=None,
+                reason="shipment", doc_type="shipment", doc_ref=doc_ref,
+                idem_key=f"ship:{reservation['id']}:{index}")
+        repo.consume_reservation(cursor, reservation["id"])
 
     def _release_left_behind(self, account: dict[str, Any], wb_supply_id: str,
                              order_ids: list[int]) -> None:
@@ -257,28 +293,92 @@ class ShipmentOperations:
                     # Схема ответа закрыта (additionalProperties: false), лишнего
                     # поля с объяснением в неё не добавить.
                     return self._view(shipment, supply, seller, orders=orders)
+                if shipment["state"] == "handed_to_wb":
+                    result = self._view(shipment, supply, seller, orders=orders)
+                    result["duplicate"] = True
+                    return result
+                # Подписать можно только то, что уехало. Раньше `hand_over`
+                # работал по открытой поставке: человек подтверждал передачу
+                # машины, которую ещё не собрали, и `handed` вставал у заданий,
+                # лежащих на полке.
+                if supply["state"] != "delivered":
+                    raise ValueError(
+                        f"поставка в состоянии {supply['state']!r}: подтвердить "
+                        f"передачу можно только после deliver")
                 repo.hand_over_shipment(cursor, shipment["id"], handed_by)
                 for task in repo.tasks_of_supply(cursor, supply["id"]):
+                    check_transition("hand_over", task["state"])
                     repo.set_task_state(cursor, task["id"], "handed")
                 shipment.update({"state": "handed_to_wb", "handed_by": handed_by,
                                  "handed_at": now()})
         return self._view(shipment, supply, seller, orders=orders)
 
     def _reconcile(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
-        """`ACCEPTED_BY_WB` — только по сверке с WB, а не по нашему статусу."""
+        """`ACCEPTED_BY_WB` — только по фактическому ответу Wildberries.
+
+        Раньше команда просто ставила `accepted` всем заданиям поставки: то
+        есть подтверждала приёмку сама себе. Именно так в боевом контуре 6072
+        задания оказались в терминальном успехе, ничего не доказав.
+
+        Теперь статусы спрашиваются у WB поимённо, и `accepted` встаёт, только
+        если WB отвечает `complete` по КАЖДОМУ заказу. Не отвечает — отказ с
+        перечислением того, что не сошлось; задания остаются в `handed`, а
+        разбор идёт к человеку.
+        """
         with self._pool.connection() as connection:
-            with transaction(connection) as cursor:
+            with single(connection) as cursor:
                 owner, account = self._owner_and_account(cursor, seller)
                 supply = repo.supply_of_account(cursor, account["id"],
                                                 _text(params.get("wb_supply_id")))
+                tasks = repo.tasks_of_supply(cursor, supply["id"])
+
+        # Вызов в WB — вне транзакции (инвариант 2).
+        confirmed = self._accepted_at_wb(account, tasks)
+
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
                 shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
                                                 supply_id=supply["id"])
                 orders = repo.supply_order_count(cursor, supply["id"])
                 repo.accept_shipment(cursor, shipment["id"])
-                for task in repo.tasks_of_supply(cursor, supply["id"]):
+                for task in tasks:
+                    if task["state"] == TaskState.ACCEPTED.value:
+                        continue
+                    check_transition("reconcile", task["state"])
                     repo.set_task_state(cursor, task["id"], "accepted")
                 shipment.update({"state": "accepted_by_wb", "accepted_at": now()})
+        del confirmed
         return self._view(shipment, supply, seller, orders=orders)
+
+    def _accepted_at_wb(self, account: dict[str, Any],
+                        tasks: list[dict[str, Any]]) -> set[int]:
+        """Какие заказы поставки Wildberries действительно считает уехавшими.
+
+        Отсутствие ответа — не согласие. Если спросить не удалось или хотя бы
+        один заказ не `complete`, приёмка не подтверждается: `accepted` —
+        терминальный успех, и ставить его по молчанию нельзя.
+        """
+        order_ids = [int(task["wb_order_id"]) for task in tasks
+                     if task.get("wb_order_id") is not None]
+        if not order_ids:
+            raise ValueError("в поставке нет заданий: подтверждать приёмку нечему")
+        try:
+            with WbClient(account_external_id=account["external_id"],
+                          secret_ref=account["secret_ref"]) as client:
+                statuses = client.orders_status(order_ids)
+        except (WbError, SecretUnavailable) as failure:
+            raise ValueError(
+                f"Wildberries не ответил о статусах поставки ({failure}): "
+                f"приёмка не подтверждается по молчанию") from None
+        unconfirmed = [order_id for order_id in order_ids
+                       if statuses.get(order_id) != "complete"]
+        if unconfirmed:
+            raise ValueError(
+                f"Wildberries не подтвердил приёмку {len(unconfirmed)} заказов "
+                f"(первый — {unconfirmed[0]}, у WB "
+                f"{statuses.get(unconfirmed[0]) or 'нет такого заказа'!r}): "
+                f"ACCEPTED_BY_WB ставится только по фактическому complete")
+        return set(order_ids)
 
     # ------------------------------------------------------------ служебное
 

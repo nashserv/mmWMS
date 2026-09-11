@@ -329,9 +329,20 @@ class ReceivingOperations:
                     box = repo.find_box(cursor, str(line["box_barcode"]).strip()) \
                         if _text(line.get("box_barcode")) else None
 
-                    expected = repo.balance_at(
+                    # Ожидание — `good` ПЛЮС `reserved`: считающий видит на
+                    # полке всё, что там лежит, и зарезервированное под заказ
+                    # в том числе — оно лежит там же, пока его не сняли на
+                    # подбор. Ожидание по одному `good` давало фантомный
+                    # излишек ровно на величину резерва: по ячейке с двумя
+                    # зарезервированными вещами пересчёт «вижу две» писал
+                    # приход двух штук, которых не было.
+                    on_hand = repo.balance_at(
                         cursor, owner_id=owner["id"], sku_id=sku["id"], cell_id=cell["id"],
                         box_id=box["id"] if box else None, state="good")
+                    reserved = repo.balance_at(
+                        cursor, owner_id=owner["id"], sku_id=sku["id"], cell_id=cell["id"],
+                        box_id=box["id"] if box else None, state="reserved")
+                    expected = on_hand + reserved
                     repo.insert_inventory_line(
                         cursor, count_id=count["id"], sku_id=sku["id"], cell_id=cell["id"],
                         box_id=box["id"] if box else None, expected_qty=expected,
@@ -339,6 +350,10 @@ class ReceivingOperations:
                     if fact == expected:
                         continue
 
+                    # Дельта применяется к `good`, а не к `reserved`: резерв
+                    # принадлежит заказу, и инвентаризация его не трогает.
+                    # Разбор недостачи под резервом — отдельная работа
+                    # (`discrepancy`), а не молчаливое снятие чужого товара.
                     delta = fact - expected
                     # Излишек приходуется, недостача списывается — и то и другое
                     # движением, а не правкой числа (инвариант 3).

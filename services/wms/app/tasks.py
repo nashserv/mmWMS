@@ -23,7 +23,7 @@ import uuid
 from typing import Any, Callable
 
 from . import repositories as repo
-from .domain import TaskState, now
+from .domain import TaskState, check_transition, now
 from .postgres import ConnectionPool, single, transaction
 from .service import Emitted, WmsService
 from .metrics import track_lock
@@ -71,7 +71,10 @@ class TaskOperations:
             raise ValueError("assignee обязателен при claim: задание выдаётся человеку")
         limit = max(1, min(int(params.get("limit") or 10), 500))
         lease = max(30, min(int(params.get("lease_seconds") or DEFAULT_LEASE_SECONDS), 3600))
-        states = params.get("states") or [TaskState.RESERVED.value]
+        # Белый список, а не «что прислали». Выдача — это «иди и собери»:
+        # задание уже уехавшее, отменённое или ждущее разбора выдавать
+        # сборщику нельзя, а `states: ["shipped"]` в запросе выдавало.
+        states = _pullable(params.get("states"))
         owners = params.get("owner_external_ids") or None
         extended = params.get("include_extended", True)
 
@@ -132,6 +135,8 @@ class TaskOperations:
                                     TaskState.LABELED.value, TaskState.IN_SUPPLY.value):
                     # Ответ мог потеряться; повтор обязан вернуть то же самое.
                     return _scan_result(row, barcode, "ok", "picked", duplicate=True)
+                # Повтор разобран выше; всё остальное — переход по автомату.
+                check_transition("scan", row["state"])
 
                 if (row["barcode"] or "") != barcode:
                     # Чужой штрихкод — не ошибка системы, а пойманная ошибка
@@ -171,6 +176,7 @@ class TaskOperations:
                 if row["state"] in (TaskState.PACKED.value, TaskState.LABELED.value,
                                     TaskState.IN_SUPPLY.value, TaskState.SHIPPED.value):
                     return _command_result(row, duplicate=True)
+                check_transition("pack", row["state"])
 
                 repo.set_task_state(cursor, row["id"], TaskState.PACKED.value,
                                     package_ref=_text(params.get("box_barcode")))
@@ -186,18 +192,46 @@ class TaskOperations:
     # --------------------------------------------------- возврат и отмена
 
     def return_to_shelf(self, task_id: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Товар вернулся на полку. Причина обязательна.
+        """Сборщик кладёт вещь обратно и отдаёт задание в очередь.
 
-        Возврат на полку без причины — ровно та тихая запись, из-за которой у
-        всех 2645 отмен боевого контура причина пуста (раздел 3).
+        Резерв НЕ снимается. Вещь физически осталась на той же полке, и она
+        по-прежнему нужна этому заказу: снять резерв значит выставить её
+        свободной — задание вернётся в очередь без брони, тот же товар уедет
+        по другому заказу, и заказ, ради которого он лежал, соберут из
+        воздуха. Раньше `return_to_shelf` звал `_unwind`: тот писал движения
+        `reserved → good`, снимал бронь и оставлял задание в `reserved`.
+
+        Причина обязательна: возврат без причины — та самая тихая запись, из-за
+        которой у всех 2645 отмен боевого контура причина пуста (раздел 3).
         """
         reason = _text(params.get("reason"))
         if not reason:
             raise ValueError("reason обязателен: возврат на полку без причины неразбираем")
-        return self._unwind(task_id, reason=reason, state=TaskState.RESERVED.value,
-                            release_reason=f"returned_to_shelf: {reason}",
-                            event="wms.returned.to.shelf.v1",
-                            idempotency=str(params.get("idempotency_key") or ""))
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                row = repo.task_view(cursor, _uuid(task_id), for_update=True)
+                if row is None:
+                    raise ValueError(f"задание {task_id} не найдено")
+                if row["state"] == TaskState.RESERVED.value and row["assignee"] is None:
+                    # Уже вернули: повтор возвращает тот же ответ (инвариант 5).
+                    return _command_result(row, duplicate=True)
+                check_transition("return_to_shelf", row["state"])
+
+                # Факт «взял и положил обратно» остаётся в листе подбора: по
+                # нему видно, что на этой полке сборщик спотыкается.
+                repo.record_scan(cursor, task_id=row["id"], owner_id=row["owner_id"],
+                                 sku_id=row["sku_id"], result="returned")
+                repo.set_task_state(cursor, row["id"], TaskState.RESERVED.value,
+                                    clear_assignee=True)
+                self._service.emit_for_aggregate(
+                    cursor, aggregate_id=row["id"],
+                    event_type="wms.returned.to.shelf.v1",
+                    payload={"task_id": str(row["id"]), "owner_id": str(row["owner_id"]),
+                             "wb_order_id": int(row["wb_order_id"]), "reason": reason},
+                    correlation_id=str(params.get("idempotency_key")
+                                       or f"return-{row['id']}"))
+                row["state"], row["assignee"] = TaskState.RESERVED.value, None
+                return _command_result(row)
 
     def cancel(self, task_id: str, params: dict[str, Any]) -> dict[str, Any]:
         """Отмена задания, в том числе после выдачи стикера (раздел 6.6).
@@ -210,6 +244,13 @@ class TaskOperations:
         if not event_id:
             raise ValueError("cancellation_event_id обязателен: это ключ идемпотентности")
         handed_over = bool(params.get("handed_over"))
+        if handed_over:
+            # Товар уже в машине. Откатывать резерв тут нечего — вещи на
+            # складе нет, — и `_unwind` возвращал в `good` товар, который
+            # физически уехал: остаток рос на отменах. Это вход в разбор
+            # возврата (раздел 2.12), а не отмена.
+            return self._cancel_after_handover(task_id, event_id,
+                                               _text(params.get("reason")))
         # Причина явная, если её дали: «отменено у Wildberries (заказ 12345)»
         # разбирается человеком, а «отменено по событию wb-cancel-12345» —
         # нет. Пустую причину схема не пропустит (инвариант 11), поэтому
@@ -221,6 +262,40 @@ class TaskOperations:
                             release_reason=f"cancelled: {event_id}",
                             event="wms.order.cancelled.v1", idempotency=event_id,
                             invalidate_label=True, release_supply=True)
+
+    def _cancel_after_handover(self, task_id: str, event_id: str,
+                               reason: str | None) -> dict[str, Any]:
+        """Отмена после передачи в доставку: заводится ожидаемый возврат.
+
+        Задание остаётся в своём состоянии (`shipped`/`handed`/`accepted`) —
+        это факт, он был. Появляется `wms_return` в состоянии `expected`: вещь
+        поедет обратно, и когда она приедет, её примут и решат, годна ли она
+        (`/returns/{id}/receive`, `/returns/{id}/decision`). Только это
+        решение вернёт товар в остаток.
+        """
+        explanation = reason or "отменено после передачи в доставку — разбор возврата"
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                row = repo.task_view(cursor, _uuid(task_id), for_update=True)
+                if row is None:
+                    raise ValueError(f"задание {task_id} не найдено")
+                returned, created = repo.upsert_return(
+                    cursor, return_event_id=f"cancel:{event_id}",
+                    owner_id=row["owner_id"], task_id=row["id"], reason=explanation)
+                if created:
+                    self._service.emit_for_aggregate(
+                        cursor, aggregate_id=returned["id"],
+                        event_type="wms.return.expected.v1",
+                        payload={"return_id": str(returned["id"]),
+                                 "task_id": str(row["id"]),
+                                 "owner_id": str(row["owner_id"]),
+                                 "reason": explanation},
+                        correlation_id=f"cancel:{event_id}")
+                row["cancel_reason"] = explanation
+                result = _cancel_result(row, duplicate=not created)
+        log.info("задание %s отменено после передачи: заведён ожидаемый возврат %s",
+                 task_id, returned["id"])
+        return result
 
     def _unwind(self, task_id: str, *, reason: str, state: str, release_reason: str,
                 event: str, idempotency: str, invalidate_label: bool = False,
@@ -237,6 +312,8 @@ class TaskOperations:
                     raise ValueError(f"задание {task_id} не найдено")
                 if row["state"] == state and state == TaskState.CANCELLED.value:
                     return _cancel_result(row, duplicate=True)
+                if state == TaskState.CANCELLED.value:
+                    check_transition("cancel", row["state"])
 
                 owner_id = row["owner_id"]
                 reservation = repo.held_reservation(cursor, row["id"], for_update=True)
@@ -288,6 +365,23 @@ class TaskOperations:
             except Exception:
                 log.warning("остаток вернулся на полку, но не опубликован")
         return result
+
+
+# Из каких состояний задание вообще можно выдать сборщику.
+PULLABLE_STATES = frozenset({TaskState.RESERVED.value, TaskState.PICKING.value})
+
+
+def _pullable(requested: Any) -> list[str]:
+    """Отсекает состояния, из которых выдавать задание нельзя."""
+    if not requested:
+        return [TaskState.RESERVED.value]
+    asked = [str(value).strip() for value in requested if str(value).strip()]
+    allowed = [value for value in asked if value in PULLABLE_STATES]
+    if not allowed:
+        raise ValueError(
+            f"состояния {sorted(set(asked))} не выдаются сборщику: "
+            f"выдать можно только {sorted(PULLABLE_STATES)}")
+    return allowed
 
 
 # ------------------------------------------------------------- проекции
