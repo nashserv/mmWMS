@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from ..metrics import WORKER_PROCESSED
+from ..metrics import WORKER_PROCESSED, WORKER_TICKS
 
 log = logging.getLogger("wms.worker")
 
@@ -69,6 +69,10 @@ class Worker:
             try:
                 processed = tick()
             except Exception:
+                # Упавший такт — тоже такт: воркер крутится, просто неудачно.
+                # Иначе сломанный воркер выглядел бы остановленным, и алерт
+                # сказал бы не то, что случилось.
+                WORKER_TICKS.labels(worker=self.name).inc()
                 log.exception("воркер %s: цикл упал", self.name)
                 # Растущая пауза после падения: если упала база, долбить её
                 # в полную силу — значит мешать ей подняться.
@@ -78,6 +82,9 @@ class Worker:
 
             backoff = self._idle
             elapsed = time.monotonic() - started
+            # Такт считается всегда: пульс отличает «нечего делать» от
+            # «не крутится», а алерт инварианта 14 смотрит именно на пульс.
+            WORKER_TICKS.labels(worker=self.name).inc()
             WORKER_PROCESSED.labels(worker=self.name).inc(max(0, processed))
             if processed:
                 log.info("воркер %s: обработано %d за %.0f мс",

@@ -10,18 +10,44 @@ groups:
   - name: wms-workers
     rules:
       # Инвариант 14: молчащий воркер считается сломанным.
+      #
+      # Смотрим на ПУЛЬС, а не на работу. Правило на
+      # `worker_processed_total == 0` срабатывало бы каждую тихую ночь: воркер
+      # жив, очередь пуста, обработано ноль — и дежурный приходит к исправному
+      # складу. Пара таких вызовов, и уведомления выключают, после чего молчит
+      # уже всё.
+      #
+      # Ноль тактов значит ровно одно: воркер не крутится. Две минуты — с
+      # запасом: самый медленный такт (сверка) ходит раз в минуту.
       - alert: WorkerSilent
         expr: |
-          sum by (worker) (increase(mmx_wms_worker_processed_total[15m])) == 0
-        for: 15m
+          sum by (worker) (increase(mmx_wms_worker_ticks_total[2m])) == 0
+        for: 2m
         labels: {severity: critical}
         annotations:
-          summary: "Воркер {{ $labels.worker }} не обработал ничего за 15 минут"
+          summary: "Воркер {{ $labels.worker }} не сделал ни одного такта за две минуты"
           description: >-
-            Ноль обработанных единиц. В боевом контуре так молчали
+            Воркер не крутится. В боевом контуре так молчали
             gateway-sync-worker, gateway-command-worker, catalog-stock-worker и
             workstation-inbox-consumer — при этом healthcheck был зелёный.
             Проверять работу, а не порт.
+
+      # Воркер крутится, но ничего не делает НЕОБЫЧНО долго.
+      #
+      # Отдельно от пульса и мягче: ночью это норма, а вот опросчик, не
+      # заведший ни одного задания за смену, — уже вопрос. Предупреждение, не
+      # вызов дежурного.
+      - alert: WorkerIdleTooLong
+        expr: |
+          sum by (worker) (increase(mmx_wms_worker_processed_total[6h])) == 0
+          and on (worker) sum by (worker) (increase(mmx_wms_worker_ticks_total[10m])) > 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Воркер {{ $labels.worker }} крутится, но за шесть часов не сделал ничего"
+          description: >-
+            Пульс есть, работы нет. Ночью это норма; днём значит, что до
+            воркера не доходит то, что он обязан обрабатывать.
 
   - name: wms-invariants
     rules:
