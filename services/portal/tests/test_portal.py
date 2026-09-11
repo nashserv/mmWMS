@@ -89,7 +89,7 @@ def parts(database: Database, monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[
         cursor.execute("TRUNCATE portal_export RESTART IDENTITY")
     with TestClient(api_module.app) as client:
         yield {"client": client, "wms": api_module.wms, "billing": api_module.billing,
-               "module": api_module}
+               "identity": api_module.identity, "module": api_module}
 
 
 def test_the_stock_comes_from_the_warehouse_every_time(parts: dict[str, Any]) -> None:
@@ -217,3 +217,63 @@ def test_the_screen_is_served(parts: dict[str, Any]) -> None:
     page = parts["client"].get("/")
     assert page.status_code == 200
     assert "личный кабинет" in page.text
+
+
+def test_a_client_with_two_cabinets_can_choose_the_second(parts: dict[str, Any]) -> None:
+    """Кабинет называется явно — но только свой.
+
+    Без `?seller=` показывался всегда первый, и второй был недоступен вовсе:
+    не «скрыт», а просто не существовал для ЛК.
+    """
+    parts["identity"].principal = {
+        "active": True, "user_id": "u-owner", "roles": ["owner"],
+        "sellers": ["stand-seller-001", "stand-seller-002"]}
+
+    first = parts["client"].get("/api/portal/v1/accruals",
+                                params={"period": "2026-09"}).json()
+    second = parts["client"].get("/api/portal/v1/accruals",
+                                 params={"period": "2026-09",
+                                         "seller": "stand-seller-002"}).json()
+
+    asked = [params for path, params in parts["billing"].asked
+             if path.endswith("/accruals/summary")]
+    assert asked[0]["seller"] == "stand-seller-001"
+    assert asked[-1]["seller"] == "stand-seller-002", (
+        f"второй кабинет не запрошен: {asked}")
+    assert first and second
+
+
+def test_someone_elses_cabinet_does_not_exist_for_the_client(
+        parts: dict[str, Any]) -> None:
+    """Чужой кабинет — «нет такого», а не «нет доступа».
+
+    Существование чужого кабинета тоже сведение: по отказу «нет доступа»
+    видно, что такой клиент у нас есть.
+    """
+    response = parts["client"].get("/api/portal/v1/accruals",
+                                   params={"period": "2026-09",
+                                           "seller": "чужой-кабинет"})
+
+    assert response.status_code in (403, 404, 409), response.text
+    body = response.json()
+    assert "нет" in str(body).lower()
+    assert "доступ" not in str(body).lower(), (
+        "отказ выдаёт, что такой кабинет существует")
+
+
+def test_the_portal_is_closed_without_a_token(parts: dict[str, Any]) -> None:
+    """Без токена ЛК не показывает ничего.
+
+    В нём остаток клиента, его начисления и акт — то есть сколько он платит и
+    какая у него наценка. Открытый маршрут здесь означает, что это видит
+    любой, кто знает адрес.
+    """
+    parts["identity"].principal = {"active": False, "reason": "токен не предъявлен"}
+
+    for path in ("/api/portal/v1/me", "/api/portal/v1/stock",
+                 "/api/portal/v1/accruals", "/api/portal/v1/exports"):
+        response = parts["client"].get(path, params={"period": "2026-09"})
+        assert response.status_code >= 400, (
+            f"{path} ответил {response.status_code} без действующего токена")
+        assert "stand-seller" not in response.text, (
+            f"{path} выдал кабинет клиента в отказе")

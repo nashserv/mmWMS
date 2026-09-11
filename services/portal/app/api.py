@@ -78,12 +78,16 @@ def token_of(request: Request) -> str | None:
     return request.headers.get("authorization")
 
 
-def client_of(request: Request) -> dict[str, Any]:
+def client_of(request: Request, seller: str | None = None) -> dict[str, Any]:
     """Клиент за токеном и его кабинет.
 
-    Кабинет берётся из области роли (`seller` в identity), а не из параметра
-    запроса: иначе достаточно подставить чужой ключ продавца, чтобы увидеть
-    чужой остаток.
+    Список кабинетов берётся из области роли (`seller` в identity), а не из
+    параметра запроса: иначе достаточно подставить чужой ключ продавца, чтобы
+    увидеть чужой остаток.
+
+    Кабинет МОЖНО назвать явно (`?seller=`) — но только свой. У клиента с
+    двумя кабинетами без этого показывался всегда первый, и второй был
+    недоступен вовсе: не «скрыт», а просто не существовал для ЛК.
     """
     principal = identity.whoami(token_of(request))
     if not principal.get("active"):
@@ -93,7 +97,12 @@ def client_of(request: Request) -> dict[str, Any]:
         raise NoCabinet(
             "у пользователя нет кабинета: роль владельца или менеджера выдаётся "
             "с областью seller, иначе показывать нечего")
-    return {"user_id": principal.get("user_id"), "seller": sellers[0], "sellers": sellers,
+    chosen = (seller or "").strip() or sellers[0]
+    if chosen not in sellers:
+        # Не «нет доступа», а «нет такого кабинета»: существование чужого
+        # кабинета — тоже сведение.
+        raise NoCabinet(f"кабинета {chosen!r} у вас нет")
+    return {"user_id": principal.get("user_id"), "seller": chosen, "sellers": sellers,
             "roles": principal.get("roles") or []}
 
 
@@ -140,13 +149,14 @@ def stock(request: Request, barcode: str | None = None) -> JSONResponse:
 # --------------------------------------------------------------- начисления
 
 @router.get("/accruals")
-def accruals(request: Request, period: str | None = None) -> JSONResponse:
+def accruals(request: Request, period: str | None = None,
+             seller: str | None = None) -> JSONResponse:
     """Расшифровка с видимой наценкой партнёра.
 
     Итог без разбивки читается как «MM-Express берёт 45». Разбивка объясняет,
     что 30 — наши, 15 — того, кто привёл клиента.
     """
-    client = client_of(request)
+    client = client_of(request, seller)
     month = period or today().strftime("%Y-%m")
     status, body = billing.get("/api/billing/v1/accruals", token_of(request),
                                {"period": month, "limit": 1000,
@@ -175,9 +185,10 @@ def accruals(request: Request, period: str | None = None) -> JSONResponse:
 
 
 @router.get("/accruals.csv")
-def accruals_csv(request: Request, period: str | None = None) -> Response:
+def accruals_csv(request: Request, period: str | None = None,
+                 seller: str | None = None) -> Response:
     """Акт за период. Клиент выгружает сам, без участия бухгалтера (файл 04)."""
-    client = client_of(request)
+    client = client_of(request, seller)
     month = period or today().strftime("%Y-%m")
     status, body = billing.get("/api/billing/v1/accruals", token_of(request),
                                {"period": month, "limit": 1000})

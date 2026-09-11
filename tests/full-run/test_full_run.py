@@ -20,6 +20,7 @@ import os
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -1108,3 +1109,70 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
     log_line = (f"резерв p99 {reserve_p99:.0f} мс (метрика сервиса), "
                 f"самая долгая транзакция маршрутов за окно {slowest:.0f} мс")
     print(f"\n{log_line}")
+
+
+# ==================================== мёртвые письма (этап 5.2 аудита)
+
+@pytest.mark.stream_c
+def test_a_rejected_message_lands_in_dead_letters_not_in_nowhere(
+        bus: Any) -> None:
+    """Отвергнутое сообщение обязано найтись в `stand.dead-letters`.
+
+    На проде очередь мёртвых писем пуста при регулярных потерях заданий
+    (раздел 3.5). Пустая она была не потому, что потерь нет: аргумент
+    `x-dead-letter-exchange` задаётся при СОЗДАНИИ очереди, потребитель,
+    объявивший её без него, терял отвергнутое молча — и «dead_letters пуст»
+    значило «терялось в никуда».
+
+    Политика `dead-letters` действует на очередь снаружи и не зависит от
+    того, кто её объявил. Проверяется это единственным способом: отвергнуть
+    сообщение и посмотреть, где оно.
+    """
+    bus.require_connected()
+    pika = pytest.importorskip("pika", reason="нужен pika для проверки мёртвых писем")
+
+    url = env("RABBITMQ_URL")
+    probe = f"stand.dlq-probe-{uuid.uuid4().hex[:8]}"
+    marker = uuid.uuid4().hex
+
+    connection = pika.BlockingConnection(pika.URLParameters(url))
+    try:
+        channel = connection.channel()
+        # Очередь объявляется БЕЗ аргумента dead-letter — именно так её
+        # объявил бы потребитель, который о нём забыл.
+        channel.queue_declare(queue=probe, durable=True, auto_delete=False)
+        channel.basic_publish(exchange="", routing_key=probe, body=marker.encode("utf-8"))
+
+        got = None
+        for _ in range(50):
+            method, _properties, body = channel.basic_get(queue=probe, auto_ack=False)
+            if method is not None:
+                got = (method, body)
+                break
+            time.sleep(0.1)
+        assert got is not None, "сообщение не доехало до собственной очереди"
+        method, body = got
+        assert body.decode("utf-8") == marker
+        # Отвергаем без возврата в очередь: именно это делает консьюмер с
+        # событием, которое не смог разобрать.
+        channel.basic_nack(method.delivery_tag, requeue=False)
+
+        found = None
+        for _ in range(50):
+            dead_method, _dead_props, dead_body = channel.basic_get(
+                queue="stand.dead-letters", auto_ack=True)
+            if dead_method is None:
+                time.sleep(0.1)
+                continue
+            if dead_body.decode("utf-8", "replace") == marker:
+                found = dead_body
+                break
+        assert found is not None, (
+            "отвергнутое сообщение не нашлось в stand.dead-letters: политика "
+            "dead-letter-exchange не действует, и потери уходят в никуда")
+    finally:
+        try:
+            channel.queue_delete(queue=probe)
+        except Exception:  # noqa: BLE001 — уборка не важнее проверки
+            pass
+        connection.close()
