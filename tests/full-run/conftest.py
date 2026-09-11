@@ -235,7 +235,49 @@ def _purge_run_data(db: Db, when: str) -> None:
     except Exception as failure:  # noqa: BLE001 — уборка не имеет права ронять прогон
         print(f"\nуборка {when}: не удалось убрать данные прогона ({failure})")
         return
+    _purge_billing(sellers, when)
     print(f"\nуборка {when}: данные прогона удалены")
+
+
+def _purge_billing(sellers: list[str], when: str) -> None:
+    """Убрать следы прогона в биллинге.
+
+    Нагрузочный шаг заводит сто шестьдесят заданий клиента, которого в
+    биллинге нет, — и каждое оставляет строку «не дошло до счёта» с причиной
+    `SELLER_UNKNOWN`. Строки настоящие, но говорят они о клиенте прогона, а
+    не о невыставленном счёте: алерт `UnbilledGrowing` после каждого ночного
+    прогона поднимал бы дежурного к синтетике. Пара таких вызовов, и
+    уведомления выключают — после чего молчит и настоящая неоплаченная
+    работа.
+    """
+    dsn = os.getenv("BILLING_DATABASE_URL")
+    if not dsn:
+        return
+    billing = Db(dsn)
+    try:
+        # Клиенты прогона и всё, что от них осталось. `billing_accrual`
+        # трогаем тоже: это деньги, но деньги синтетического клиента, и
+        # следующий прогон посчитает их заново.
+        billing.execute(
+            "DELETE FROM billing_unbilled "
+            " WHERE COALESCE(payload->>'seller_id', payload->>'seller_external_id') "
+            "       = ANY(%s)", (sellers,))
+        billing.execute(
+            "DELETE FROM billing_commission WHERE accrual_id IN ("
+            "  SELECT a.id FROM billing_accrual a "
+            "   WHERE a.seller_external_id = ANY(%s))", (sellers,))
+        billing.execute(
+            "DELETE FROM billing_accrual WHERE seller_external_id = ANY(%s)", (sellers,))
+        billing.execute(
+            "DELETE FROM billing_inbox WHERE payload->>'seller_id' = ANY(%s)", (sellers,))
+        billing.execute(
+            "DELETE FROM cabinet WHERE seller_external_id = ANY(%s) "
+            "  AND NOT EXISTS (SELECT 1 FROM billing_accrual a "
+            "                   WHERE a.cabinet_id = cabinet.id)", (sellers,))
+    except Exception as failure:  # noqa: BLE001
+        print(f"\nуборка {when}: биллинг не убран ({failure})")
+    finally:
+        billing.close()
 
 
 def _reset_simulator(when: str) -> None:
