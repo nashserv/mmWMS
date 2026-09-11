@@ -110,12 +110,12 @@ def record_export(actor_id: str, seller: str, kind: str, period: str | None,
 # ------------------------------------------------------------------- остаток
 
 @router.get("/me")
-async def me(request: Request) -> JSONResponse:
+def me(request: Request) -> JSONResponse:
     return ok(client_of(request))
 
 
 @router.get("/stock")
-async def stock(request: Request, barcode: str | None = None) -> JSONResponse:
+def stock(request: Request, barcode: str | None = None) -> JSONResponse:
     """Остаток по товарам, коробкам и ячейкам — из склада.
 
     Одно число, потому что источник один. Никакого зеркала кабинета WB здесь
@@ -140,7 +140,7 @@ async def stock(request: Request, barcode: str | None = None) -> JSONResponse:
 # --------------------------------------------------------------- начисления
 
 @router.get("/accruals")
-async def accruals(request: Request, period: str | None = None) -> JSONResponse:
+def accruals(request: Request, period: str | None = None) -> JSONResponse:
     """Расшифровка с видимой наценкой партнёра.
 
     Итог без разбивки читается как «MM-Express берёт 45». Разбивка объясняет,
@@ -175,7 +175,7 @@ async def accruals(request: Request, period: str | None = None) -> JSONResponse:
 
 
 @router.get("/accruals.csv")
-async def accruals_csv(request: Request, period: str | None = None) -> Response:
+def accruals_csv(request: Request, period: str | None = None) -> Response:
     """Акт за период. Клиент выгружает сам, без участия бухгалтера (файл 04)."""
     client = client_of(request)
     month = period or today().strftime("%Y-%m")
@@ -212,7 +212,7 @@ async def accruals_csv(request: Request, period: str | None = None) -> Response:
 
 
 @router.get("/exports")
-async def exports(request: Request) -> JSONResponse:
+def exports(request: Request) -> JSONResponse:
     client = client_of(request)
     with database.cursor() as cursor:
         cursor.execute(

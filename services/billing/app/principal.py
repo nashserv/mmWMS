@@ -15,6 +15,9 @@ import os
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+import threading
+import time
+
 import httpx
 
 from .config import LOCAL_ENVIRONMENTS, app_environment
@@ -79,6 +82,10 @@ class Principals:
         if not token:
             raise Unauthorized("нужен заголовок Authorization: Bearer <токен>")
 
+        cached = _introspection_cache.get(token)
+        if cached is not None:
+            return cached
+
         try:
             response = httpx.post(f"{self.base_url}/api/identity/v1/introspect",
                                   json={"token": token}, timeout=self._timeout)
@@ -88,12 +95,62 @@ class Principals:
         if response.status_code >= 400 or not body.get("active"):
             raise Unauthorized(str(body.get("reason") or "identity не признал токен"))
 
-        return Principal(
+        principal = Principal(
             user_id=str(body.get("user_id") or ""),
             roles=frozenset(body.get("roles") or ()),
             partner_branches=tuple(body.get("partner_branches") or ()),
             sellers=tuple(body.get("sellers") or ()),
         )
+        _introspection_cache.put(token, principal)
+        return principal
+
+
+class _IntrospectionCache:
+    """Ответ identity на тридцать секунд.
+
+    Экран админки и ЛК опрашивают по несколько маршрутов подряд, и каждый
+    ходил в identity: на одно открытие страницы — десяток вызовов туда и
+    обратно, каждый со своим круговым временем. Тридцать секунд — меньше
+    любого разумного срока отзыва прав и больше любой серии запросов одной
+    страницы.
+
+    Ключ — сам токен, и хранится он только в памяти процесса (инвариант 15:
+    ни в лог, ни в базу).
+    """
+
+    TTL_SECONDS = 30.0
+    LIMIT = 512
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[float, Principal]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, token: str) -> Principal | None:
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(token)
+            if entry is None:
+                return None
+            expires_at, principal = entry
+            if expires_at <= now:
+                self._entries.pop(token, None)
+                return None
+            return principal
+
+    def put(self, token: str, principal: Principal) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if len(self._entries) >= self.LIMIT:
+                # Чистим просроченное, а не выбираем «наименее нужное»: кэш
+                # живёт тридцать секунд, и просроченного в нём всегда больше.
+                self._entries = {key: value for key, value in self._entries.items()
+                                 if value[0] > now}
+                if len(self._entries) >= self.LIMIT:
+                    self._entries.clear()
+            self._entries[token] = (now + self.TTL_SECONDS, principal)
+
+
+_introspection_cache = _IntrospectionCache()
 
 
 def visible_partner_ids(cursor: Any, principal: Principal) -> list[str] | None:

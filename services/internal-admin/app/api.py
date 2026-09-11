@@ -122,12 +122,12 @@ def write_through(request: Request, action: str, subject: str | None, path: str,
 # ------------------------------------------------------------------- экраны
 
 @router.get("/whoami")
-async def whoami(request: Request) -> JSONResponse:
+def whoami(request: Request) -> JSONResponse:
     return ok(who(request))
 
 
 @router.get("/overview")
-async def overview(request: Request, period: str | None = None) -> JSONResponse:
+def overview(request: Request, period: str | None = None) -> JSONResponse:
     """Первый экран: что требует внимания сегодня.
 
     Три числа, которых сегодня нет ни у кого: сколько кабинетов заведено мимо
@@ -153,20 +153,20 @@ async def overview(request: Request, period: str | None = None) -> JSONResponse:
 
 
 @router.get("/partners")
-async def partners(request: Request) -> JSONResponse:
+def partners(request: Request) -> JSONResponse:
     status, body = billing.get("/api/billing/v1/partners", token_of(request))
     return ok(body, status)
 
 
 @router.get("/partners/{partner_id}/cabinets")
-async def partner_cabinets(partner_id: str, request: Request) -> JSONResponse:
+def partner_cabinets(partner_id: str, request: Request) -> JSONResponse:
     status, body = billing.get(f"/api/billing/v1/partners/{partner_id}/cabinets",
                                token_of(request))
     return ok(body, status)
 
 
 @router.get("/partners/{partner_id}/commission")
-async def commission(partner_id: str, period: str, request: Request) -> JSONResponse:
+def commission(partner_id: str, period: str, request: Request) -> JSONResponse:
     status, body = billing.get(f"/api/billing/v1/partners/{partner_id}/commission",
                                token_of(request), {"period": period})
     return ok(body, status)
@@ -187,7 +187,7 @@ async def set_markup(partner_id: str, request: Request) -> JSONResponse:
 
 
 @router.get("/cabinets")
-async def cabinets(request: Request, needs_onboarding: bool = False) -> JSONResponse:
+def cabinets(request: Request, needs_onboarding: bool = False) -> JSONResponse:
     status, body = billing.get("/api/billing/v1/cabinets", token_of(request),
                                {"needs_onboarding": needs_onboarding})
     return ok(body, status)
@@ -214,7 +214,7 @@ async def onboard(request: Request) -> JSONResponse:
 
 
 @router.get("/tariffs")
-async def tariffs(request: Request) -> JSONResponse:
+def tariffs(request: Request) -> JSONResponse:
     status, body = billing.get("/api/billing/v1/tariffs", token_of(request))
     return ok(body, status)
 
@@ -247,7 +247,7 @@ async def approve(version_id: str, request: Request) -> JSONResponse:
 
 
 @router.get("/accruals")
-async def accruals(request: Request, cabinet_id: str | None = None,
+def accruals(request: Request, cabinet_id: str | None = None,
                    period: str | None = None,
                    cursor_after: str | None = None) -> JSONResponse:
     """Начисления страницей — и итог периода рядом.
@@ -275,20 +275,20 @@ async def accruals(request: Request, cabinet_id: str | None = None,
 
 
 @router.get("/reports/unbilled")
-async def unbilled(request: Request) -> JSONResponse:
+def unbilled(request: Request) -> JSONResponse:
     status, body = billing.get("/api/billing/v1/reports/unbilled", token_of(request))
     return ok(body, status)
 
 
 @router.get("/reports/margin")
-async def margin(request: Request, period: str) -> JSONResponse:
+def margin(request: Request, period: str) -> JSONResponse:
     status, body = billing.get("/api/billing/v1/reports/margin", token_of(request),
                                {"period": period})
     return ok(body, status)
 
 
 @router.get("/reports/shift")
-async def shift(request: Request, day: str | None = None) -> JSONResponse:
+def shift(request: Request, day: str | None = None) -> JSONResponse:
     """Витрина начальника склада: кто сколько сделал за смену."""
     status, body = billing.get("/api/billing/v1/reports/shift", token_of(request),
                                {"day": day} if day else None)
@@ -308,7 +308,7 @@ async def close_period(period: str, request: Request) -> JSONResponse:
 
 
 @router.post("/periods/{period}/allocate")
-async def allocate(period: str, request: Request) -> JSONResponse:
+def allocate(period: str, request: Request) -> JSONResponse:
     return write_through(request, "расходы разнесены", period,
                          f"/api/billing/v1/periods/{period}/allocate", {})
 
@@ -328,14 +328,14 @@ async def invoice(request: Request) -> JSONResponse:
 
 
 @router.post("/invoices/{invoice_id}/pay")
-async def pay(invoice_id: str, request: Request) -> JSONResponse:
+def pay(invoice_id: str, request: Request) -> JSONResponse:
     """Отметка об оплате. С неё начинается вознаграждение партнёра, не раньше."""
     return write_through(request, "счёт оплачен", invoice_id,
                          f"/api/billing/v1/invoices/{invoice_id}/pay", {})
 
 
 @router.get("/roles")
-async def roles() -> JSONResponse:
+def roles() -> JSONResponse:
     return ok({"roles": identity.roles()})
 
 
@@ -356,7 +356,7 @@ async def grant(request: Request) -> JSONResponse:
 
 
 @router.get("/audit")
-async def audit_log(limit: int = 100) -> JSONResponse:
+def audit_log(limit: int = 100) -> JSONResponse:
     """Кто, когда и что сделал. Половина правила «ни одного ручного SQL»."""
     return ok(audit.recent(limit))
 

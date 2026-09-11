@@ -149,7 +149,7 @@ async def body_of(request: Request) -> dict[str, Any]:
 
 
 @router.get("/roles")
-async def roles() -> JSONResponse:
+def roles() -> JSONResponse:
     return ok({"roles": directory.roles()})
 
 
@@ -179,7 +179,7 @@ async def grant(request: Request) -> JSONResponse:
 
 
 @router.post("/grants/{grant_id}/revoke")
-async def revoke(grant_id: str, request: Request) -> JSONResponse:
+def revoke(grant_id: str, request: Request) -> JSONResponse:
     who, refusal = require_admin(request)
     if refusal is not None:
         return refusal
@@ -194,7 +194,7 @@ async def revoke(grant_id: str, request: Request) -> JSONResponse:
 
 
 @router.get("/users/{user_id}/roles")
-async def user_roles(user_id: str, request: Request) -> JSONResponse:
+def user_roles(user_id: str, request: Request) -> JSONResponse:
     """Чьи роли смотрим. Свои — можно всегда, чужие — только администратору."""
     if _uuid_or_none(user_id) is None:
         return ok({"error": "user_id должен быть uuid"}, 400)

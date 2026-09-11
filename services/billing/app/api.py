@@ -92,14 +92,14 @@ def as_money(value: Any) -> Decimal:
 # ----------------------------------------------------------------- служебное
 
 @router.get("/health")
-async def health() -> JSONResponse:
+def health() -> JSONResponse:
     return ok({"status": "ok", "service": "billing"})
 
 
 # ------------------------------------------------------------------ партнёры
 
 @router.get("/partners")
-async def list_partners(request: Request) -> JSONResponse:
+def list_partners(request: Request) -> JSONResponse:
     """Дерево менеджеров. Администратору — целиком, партнёру — своя ветка."""
     principal = caller(request)
     tree = admin.partner_tree()
@@ -124,7 +124,7 @@ async def create_partner(request: Request) -> JSONResponse:
 
 
 @router.get("/partners/{partner_id}/cabinets")
-async def partner_cabinets(partner_id: str, request: Request,
+def partner_cabinets(partner_id: str, request: Request,
                            on: str | None = None) -> JSONResponse:
     with database.cursor() as cursor:
         require_partner(cursor, caller(request), partner_id)
@@ -146,7 +146,7 @@ async def set_markup(partner_id: str, request: Request) -> JSONResponse:
 
 
 @router.get("/partners/{partner_id}/commission")
-async def partner_commission(partner_id: str, period: str, request: Request) -> JSONResponse:
+def partner_commission(partner_id: str, period: str, request: Request) -> JSONResponse:
     """Своя комиссия и комиссия ветки. Чужую не показываем даже по прямой ссылке."""
     with database.cursor() as cursor:
         require_partner(cursor, caller(request), partner_id)
@@ -156,7 +156,7 @@ async def partner_commission(partner_id: str, period: str, request: Request) -> 
 # ------------------------------------------------------------------ кабинеты
 
 @router.get("/cabinets")
-async def list_cabinets(request: Request, needs_onboarding: bool = False) -> JSONResponse:
+def list_cabinets(request: Request, needs_onboarding: bool = False) -> JSONResponse:
     principal = caller(request)
     cabinets = admin.cabinets(only_needing_onboarding=needs_onboarding)
     if principal.unrestricted:
@@ -221,7 +221,7 @@ async def onboard(request: Request) -> JSONResponse:
 # -------------------------------------------------------------------- тарифы
 
 @router.get("/tariffs")
-async def list_tariffs(request: Request) -> JSONResponse:
+def list_tariffs(request: Request) -> JSONResponse:
     """Прайс видит любой, кто представился. Цены — не секрет, но и не улица:
     по ним видно, сколько платят клиенты и какая у склада маржа."""
     caller(request)
@@ -287,7 +287,7 @@ async def ingest(request: Request) -> JSONResponse:
 
 
 @router.post("/unbilled/{event_id}/replay")
-async def replay_unbilled(event_id: str, request: Request) -> JSONResponse:
+def replay_unbilled(event_id: str, request: Request) -> JSONResponse:
     """Переиграть событие, которое не дошло до счёта.
 
     Тариф не был утверждён, клиент не был заведён, справочник поправили — и
@@ -327,7 +327,7 @@ async def replay_unbilled(event_id: str, request: Request) -> JSONResponse:
 
 
 @router.get("/accruals/summary")
-async def accruals_summary(request: Request, period: str | None = None,
+def accruals_summary(request: Request, period: str | None = None,
                            seller: str | None = None,
                            cabinet_id: str | None = None) -> JSONResponse:
     """Итог периода одним числом — посчитанным базой.
@@ -389,7 +389,7 @@ async def accruals_summary(request: Request, period: str | None = None,
 
 
 @router.get("/accruals")
-async def accruals(request: Request, cabinet_id: str | None = None, period: str | None = None,
+def accruals(request: Request, cabinet_id: str | None = None, period: str | None = None,
                    limit: int = 200, cursor_after: str | None = None) -> JSONResponse:
     """Расшифровка начислений с видимой наценкой партнёра (файл 04, «ЛК клиента»).
 
@@ -469,7 +469,7 @@ def _decode_cursor(value: str | None) -> tuple[str, str, str] | None:
 # -------------------------------------------------------------------- отчёты
 
 @router.get("/reports/margin")
-async def margin(period: str, request: Request) -> JSONResponse:
+def margin(period: str, request: Request) -> JSONResponse:
     """выручка − наценка партнёра − себестоимость = маржа по кабинету.
 
     Себестоимость — внутреннее число MM-Express, поэтому отчёт целиком виден
@@ -481,14 +481,14 @@ async def margin(period: str, request: Request) -> JSONResponse:
 
 
 @router.get("/reports/unbilled")
-async def unbilled(request: Request) -> JSONResponse:
+def unbilled(request: Request) -> JSONResponse:
     """Что склад сделал, а клиенту не выставлено, — по причинам."""
     require_write(caller(request))
     return ok({"reasons": billing.unbilled()})
 
 
 @router.get("/reports/shift")
-async def shift(request: Request, day: str | None = None) -> JSONResponse:
+def shift(request: Request, day: str | None = None) -> JSONResponse:
     """Выработка смены: кто сколько сделал (витрина начальника склада).
 
     Кто сколько сделал — это про людей, а не про деньги клиента. Смотрит
@@ -515,7 +515,7 @@ async def close_period(period: str, request: Request) -> JSONResponse:
 
 
 @router.post("/periods/{period}/allocate")
-async def allocate(period: str, request: Request) -> JSONResponse:
+def allocate(period: str, request: Request) -> JSONResponse:
     require_write(caller(request))
     return ok(admin.allocate_period(period))
 
@@ -575,7 +575,7 @@ async def issue_invoice(request: Request) -> JSONResponse:
 
 
 @router.get("/invoices/{invoice_id}")
-async def invoice(invoice_id: str, request: Request) -> JSONResponse:
+def invoice(invoice_id: str, request: Request) -> JSONResponse:
     """Акт за период: клиент выгружает сам, без участия бухгалтера.
 
     Свой — да. Чужой — нет: в акте видно, сколько платит другой клиент и какая
@@ -598,7 +598,7 @@ async def invoice(invoice_id: str, request: Request) -> JSONResponse:
 
 
 @router.post("/invoices/{invoice_id}/pay")
-async def pay_invoice(invoice_id: str, request: Request) -> JSONResponse:
+def pay_invoice(invoice_id: str, request: Request) -> JSONResponse:
     """Оплата счёта переводит вознаграждение партнёра в payable, не раньше."""
     require_write(caller(request))
     try:

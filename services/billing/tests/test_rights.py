@@ -220,3 +220,40 @@ def test_an_invoice_of_another_client_is_not_visible(
         "/api/billing/v1/invoices/33333333-3333-4333-8333-333333333333",
         headers=as_("client"))
     assert response.status_code == 404
+
+
+def test_a_blocking_handler_is_not_declared_async() -> None:
+    """Обработчик с синхронным psycopg/httpx обязан быть обычным `def`.
+
+    FastAPI запускает `def` в пуле потоков, а `async def` — прямо в цикле
+    событий: блокирующий запрос к базе внутри `async def` останавливает ВЕСЬ
+    процесс на время запроса. Пять экранов, опрашивающих раз в секунду,
+    превращают это в очередь из ждущих запросов.
+    """
+    import ast
+    import pathlib
+
+    for name in ("billing", "portal", "internal-admin", "identity"):
+        path = (pathlib.Path(__file__).resolve().parents[3]
+                / "services" / name / "app" / "api.py")
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        offenders: list[str] = []
+        for node in tree.body:
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            decorated = any(
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr in ("get", "post", "put", "patch", "delete")
+                for item in node.decorator_list)
+            if not decorated:
+                continue
+            awaits = any(isinstance(inner, (ast.Await, ast.AsyncWith, ast.AsyncFor))
+                         for inner in ast.walk(node))
+            if not awaits:
+                offenders.append(node.name)
+        assert not offenders, (
+            f"{name}: обработчики {offenders} объявлены async, но ничего не ждут — "
+            f"их синхронные запросы к базе остановят весь процесс")
