@@ -173,6 +173,31 @@ TASK_COLUMNS = (
     "manual_review_reason, last_reconciled_at, created_at, updated_at, version")
 
 
+def park_unprocessable_order(cursor: Cursor, *, wb_account_id: uuid.UUID,
+                            owner_id: uuid.UUID, wb_order_id: int,
+                            code: str, reason: str) -> dict[str, Any] | None:
+    """Заводит задание в `manual_review` по неразобранному заказу WB.
+
+    Количество ставится 1: схема требует положительное, а настоящее как раз и
+    не разобрано. Штрихкод и срок не ставятся вовсе — ровно поэтому заказ и
+    попал сюда. Всё непонятое остаётся в `manual_review_reason` для человека.
+
+    Молча пропустить такой заказ нельзя: он существует у Wildberries, и срок
+    по нему идёт. Невидимое задание — это тот же просроченный заказ, только
+    без следа.
+    """
+    cursor.execute(
+        f"INSERT INTO wms_task (id, wb_order_id, wb_account_id, owner_id, quantity, "
+        f"                      state, manual_review_code, manual_review_reason) "
+        f"VALUES (%(id)s, %(order)s, %(account)s, %(owner)s, 1, 'manual_review', "
+        f"        %(code)s, %(reason)s) "
+        f"ON CONFLICT (wb_order_id) DO NOTHING "
+        f"RETURNING {TASK_COLUMNS}",
+        {"id": uuid.uuid4(), "order": wb_order_id, "account": wb_account_id,
+         "owner": owner_id, "code": code, "reason": reason[:2000]})
+    return cursor.fetchone()
+
+
 def insert_task(cursor: Cursor, *, task_id: uuid.UUID, wb_order_id: int,
                 wb_order_uid: str | None, account_id: uuid.UUID, owner_id: uuid.UUID,
                 sku_id: uuid.UUID | None, barcode: str | None, quantity: int,
@@ -774,10 +799,30 @@ def bind_supply_to_wb(cursor: Cursor, supply_id: uuid.UUID, wb_supply_id: str) -
                    (wb_supply_id, supply_id))
 
 
+# Состояния, в которых задание ещё живо и стикер ему нужен.
+#
+# Между «спросили стикер у WB» и «сохранили ответ» проходит вызов в сеть — до
+# секунды. Задание за это время могут отменить: клиент отменил заказ, сверка
+# увидела `cancel`, человек нажал отмену. Ответ WB, записанный вслепую,
+# ВОСКРЕШАЛ такое задание: `invalidated_at` сбрасывался в NULL, и отменённое
+# задание снова выглядело готовым к отгрузке — со стикером и в поставке.
+ALIVE_FOR_LABEL = ("reserved", "picking", "picked")
+
+# В поставку кладут и собранное: `add_orders` собирает машину из упакованного.
+# Не кладут отменённое, уехавшее и остановленное сверкой — им в машине нечего
+# делать, а WB будет ждать их там.
+ATTACHABLE_STATES = ALIVE_FOR_LABEL + ("packed", "labeled")
+
+
 def attach_tasks_to_supply(cursor: Cursor, task_ids: Sequence[uuid.UUID],
-                           supply_id: uuid.UUID) -> None:
-    cursor.execute("UPDATE wms_task SET supply_id = %s WHERE id = ANY(%s) AND supply_id IS NULL",
-                   (supply_id, list(task_ids)))
+                           supply_id: uuid.UUID) -> list[uuid.UUID]:
+    """Кладёт задания в поставку. Возвращает те, что действительно легли."""
+    cursor.execute(
+        "UPDATE wms_task SET supply_id = %s "
+        " WHERE id = ANY(%s) AND supply_id IS NULL AND state = ANY(%s) "
+        "RETURNING id",
+        (supply_id, list(task_ids), list(ATTACHABLE_STATES)))
+    return [row["id"] for row in cursor.fetchall()]
 
 
 def save_label(cursor: Cursor, *, task_id: uuid.UUID, payload: bytes, checksum: str,
@@ -788,15 +833,19 @@ def save_label(cursor: Cursor, *, task_id: uuid.UUID, payload: bytes, checksum: 
     стикер другой, и печатать старый нельзя.
     """
     cursor.execute(
+        # Сохраняем только живому заданию. `SELECT` в источнике вставки, а не
+        # проверка в коде: между проверкой и вставкой отмена успеет пройти
+        # снова, а здесь условие держит та же строка, что и пишет.
         "INSERT INTO wb_label (id, task_id, format, payload, checksum) "
-        "VALUES (%(id)s, %(task)s, %(format)s, %(payload)s, %(checksum)s) "
+        "SELECT %(id)s, %(task)s, %(format)s, %(payload)s, %(checksum)s "
+        "  FROM wms_task t WHERE t.id = %(task)s AND t.state = ANY(%(alive)s) "
         "ON CONFLICT (task_id) DO UPDATE SET "
         "    format = EXCLUDED.format, payload = EXCLUDED.payload, "
         "    checksum = EXCLUDED.checksum, fetched_at = now(), "
         "    invalidated_at = NULL, version = wb_label.version + 1 "
         "RETURNING id, task_id, format, checksum, version, fetched_at",
         {"id": uuid.uuid4(), "task": task_id, "format": label_format,
-         "payload": payload, "checksum": checksum})
+         "payload": payload, "checksum": checksum, "alive": list(ALIVE_FOR_LABEL)})
     label = cursor.fetchone()
     if label is not None:
         cursor.execute("UPDATE wms_task SET label_id = %s WHERE id = %s",

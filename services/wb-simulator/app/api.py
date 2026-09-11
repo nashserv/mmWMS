@@ -106,7 +106,8 @@ class Simulator:
             return created
 
     def seed_orders(self, account: str, count: int, barcode: str,
-                    deadline: str | None = None) -> list[dict[str, Any]]:
+                    deadline: str | None = None,
+                    broken: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         with self._lock:
             created = []
             for _ in range(count):
@@ -122,6 +123,12 @@ class Simulator:
                     "account": account,
                     "ddate": deadline,
                 }
+                # Ручка стенда: заказ с битым полем. У настоящего WB такие
+                # приезжают сами — кривая дата, отрицательное количество,
+                # штрихкод не из этого мира, — и один такой роняет весь такт
+                # опроса, если его не разобрать.
+                if broken:
+                    order.update(broken)
                 self._next_order_id += 1
                 self._orders.append(order)
                 created.append(order)
@@ -355,7 +362,8 @@ async def seed_orders(request: Request) -> Any:
         account=str(body.get("account", "default")),
         count=int(body.get("count", 1)),
         barcode=str(body.get("barcode", "2000000000011")),
-        deadline=body.get("deadline"))
+        deadline=body.get("deadline"),
+        broken=body.get("broken"))
     return {"created": len(created), "orders": created}
 
 

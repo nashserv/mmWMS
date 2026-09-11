@@ -454,3 +454,46 @@ def test_acceptance_is_confirmed_only_by_what_wildberries_actually_says(
 
     task = rows(pool, "SELECT state FROM wms_task WHERE id = %s", (task_id,))[0]
     assert task["state"] == "accepted", f"состояние задания {task['state']}"
+
+
+def test_a_cancellation_while_the_sticker_is_being_fetched_does_not_revive_the_task(
+        pool: ConnectionPool, live_cabinet: dict) -> None:
+    """Между «спросили стикер» и «сохранили ответ» проходит вызов в сеть.
+
+    Задание за это время успевают отменить. Ответ WB, записанный вслепую,
+    ВОСКРЕШАЛ его: `invalidated_at` сбрасывался в NULL, и отменённое задание
+    снова выглядело готовым к отгрузке — со стикером и в поставке.
+    """
+    from app.service import WmsService
+    from app.tasks import TaskOperations
+    from app.workers import wb_labels
+
+    order_ids = seed(live_cabinet["account"], 1, live_cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[live_cabinet["account"]]).tick()
+    task_id = rows(pool, "SELECT id FROM wms_task WHERE wb_order_id = %s",
+                   (order_ids[0],))[0]["id"]
+
+    # Отмена происходит ровно в окне между запросом стикера и его записью.
+    tasks = TaskOperations(pool, WmsService(pool))
+    real_stickers = wb_labels.WbClient.stickers
+
+    def cancel_in_the_window(self, ids, *, sticker_format="zplv"):
+        result = real_stickers(self, ids, sticker_format=sticker_format)
+        tasks.cancel(str(task_id), {"cancellation_event_id": unique("race"),
+                                    "handed_over": False})
+        return result
+
+    wb_labels.WbClient.stickers = cancel_in_the_window
+    try:
+        WbLabelWorker(pool, only_accounts=[live_cabinet["account"]]).tick()
+    finally:
+        wb_labels.WbClient.stickers = real_stickers
+
+    task = rows(pool, "SELECT state, cancel_reason FROM wms_task WHERE id = %s",
+                (task_id,))[0]
+    assert task["state"] == "cancelled", (
+        f"состояние {task['state']}: ответ Wildberries воскресил отменённое задание")
+
+    label = rows(pool, "SELECT invalidated_at FROM wb_label WHERE task_id = %s", (task_id,))
+    assert not label or label[0]["invalidated_at"] is not None, (
+        "стикер отменённого задания снова действителен — его напечатают и наклеят")

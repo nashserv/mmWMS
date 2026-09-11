@@ -180,3 +180,43 @@ def _release_lease(pool: ConnectionPool, account: str) -> None:
             cursor.execute(
                 "UPDATE wb_account SET sync_claimed_at = NULL, next_sync_at = NULL "
                 " WHERE external_id = %s", (account,))
+
+
+def test_one_poisoned_order_does_not_stop_the_whole_cabinet(
+        pool: ConnectionPool, cabinet: dict) -> None:
+    """Один заказ с битым полем ронял ВЕСЬ такт опроса.
+
+    Курсор не двигался, следующий такт приносил тот же заказ — и кабинет
+    вставал навсегда, а вместе с ним и все остальные заказы этого клиента.
+    Ядовитый заказ обязан уйти в разбор человеку, а опрос — продолжиться.
+    """
+    good_before = seed_orders(cabinet["account"], 1, cabinet["barcode"])
+    poisoned = httpx.post(f"{SIMULATOR}/__stand__/seed-orders", timeout=10.0, json={
+        "account": cabinet["account"], "count": 1, "barcode": cabinet["barcode"],
+        # Дата, которой не бывает. У настоящего WB такое приезжает само.
+        "broken": {"ddate": "позавчера вечером"}}).json()["orders"]
+    good_after = seed_orders(cabinet["account"], 1, cabinet["barcode"])
+
+    worker = WbSyncWorker(pool, only_accounts=[cabinet["account"]])
+    created = worker.tick()
+
+    assert created >= 2, (
+        f"заведено {created} заданий: здоровые заказы по обе стороны от "
+        f"ядовитого обязаны доехать")
+
+    parked = rows(pool, "SELECT state, manual_review_code, manual_review_reason "
+                        "  FROM wms_task WHERE wb_order_id = %s",
+                  (int(poisoned[0]["id"]),))
+    assert parked, "ядовитый заказ пропал бесследно: срок по нему идёт у WB"
+    assert parked[0]["state"] == "manual_review"
+    assert parked[0]["manual_review_code"] == "UNPROCESSABLE_ORDER"
+    assert parked[0]["manual_review_reason"], "разбирать нечего: причина пуста"
+
+    for order_id in good_before + good_after:
+        healthy = rows(pool, "SELECT state FROM wms_task WHERE wb_order_id = %s",
+                       (order_id,))
+        assert healthy and healthy[0]["state"] == "reserved", (
+            f"здоровый заказ {order_id} не заведён — ядовитый утащил за собой такт")
+
+    # Курсор сдвинулся: следующий такт не принесёт тот же ядовитый заказ снова.
+    assert worker.tick() == 0, "опрос читает ту же страницу заново"

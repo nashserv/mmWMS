@@ -25,7 +25,7 @@ from typing import Any, Sequence
 
 from .. import rate_limit, repositories as repo
 from ..metrics import WB_SYNC_LAST_SUCCESS, WB_SYNC_LAG
-from ..postgres import ConnectionPool, pool as shared_pool, single
+from ..postgres import ConnectionPool, pool as shared_pool, single, transaction
 from ..secrets import SecretUnavailable
 from ..service import WmsService
 from ..stock_push import publisher as stock_publisher
@@ -115,24 +115,66 @@ class WbSyncWorker:
                 with single(connection) as cursor:
                     known = repo.known_orders(cursor, [order.wb_order_id for order in orders])
 
-        created = 0
-        for order in orders:
-            if order.wb_order_id in known:
-                continue
-            if self._reserve(account, order):
-                created += 1
-
-        with self._pool.connection() as connection:
-            with single(connection) as cursor:
-                repo.finish_sync_with_cursor(
-                    cursor, account["id"], cursor_value=next_cursor,
-                    next_in_seconds=SYNC_INTERVAL, status="ACTIVE")
+        created, poisoned = 0, 0
+        try:
+            for order in orders:
+                if order.wb_order_id in known:
+                    continue
+                try:
+                    if self._reserve(account, order):
+                        created += 1
+                except Exception:  # noqa: BLE001 — один заказ не роняет опрос
+                    # Ядовитый заказ. Один заказ с битым полем — кривая дата,
+                    # отрицательное количество, штрихкод не из этого мира —
+                    # ронял ВЕСЬ такт: курсор не двигался, и следующий такт
+                    # приносил тот же заказ. Кабинет вставал навсегда, а вместе
+                    # с ним и все остальные заказы этого клиента.
+                    poisoned += 1
+                    log.exception("кабинет %s: заказ %s не разобран — "
+                                  "задание уходит в разбор человеку",
+                                  account["external_id"], order.wb_order_id)
+                    self._park_unprocessable(account, order)
+        finally:
+            # Курсор двигается в любом случае. Иначе ядовитый заказ приезжает
+            # снова и снова: ровно этим кабинет и вставал.
+            with self._pool.connection() as connection:
+                with single(connection) as cursor:
+                    repo.finish_sync_with_cursor(
+                        cursor, account["id"], cursor_value=next_cursor,
+                        next_in_seconds=SYNC_INTERVAL, status="ACTIVE")
         WB_SYNC_LAST_SUCCESS.set(time.time())
         WB_SYNC_LAG.observe(time.monotonic() - started)
-        if created:
-            log.info("кабинет %s: заведено заданий %d, перечитано по перекрытию %d",
-                     account["external_id"], created, len(known))
+        if created or poisoned:
+            log.info("кабинет %s: заведено заданий %d, в разбор %d, "
+                     "перечитано по перекрытию %d",
+                     account["external_id"], created, poisoned, len(known))
         return created
+
+    def _park_unprocessable(self, account: dict[str, Any], order: WbOrder) -> None:
+        """Заводит задание в `manual_review` отдельной короткой транзакцией.
+
+        Отдельной — потому что транзакция, в которой заказ уже сломался,
+        доверия не заслуживает: она может быть в состоянии отката. Короткой —
+        потому что это разбор, а не работа склада.
+
+        Молча пропустить такой заказ нельзя: он существует у Wildberries, и
+        срок по нему идёт. Невидимое задание — это тот же просроченный заказ,
+        только без следа.
+        """
+        try:
+            with self._pool.connection() as connection:
+                with transaction(connection) as cursor:
+                    repo.park_unprocessable_order(
+                        cursor, wb_account_id=account["id"],
+                        owner_id=account["owner_id"],
+                        wb_order_id=order.wb_order_id,
+                        code="UNPROCESSABLE_ORDER",
+                        reason=f"заказ Wildberries не разобран: "
+                               f"штрихкод {order.barcode!r}, количество "
+                               f"{order.quantity!r}, срок {order.deadline!r}")
+        except Exception:  # noqa: BLE001
+            log.exception("кабинет %s: заказ %s не удалось отправить в разбор",
+                          account["external_id"], order.wb_order_id)
 
     def _fetch(self, account: dict[str, Any]) -> tuple[list[WbOrder], int]:
         """Забирает страницу заданий. Место в лимите занимается до вызова."""

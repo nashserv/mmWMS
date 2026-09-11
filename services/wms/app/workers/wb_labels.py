@@ -112,17 +112,37 @@ class WbLabelWorker:
 
         by_order = {sticker.wb_order_id: sticker for sticker in stickers}
         saved = 0
+        # Задания, отменённые, пока мы ходили в Wildberries. Их заказы надо
+        # освободить из поставки: WB ждёт их в машине, а везти нечего.
+        cancelled_meanwhile: list[int] = []
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
                 for task in tasks:
                     sticker = by_order.get(int(task["wb_order_id"]))
                     if sticker is None or not sticker.payload:
                         continue
+                    # Перечитываем под блокировкой: между «спросили стикер» и
+                    # «сохранили ответ» прошёл вызов в сеть, и задание успели
+                    # отменить. Ответ, записанный вслепую, ВОСКРЕШАЛ такое
+                    # задание — снимал `invalidated_at`, и отменённое снова
+                    # выглядело готовым к отгрузке.
+                    fresh = repo.task_view(cursor, task["id"], for_update=True)
+                    if fresh is None or fresh["state"] not in repo.ALIVE_FOR_LABEL:
+                        cancelled_meanwhile.append(int(task["wb_order_id"]))
+                        log.info("задание %s отменено, пока брали стикер (%s): "
+                                 "стикер не сохранён",
+                                 task["id"], fresh["state"] if fresh else "нет задания")
+                        continue
                     repo.save_label(
                         cursor, task_id=task["id"], payload=sticker.payload,
                         checksum=hashlib.sha256(sticker.payload).hexdigest(),
                         label_format=self._format)
                     saved += 1
+
+        # Вызов в WB — после транзакции (инвариант 2).
+        if cancelled_meanwhile and supply.get("wb_supply_id"):
+            self._release_cancelled(account_external, secret_ref,
+                                    supply["wb_supply_id"], cancelled_meanwhile)
         # Получилось — пауза снимается.
         self._failures.pop(account_id, None)
         self._cooldown.pop(account_id, None)
@@ -131,6 +151,25 @@ class WbLabelWorker:
             log.info("кабинет %s: стикеров получено %d из %d заданий",
                      account_external, saved, len(tasks))
         return saved
+
+    def _release_cancelled(self, account_external: str, secret_ref: str,
+                           wb_supply_id: str, order_ids: list[int]) -> None:
+        """Освобождает из поставки то, что отменили, пока мы брали стикер.
+
+        Иначе WB ждёт эти заказы в машине, а их там нет: поставка приедет
+        неполной, и разбирать это будет уже клиент.
+        """
+        try:
+            with WbClient(account_external_id=account_external,
+                          secret_ref=secret_ref) as client:
+                for order_id in order_ids:
+                    client.release_from_supply(wb_supply_id, order_id)
+        except (WbError, SecretUnavailable) as failure:
+            log.warning("кабинет %s: %d отменённых заказов не освобождены "
+                        "из поставки (%s)", account_external, len(order_ids), failure)
+            return
+        log.info("кабинет %s: из поставки освобождено %d отменённых заказов",
+                 account_external, len(order_ids))
 
     def _ensure_supply(self, client: WbClient, account_id: Any) -> dict[str, Any]:
         """Накопительная поставка кабинета, созданная в WB при первой нужде.
