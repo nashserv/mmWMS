@@ -69,6 +69,12 @@ class AgentHub:
     def __init__(self) -> None:
         self._agents: dict[str, AgentSession] = {}
         self._waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # Кому какое задание отправлено. Без этой памяти `resolve` принимает
+        # результат от ЛЮБОГО подключённого агента: чужая станция закрывает
+        # чужую печать, и «напечатано» означает «кто-то сказал, что напечатал».
+        # На складе пять станций и пять принтеров (раздел 4) — перепутать их
+        # значит наклеить стикер на чужую коробку.
+        self._job_owner: dict[str, str] = {}
         self._lock = asyncio.Lock()
         # Последняя запись в устройство — её читает шаг 10 полного прогона
         # через PRINT_AGENT_STATS_URL. Без этого числа утверждение «до записи в
@@ -137,6 +143,7 @@ class AgentHub:
         }
 
         future: asyncio.Future[dict[str, Any]] | None = None
+        self._job_owner[job_id] = station_id
         if wait_ack:
             future = asyncio.get_running_loop().create_future()
             self._waiters[job_id] = future
@@ -144,6 +151,7 @@ class AgentHub:
             await session.websocket.send_json(message)
         except Exception as error:  # noqa: BLE001
             self._waiters.pop(job_id, None)
+            self._job_owner.pop(job_id, None)
             await self.unregister(station_id, session.websocket)
             raise AgentBusy(f"агент станции {station_id} оборвал соединение: {error}") from error
 
@@ -159,12 +167,28 @@ class AgentHub:
                 f"{ACK_TIMEOUT_SECONDS:.0f} с") from error
         finally:
             self._waiters.pop(job_id, None)
+            self._job_owner.pop(job_id, None)
 
-    def resolve(self, job_id: str, payload: dict[str, Any]) -> None:
-        """Подтверждение от агента: задание напечатано (или нет)."""
+    def resolve(self, job_id: str, payload: dict[str, Any], *,
+                station_id: str | None = None) -> bool:
+        """Подтверждение от агента: задание напечатано (или нет).
+
+        Принимается только от той станции, которой это задание и отправляли.
+        Раньше принималось от любой: агент чужой станции мог закрыть чужую
+        печать, и «напечатано» значило «кто-то сказал, что напечатал».
+
+        Возвращает False, если подтверждение пришло не от того — вызывающий
+        обязан это заметить и записать, а не промолчать.
+        """
+        owner = self._job_owner.get(job_id)
+        if owner is None:
+            return False
+        if station_id is not None and owner != station_id:
+            return False
         future = self._waiters.get(job_id)
         if future is not None and not future.done():
             future.set_result(payload)
+        return True
 
     async def send_probe(self, station_id: str) -> None:
         """Попросить агент проверить, что принтер вообще понимает.

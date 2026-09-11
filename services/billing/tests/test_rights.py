@@ -162,3 +162,61 @@ def test_an_unknown_identity_url_fails_closed_outside_the_stand(
 
     monkeypatch.setenv("APP_ENV", "test")
     assert Principals(base_url="").of(None).open_stand is True
+
+
+# ------------------------------------------- маршруты, которые были открыты
+
+def test_the_tariff_list_needs_a_token(client: TestClient) -> None:
+    """Прайс — не секрет, но и не улица: по нему видно, сколько платят
+    клиенты и какая у склада маржа."""
+    assert client.get("/api/billing/v1/tariffs").status_code == 401
+    assert client.get("/api/billing/v1/tariffs", headers=as_("client")).status_code == 200
+
+
+def test_ingesting_an_event_needs_the_right_to_write_money(client: TestClient) -> None:
+    """`/events` превращает событие в начисление клиенту.
+
+    Маршрут был открыт: кто угодно мог выставить клиенту любую сумму или,
+    наоборот, не выставить — повторив событие с чужим `event_id`.
+    """
+    payload = {"event_id": "11111111-1111-4111-8111-111111111111",
+               "type": "order.packed.v1", "occurred_at": "2026-09-11T10:00:00Z",
+               "payload": {"seller_id": "seller-1"}}
+    assert client.post("/api/billing/v1/events", json=payload).status_code == 401
+    assert client.post("/api/billing/v1/events", json=payload,
+                       headers=as_("client")).status_code == 403
+
+
+def test_the_consumer_may_ingest_with_a_service_token(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Консьюмер шины не человек, и роли человека ему не нужны."""
+    monkeypatch.setenv("SERVICE_TOKEN", "service-token-for-tests")
+    payload = {"event_id": "22222222-2222-4222-8222-222222222222",
+               "type": "order.packed.v1", "occurred_at": "2026-09-11T10:00:00Z",
+               "payload": {"seller_id": "seller-1"}}
+    response = client.post("/api/billing/v1/events", json=payload,
+                           headers={"Authorization": "Bearer service-token-for-tests"})
+    assert response.status_code == 200, response.text
+
+
+def test_shift_output_is_for_the_warehouse_head(client: TestClient) -> None:
+    """Кто сколько сделал — про людей, а не про деньги клиента."""
+    assert client.get("/api/billing/v1/reports/shift").status_code == 401
+    assert client.get("/api/billing/v1/reports/shift",
+                      headers=as_("client")).status_code == 403
+    assert client.get("/api/billing/v1/reports/shift",
+                      headers=as_("admin")).status_code == 200
+
+
+def test_an_invoice_of_another_client_is_not_visible(
+        client: TestClient, stand: dict[str, Any]) -> None:
+    """В акте видно, сколько платит другой клиент и какая у него наценка.
+
+    Отвечаем 404, а не 403: существование чужого счёта — тоже сведение.
+    """
+    assert client.get("/api/billing/v1/invoices/33333333-3333-4333-8333-333333333333"
+                      ).status_code == 401
+    response = client.get(
+        "/api/billing/v1/invoices/33333333-3333-4333-8333-333333333333",
+        headers=as_("client"))
+    assert response.status_code == 404

@@ -99,12 +99,19 @@ def wms_base_url() -> str:
 def wms_service_token() -> str | None:
     """Сервисный токен к wms.
 
-    В локальных окружениях его может не быть — на стенде авторизация не
-    поднята. Вне их отсутствие токена это ошибка старта, а не тихий
-    неавторизованный клиент.
+    Имя переменной — `SERVICE_TOKEN`, общее для всех сервисов: раздавать один
+    и тот же секрет под разными именами значит однажды задать его не везде.
+    `WMS_SERVICE_TOKEN` принимается как прежнее имя.
+
+    В локальных окружениях токена может не быть. Вне их его отсутствие — это
+    ошибка старта, а не тихий неавторизованный клиент: такой клиент выглядит
+    работающим ровно до первого закрытого маршрута.
     """
     environment = app_environment()
     required = environment not in LOCAL_ENVIRONMENTS
+    token = read_secret("SERVICE_TOKEN", required=False)
+    if token:
+        return token
     return read_secret("WMS_SERVICE_TOKEN", required=required)
 
 

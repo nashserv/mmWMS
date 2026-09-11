@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from typing import Any, Iterator
 
 import pytest
@@ -160,3 +161,69 @@ def test_the_journal_trims_bulk_payloads_but_keeps_everything_else() -> None:
     assert trimmed["opening_stock"] == "1 строк"
     # secret_ref — ссылка, а не секрет: её как раз и нужно видеть в журнале.
     assert trimmed["secret_ref"] == "vault://mmx/wb/s-1"
+
+
+# ------------------------------- маршруты, которые были открыты настежь
+
+def _with_identity(database: Database, monkeypatch: pytest.MonkeyPatch,
+                   principal: dict[str, Any]) -> TestClient:
+    """Админка с заданным ответом identity."""
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("DATABASE_URL", database.url)
+    from app import api as api_module
+
+    importlib.reload(api_module)
+    api_module.billing = FakeBilling()
+    api_module.identity = FakeIdentity(principal)
+    return TestClient(api_module.app)
+
+
+def test_admin_routes_are_closed_without_a_token(
+        database: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Раньше открыты были ВСЕ, включая /audit и /roles: по ним видно, кто
+    чем управляет и какими действиями."""
+    client = _with_identity(database, monkeypatch,
+                            {"active": False, "reason": "токен не предъявлен"})
+    for path in ("/api/admin/v1/overview", "/api/admin/v1/partners",
+                 "/api/admin/v1/audit", "/api/admin/v1/roles",
+                 "/api/admin/v1/whoami"):
+        assert client.get(path).status_code == 401, f"{path} отвечает без токена"
+
+
+def test_a_picker_has_no_business_in_the_admin_panel(
+        database: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Админка меняет деньги и права. Сборочная роль туда не ходит."""
+    client = _with_identity(database, monkeypatch,
+                            {"active": True, "user_id": "u-picker", "roles": ["picker"]})
+    assert client.get("/api/admin/v1/overview").status_code == 403
+
+
+def test_an_accountant_is_let_in(database: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _with_identity(database, monkeypatch,
+                            {"active": True, "user_id": "u-acc", "roles": ["accountant"]})
+    assert client.get("/api/admin/v1/partners").status_code == 200
+
+
+def test_the_author_of_an_approval_comes_from_the_token(parts: dict[str, Any]) -> None:
+    """`approved_by` из тела перезаписывается: подпись за того, кого назовут,
+    при разборе инцидента ничего не стоит."""
+    parts["client"].post("/api/admin/v1/tariff-versions/v-1/approve",
+                         json={"approved_by": "кто-то-другой"})
+    path, _token, body = parts["billing"].calls[-1]
+    assert body["approved_by"] == "u-admin", (path, body)
+
+
+def test_a_token_shaped_value_never_reaches_the_journal(parts: dict[str, Any]) -> None:
+    """Журнал админки читают при разборе инцидентов, и живой токен живёт в нём
+    дольше, чем сам инцидент (инвариант 15)."""
+    import base64
+
+    shaped = ".".join(
+        base64.urlsafe_b64encode(part).decode().rstrip("=")
+        for part in (b'{"alg":"HS256"}', b'{"sub":"x"}', b"sig"))
+    parts["client"].post("/api/admin/v1/onboarding",
+                         json={"seller_external_id": "s-1", "secret_ref": shaped})
+    rows = parts["module"].audit.recent(10)
+    assert rows, "действие не попало в журнал"
+    written = json.dumps(rows[0]["request"], ensure_ascii=False)
+    assert shaped not in written, "строка формы JWT сохранена в журнале целиком"

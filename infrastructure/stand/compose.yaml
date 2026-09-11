@@ -237,6 +237,7 @@ services:
       # Секреты только по ссылке, значение токена в переменных не появляется
       # никогда (инвариант 15).
       WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
+      SERVICE_TOKEN: ${SERVICE_TOKEN:?set outside Git}
     healthcheck:
       # Готовность — доступность базы, а не «процесс жив». Мониторинг, следящий
       # за портом вместо работы, — раздел 3.5.
@@ -275,6 +276,7 @@ services:
       WB_STICKER_FORMAT: ${WB_STICKER_FORMAT:-zplv}
       WB_SYNC_ONLY_ACCOUNTS: ${WB_SYNC_ONLY_ACCOUNTS:-}
       WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
+      SERVICE_TOKEN: ${SERVICE_TOKEN:?set outside Git}
       # Период опроса кабинета. Полсекунды — это 120 запросов в минуту на
       # кабинет из 300 разрешённых (приложение D): сорок процентов бюджета
       # уходит на опрос, и на стикеры, поставки и публикацию остатка остаётся
@@ -426,6 +428,9 @@ services:
       # настоящий сервис потока A. Больше ничего править не нужно: контракт
       # один и тот же (приложение B мастера).
       WMS_BASE_URL: http://wms:8080
+      # Рабочее место зовёт wms не от имени человека: сервисный токен.
+      SERVICE_TOKEN: ${SERVICE_TOKEN:?set outside Git}
+      IDENTITY_URL: http://identity:8080
 
       DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/workstation
 
@@ -441,6 +446,8 @@ services:
       WORKSTATION_POLL_INTERVAL_MS: ${WORKSTATION_POLL_INTERVAL_MS:-1000}
       WORKSTATION_POLL_LIMIT: ${WORKSTATION_POLL_LIMIT:-200}
       WORKSTATION_LEASE_SECONDS: ${WORKSTATION_LEASE_SECONDS:-900}
+      # Тот же секрет, что у агента: рабочее место сверяет предъявленный.
+      WORKSTATION_AGENT_TOKEN: ${WORKSTATION_AGENT_TOKEN:?set outside Git}
     healthcheck:
       # Проба спрашивает «процесс жив», а не «работа делается»: /readyz честно
       # отдаёт 503 при непроходящем опросе, и на нём контейнер уходил бы в
@@ -488,6 +495,12 @@ services:
       - --stats-port=8091
     environment:
       APP_ENV: development
+      # Агент в контейнере: привязка к петле сделала бы порт недостижимым
+      # через проброс, а наружу он всё равно не выходит — опубликован как
+      # 127.0.0.1:8091 на хосте. На складском ПК умолчание остаётся петлёй.
+      AGENT_STATS_HOST: 0.0.0.0
+      # Общий секрет станции. На стенде значение стендовое и лежит в .env.
+      WORKSTATION_AGENT_TOKEN: ${WORKSTATION_AGENT_TOKEN:?set outside Git}
     # Телеметрия записи в устройство: PRINT_AGENT_STATS_URL шага 10 прогона.
     ports: ["127.0.0.1:8091:8091"]
     healthcheck:

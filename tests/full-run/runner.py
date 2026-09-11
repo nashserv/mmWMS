@@ -57,6 +57,17 @@ def env(name: str, default: str | None = None) -> str:
 # --------------------------------------------------------------------- HTTP
 
 
+def service_headers() -> dict[str, str]:
+    """Прогон ходит в `wms` как соседний сервис, а не как человек.
+
+    Сервисный токен — тот же путь, которым в него ходят рабочее место, каталог
+    и возвраты. Токен человека здесь не нужен: прогон не подписывается ни за
+    кого — он проверяет склад.
+    """
+    token = (os.getenv("SERVICE_TOKEN") or "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 @dataclass
 class Call:
     """Один вызов контракта: и результат, и то, сколько он занял."""
@@ -85,7 +96,9 @@ class Wms:
 
     def __init__(self, base_url: str, timeout: float = 10.0) -> None:
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.Client(timeout=timeout)
+        # Заголовок ставится на клиента целиком: маршрутов у прогона три
+        # десятка, и «не забыть добавить» на каждый — способ однажды забыть.
+        self._client = httpx.Client(timeout=timeout, headers=service_headers())
         self._id = 0
 
     def close(self) -> None:

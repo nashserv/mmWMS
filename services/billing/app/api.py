@@ -24,6 +24,7 @@ from .admin import Admin, OnboardingError
 from .config import app_environment, database_url, trusted_hosts
 from .db import Database
 from .domain import Service
+from . import auth
 from .principal import (Forbidden, Principal, Principals, Unauthorized, require_partner,
                         require_write, summary, visible_cabinet_ids)
 from .service import BillingService
@@ -210,7 +211,10 @@ async def onboard(request: Request) -> JSONResponse:
 # -------------------------------------------------------------------- тарифы
 
 @router.get("/tariffs")
-async def list_tariffs() -> JSONResponse:
+async def list_tariffs(request: Request) -> JSONResponse:
+    """Прайс видит любой, кто представился. Цены — не секрет, но и не улица:
+    по ним видно, сколько платят клиенты и какая у склада маржа."""
+    caller(request)
     return ok({"tariffs": admin.tariffs()})
 
 
@@ -261,7 +265,14 @@ async def ingest(request: Request) -> JSONResponse:
     Тот же путь, что у billing-inbox-consumer, буква в букву: маршрут нужен,
     чтобы тарификацию можно было проверить без брокера — и чтобы админка могла
     переиграть событие из billing_unbilled после исправления справочника.
+
+    Маршрут ПИШЕТ ДЕНЬГИ: событие превращается в начисление клиенту. Поэтому
+    либо человек с правом записи, либо сервисный токен консьюмера — тот не
+    человек, но и не улица.
     """
+    token = auth.bearer(request.headers)
+    if not auth.service_token_matches(token):
+        require_write(caller(request))
     return ok(billing.ingest(await body_of(request)))
 
 
@@ -315,8 +326,15 @@ async def unbilled(request: Request) -> JSONResponse:
 
 
 @router.get("/reports/shift")
-async def shift(day: str | None = None) -> JSONResponse:
-    """Выработка смены: кто сколько сделал (витрина начальника склада)."""
+async def shift(request: Request, day: str | None = None) -> JSONResponse:
+    """Выработка смены: кто сколько сделал (витрина начальника склада).
+
+    Кто сколько сделал — это про людей, а не про деньги клиента. Смотрит
+    начальник склада или администратор, а не любой представившийся.
+    """
+    who = caller(request)
+    if not (who.unrestricted or "warehouse_head" in who.roles):
+        raise Forbidden("выработку смены видит начальник склада или администратор")
     return ok({"day": as_date(day, date.today()).isoformat(),
                "rows": billing.shift_output(as_date(day, date.today()))})
 
@@ -369,12 +387,26 @@ async def issue_invoice(request: Request) -> JSONResponse:
 
 
 @router.get("/invoices/{invoice_id}")
-async def invoice(invoice_id: str) -> JSONResponse:
-    """Акт за период: клиент выгружает сам, без участия бухгалтера."""
+async def invoice(invoice_id: str, request: Request) -> JSONResponse:
+    """Акт за период: клиент выгружает сам, без участия бухгалтера.
+
+    Свой — да. Чужой — нет: в акте видно, сколько платит другой клиент и какая
+    у него наценка. Видимость считается деревом закреплений, а не ролью.
+    """
+    who = caller(request)
     try:
-        return ok(admin.invoice(invoice_id))
+        found = admin.invoice(invoice_id)
     except OnboardingError as error:
         return ok({"error": str(error)}, 404)
+
+    if not who.unrestricted:
+        cabinet_id = str((found.get("invoice") or found).get("cabinet_id") or "")
+        with database.cursor() as cursor:
+            allowed = visible_cabinet_ids(cursor, who)
+        if allowed is not None and cabinet_id not in {str(item) for item in allowed}:
+            # 404, а не 403: существование чужого счёта — тоже сведение.
+            return ok({"error": "счёт не найден"}, 404)
+    return ok(found)
 
 
 @router.post("/invoices/{invoice_id}/pay")

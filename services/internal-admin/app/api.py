@@ -13,7 +13,7 @@ import time
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -32,7 +32,35 @@ database = Database(database_url() or "postgresql:///internal_admin")
 billing = BillingClient()
 identity = IdentityClient()
 audit = Audit(database)
-router = APIRouter(prefix=BASE_PATH)
+def require_caller(request: Request) -> dict[str, Any]:
+    """Кто пришёл в админку. Отказ — исключение, а не пустой экран.
+
+    Админка меняет деньги и права: заводит партнёров, утверждает тарифы,
+    закрывает периоды, выдаёт роли. Все её маршруты были открыты — включая
+    `/roles` и `/audit`, по которым видно, кто чем управляет.
+    """
+    principal = who(request)
+    if not principal.get("active"):
+        raise HTTPException(
+            status_code=401,
+            detail=str(principal.get("reason") or "нужен Bearer-токен identity"))
+    return principal
+
+
+def require_admin_role(request: Request) -> dict[str, Any]:
+    """Админка — инструмент администратора и бухгалтера, не любого сотрудника."""
+    principal = require_caller(request)
+    allowed = {"admin", "accountant", "warehouse_head"}
+    if not (set(principal.get("roles") or ()) & allowed):
+        raise HTTPException(
+            status_code=403,
+            detail=f"нужна одна из ролей: {', '.join(sorted(allowed))}")
+    return principal
+
+
+# Проверка висит на роутере: маршрутов два десятка, и «не забыть добавить» на
+# каждый новый — это способ однажды забыть.
+router = APIRouter(prefix=BASE_PATH, dependencies=[Depends(require_admin_role)])
 
 
 def plain(value: Any) -> Any:
@@ -210,7 +238,10 @@ async def approve(version_id: str, request: Request) -> JSONResponse:
     """Утверждение цены. Кто утвердил — в журнале, а не в памяти."""
     body = await body_of(request)
     principal = who(request)
-    body.setdefault("approved_by", str(principal.get("user_id") or ""))
+    # Автор берётся ИЗ ТОКЕНА и перезаписывает присланное: `setdefault`
+    # оставлял подпись за того, кого назовут в теле, и при разборе
+    # инцидента она ничего не стоила.
+    body["approved_by"] = str(principal.get("user_id") or "")
     return write_through(request, "версия тарифа утверждена", version_id,
                          f"/api/billing/v1/tariff-versions/{version_id}/approve", body)
 
@@ -249,7 +280,10 @@ async def shift(request: Request, day: str | None = None) -> JSONResponse:
 async def close_period(period: str, request: Request) -> JSONResponse:
     body = await body_of(request)
     principal = who(request)
-    body.setdefault("closed_by", str(principal.get("user_id") or ""))
+    # Автор берётся ИЗ ТОКЕНА и перезаписывает присланное: `setdefault`
+    # оставлял подпись за того, кого назовут в теле, и при разборе
+    # инцидента она ничего не стоила.
+    body["closed_by"] = str(principal.get("user_id") or "")
     return write_through(request, "период закрыт", period,
                          f"/api/billing/v1/periods/{period}/close", body)
 
@@ -290,7 +324,10 @@ async def roles() -> JSONResponse:
 async def grant(request: Request) -> JSONResponse:
     body = await body_of(request)
     principal = who(request)
-    body.setdefault("granted_by", str(principal.get("user_id") or ""))
+    # Автор берётся ИЗ ТОКЕНА и перезаписывает присланное: `setdefault`
+    # оставлял подпись за того, кого назовут в теле, и при разборе
+    # инцидента она ничего не стоила.
+    body["granted_by"] = str(principal.get("user_id") or "")
     status, response = identity.grant(token_of(request), body)
     audit.record(actor_id=str(principal.get("user_id") or "неизвестен"),
                  actor_roles=list(principal.get("roles") or []),

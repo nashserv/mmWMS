@@ -115,10 +115,16 @@ class PrintAgent:
         self._socket = socket_client
         socket_client.send_json({
             "type": "hello",
+            # Общий секрет станции. Без него в сокет приходит кто угодно и
+            # объявляет себя станцией — печатает чужие стикеры и подтверждает
+            # чужие задания.
+            "token": os.getenv("WORKSTATION_AGENT_TOKEN", ""),
             "station_id": self.station_id,
             "station_name": self.station_name,
-            "printer_name": self.printer.describe(),
-            "transport": "agent",
+            # `printer_name` и `transport` сервер больше не принимает от
+            # агента: транспорт станции — запись в базе. Отправляем для
+            # диагностики, применяет их не он.
+            "printer_hint": self.printer.describe(),
             "confirmed_format": self.confirmed_format,
             "capabilities": {"raw": True, "png_to_zpl": True, "png_to_tspl": True},
         })
@@ -275,7 +281,15 @@ def start_stats_server(stats: Stats, port: int) -> HTTPServer:
         def log_message(self, *args: Any) -> None:
             return
 
-    server = HTTPServer(("0.0.0.0", port), Handler)
+    # По умолчанию только петля. Телеметрия отвечает, что и когда печаталось,
+    # с какой станции и как быстро — на складской сети это лишнее знание, а
+    # пользы от доступа снаружи никакой: на ПК её читают с той же машины.
+    #
+    # На стенде агент живёт в контейнере, и привязка к петле сделала бы порт
+    # недостижимым даже через проброс. Там адрес задаётся явно, а наружу порт
+    # всё равно не выходит: он опубликован как 127.0.0.1:8091 на хосте.
+    host = os.getenv("AGENT_STATS_HOST", "127.0.0.1")
+    server = HTTPServer((host, port), Handler)
     threading.Thread(target=server.serve_forever, name="agent-stats", daemon=True).start()
     return server
 

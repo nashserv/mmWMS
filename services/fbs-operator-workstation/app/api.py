@@ -15,6 +15,8 @@ healthcheck и нулём обработанных сообщений (разд�
 """
 from __future__ import annotations
 
+import hmac
+
 import asyncio
 import logging
 import os
@@ -530,6 +532,23 @@ async def agent_socket(websocket: WebSocket) -> None:
         await websocket.close(code=1002)
         return
 
+    # Агент предъявляет общий секрет. Без него в сокет приходит кто угодно и
+    # объявляет себя станцией: печать чужих стикеров и подтверждение чужих
+    # заданий. Вне локальных сред секрет обязателен.
+    expected = (os.getenv("WORKSTATION_AGENT_TOKEN") or "").strip()
+    presented = str(hello.get("token") or "").strip()
+    local = (os.getenv("APP_ENV") or "").strip().lower() in {"test", "local", "development"}
+    if expected:
+        if not hmac.compare_digest(expected, presented):
+            await websocket.send_json({"type": "error", "error": "агент не предъявил токен"})
+            await websocket.close(code=1008)
+            return
+    elif not local:
+        await websocket.send_json(
+            {"type": "error", "error": "WORKSTATION_AGENT_TOKEN не задан"})
+        await websocket.close(code=1011)
+        return
+
     station_id = str(hello.get("station_id") or "").strip()
     station_name = str(hello.get("station_name") or station_id or "станция")
     if not station_id:
@@ -537,10 +556,13 @@ async def agent_socket(websocket: WebSocket) -> None:
         await websocket.close(code=1002)
         return
 
+    # `transport` и `printer_name` агент НЕ задаёт: транспорт станции — это
+    # запись в базе (`station.transport`), и агент, объявивший себя `tcp`,
+    # увёл бы печать на сетевой адрес, которого никто не проверял.
     session = AgentSession(
         station_id=station_id, station_name=station_name, websocket=websocket,
-        printer_name=_text(hello.get("printer_name")),
-        transport=str(hello.get("transport") or "agent"),
+        printer_name=None,
+        transport="agent",
         capabilities=hello.get("capabilities") if isinstance(hello.get("capabilities"), dict) else {},
         confirmed_format=_text(hello.get("confirmed_format")))
     await state.hub.register(session)
@@ -570,8 +592,17 @@ async def _handle_agent_message(session: AgentSession, message: dict[str, Any]) 
         job_id = str(message.get("job_id") or "")
         ok = bool(message.get("ok", True))
         write_ms = message.get("write_ms")
-        state.hub.resolve(job_id, {
-            "ok": ok, "write_ms": write_ms, "error": message.get("error")})
+        accepted = state.hub.resolve(
+            job_id, {"ok": ok, "write_ms": write_ms, "error": message.get("error")},
+            station_id=session.station_id)
+        if not accepted:
+            # Не молчим: подтверждение от не той станции — это либо ошибка
+            # настройки агента, либо чужой агент в сети. И то и другое надо
+            # видеть, а не списывать на «печать не подтвердилась».
+            log.warning("станция %s подтвердила чужое задание печати %s",
+                        session.station_id, job_id)
+            metrics.PRINTS.labels(outcome="foreign_ack", label_format="unknown").inc()
+            return
         if ok and write_ms is not None:
             state.hub.note_write(
                 task_id=str(message.get("task_id") or ""), station_id=session.station_id,
