@@ -32,7 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import config, metrics, screens
+from . import auth, config, metrics, screens
 from .agent_hub import AgentBusy, AgentHub, AgentSession
 from .inbox import InboxConsumer, NullConsumer
 from .picking import PickingRefused, PickingService
@@ -341,11 +341,47 @@ async def poll_now() -> dict[str, Any]:
 
 # ------------------------------------------------------------------ подбор
 
+def _who_is_picking(request: Request, typed: str) -> str:
+    """Кто на самом деле берёт задания.
+
+    Токен сборщика перебивает набранное руками имя, и это не предпочтение, а
+    единственный способ ответить на вопрос «кто это сделал». Имя с экрана
+    разворачивается в постоянный `uuid5` (раздел 13, пункт 13): значение
+    воспроизводимо от смены к смене, но ни с кем в `identity` не связано —
+    по нему нельзя ни спросить человека, ни отозвать ему доступ.
+
+    Сервисный токен сюда не годится намеренно: им ходит сама стойка, а не
+    человек. Задание, взятое «стойкой», — это опять никто.
+    """
+    try:
+        who = auth.caller_from(request.headers, allow_service=False)
+    except auth.AuthError:
+        return _typed_name(typed)
+    subject = str(getattr(who, "subject", "") or "").strip()
+    if not subject:
+        return _typed_name(typed)
+    metrics.PICKER_IDENTIFIED.labels(how="токен").inc()
+    return subject
+
+
+def _typed_name(name: str) -> str:
+    """Имя с экрана. Считается отдельно, чтобы долю было видно в метрике."""
+    metrics.PICKER_IDENTIFIED.labels(how="имя с экрана").inc()
+    return name
+
+
 @router.post("/sessions")
-async def session_start(command: SessionStart) -> JSONResponse:
+async def session_start(command: SessionStart, request: Request) -> JSONResponse:
+    """Начать обход.
+
+    `actor_id` берётся ИЗ ТОКЕНА, если сборщик пришёл со своим. Набранное на
+    экране имя — запасной путь, и путь этот отвечает на вопрос «кто это
+    сделал» словами «неизвестно кто, назвавшийся так».
+    """
     try:
         result = await state.picks.start_session(
-            actor_id=command.actor_id, station_id=_station(command.station_id),
+            actor_id=_who_is_picking(request, command.actor_id),
+            station_id=_station(command.station_id),
             limit=command.limit, lease_seconds=config.lease_seconds(),
             owner_external_ids=command.owner_external_ids)
     except PickingRefused as error:

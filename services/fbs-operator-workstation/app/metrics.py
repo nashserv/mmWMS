@@ -20,6 +20,12 @@ SERVICE = "fbs_operator_workstation"
 
 # --- общее для платформы ---------------------------------------------------
 
+PICKER_IDENTIFIED = Counter(
+    "mmx_workstation_picker_identified_total",
+    "Как опознан сборщик, начавший обход: по токену или по набранному имени. "
+    "Доля «имени» — это доля смен, про которые нельзя ответить, кто их отработал.",
+    ["how"])
+
 HTTP_REQUESTS = Counter(
     "mmx_http_requests_total",
     "HTTP requests completed by MM Express services.",

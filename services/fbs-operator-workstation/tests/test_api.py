@@ -292,3 +292,72 @@ def test_escaping_covers_the_characters_that_matter() -> None:
     body = screens.BASE_JS
     for character in ("'&'", "'<'", "'>'", "'\"'", '"\'"'):
         assert character in body, f"не экранируется {character}"
+
+
+# --- кто на самом деле берёт задания ----------------------------------------
+#
+# Раздел 13, пункт 13. Имя с экрана разворачивается в постоянный uuid5:
+# «за кем задание» воспроизводимо, но ни с кем в identity это значение не
+# связано — по нему нельзя ни спросить человека, ни отозвать ему доступ.
+# Токен сборщика отвечает на тот же вопрос по-настоящему.
+
+def test_a_pickers_token_beats_the_name_typed_on_the_screen(client, monkeypatch) -> None:
+    """Пришёл со своим токеном — задание записано на него, а не на набранное.
+
+    До фикса `actor_id` брался из тела запроса всегда, и человек мог назваться
+    кем угодно, включая коллегу.
+    """
+    from app import api as api_module
+
+    monkeypatch.setattr(api_module.auth, "caller_from",
+                        lambda headers, allow_service=False: api_module.auth.Caller(
+                            subject="11111111-2222-3333-4444-555555555555", roles=()))
+
+    seen: dict[str, str] = {}
+
+    async def remember(**kwargs):
+        seen.update({"actor": kwargs.get("actor_id")})
+        return {"session_id": "s-1", "tasks": []}
+
+    monkeypatch.setattr(api_module.state.picks, "start_session", remember)
+
+    answer = client.post("/api/workstation/v1/sessions",
+                         json={"actor_id": "Вася с экрана", "limit": 5},
+                         headers={"authorization": "Bearer a-pickers-token"})
+
+    assert answer.status_code == 200, answer.text[:200]
+    assert seen["actor"] == "11111111-2222-3333-4444-555555555555", (
+        "задание записано на имя с экрана при наличии токена сборщика — "
+        "«кто это сделал» по-прежнему без ответа")
+
+
+def test_without_a_token_the_typed_name_is_used_and_counted(client, monkeypatch) -> None:
+    """Без токена имя с экрана по-прежнему работает, но считается отдельно.
+
+    Смена не должна вставать из-за того, что входа ещё нет. Но доля таких смен
+    обязана быть видна: это доля работы, про которую нельзя сказать, кто её
+    сделал.
+    """
+    from app import api as api_module
+
+    def refuse(headers, allow_service=False):
+        raise api_module.auth.AuthError("токена нет")
+
+    monkeypatch.setattr(api_module.auth, "caller_from", refuse)
+
+    seen: dict[str, str] = {}
+
+    async def remember(**kwargs):
+        seen.update({"actor": kwargs.get("actor_id")})
+        return {"session_id": "s-2", "tasks": []}
+
+    monkeypatch.setattr(api_module.state.picks, "start_session", remember)
+
+    answer = client.post("/api/workstation/v1/sessions",
+                         json={"actor_id": "Вася с экрана", "limit": 5})
+
+    assert answer.status_code == 200, answer.text[:200]
+    assert seen["actor"] == "Вася с экрана"
+    # Метрика обязана различать два пути: без неё «все смены анонимны» и «все
+    # смены подписаны» выглядят одинаково.
+    assert api_module.metrics.PICKER_IDENTIFIED.labels(how="имя с экрана")._value.get() > 0

@@ -102,3 +102,4 @@ async def _test_the_job_owner_is_forgotten_after_the_job_is_done() -> None:
 
     assert hub.resolve(job_id, {"ok": True}, station_id="station-1") is False, \
         "задание осталось в памяти после завершения"
+
