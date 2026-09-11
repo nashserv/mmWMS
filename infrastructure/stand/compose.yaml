@@ -746,6 +746,10 @@ services:
       rabbitmq: {condition: service_healthy}
       rabbitmq-init: {condition: service_completed_successfully}
     environment:
+      # Воркер хранения спрашивает склад о коробко-местах, а склад
+      # спрашивает, кто пришёл (находка 1.3). Без токена — 401 на
+      # каждый кабинет, и хранение не начисляется никому.
+      SERVICE_TOKEN: ${SERVICE_TOKEN:?set outside Git}
       <<: *billing-env
       METRICS_PORT: "8081"
       # На стенде считаем чаще суток, чтобы не ждать ночи ради проверки.

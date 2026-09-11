@@ -187,3 +187,55 @@ def test_a_message_that_is_not_json_is_not_retried_forever(
     handler._consume()
 
     assert broken.nacked == [(1, False)]
+
+
+# --- воркер хранения представляется складу ---------------------------------
+#
+# С этапа 1 склад спрашивает, кто пришёл (находка 1.3). Воркер хранения ходит
+# в него за коробко-местами и токена не посылал: 401 на каждый кабинет и на
+# каждый досчитываемый день. Хранение не начислялось НИ ОДНОМУ клиенту, а
+# выглядело это как «у всех ноль коробок» — отказ склада считался отсутствием
+# количества.
+
+def test_the_storage_worker_introduces_itself_to_the_warehouse(monkeypatch) -> None:
+    """Запрос к складу несёт сервисный токен."""
+    from app import worker
+
+    seen: dict[str, object] = {}
+
+    class Answer:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"result": {"placements": [{"box_barcode": "BOX-1"}]}}
+
+    def fake_post(url: str, **kwargs: object) -> Answer:
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers")
+        return Answer()
+
+    monkeypatch.setattr(worker.httpx, "post", fake_post)
+    monkeypatch.setenv("SERVICE_TOKEN", "stand-fake-secret-1")
+
+    assert worker.box_places("кто-то") == 1
+    headers = seen["headers"] or {}
+    assert headers.get("authorization") == "Bearer stand-fake-secret-1", (
+        "воркер хранения пошёл в склад без токена — склад ответит 401, и "
+        "хранение не будет начислено никому")
+
+
+def test_a_warehouse_that_refuses_is_not_reported_as_missing_quantity() -> None:
+    """Отказ склада называется отказом склада, а не отсутствием количества.
+
+    Разница не косметическая. По причине «нет количества» дежурный идёт
+    смотреть пустые склады, по «склад недоступен» — связь с `wms`. Ровно из-за
+    этой подмены 162 строки за такт выглядели нормой, и то, что хранение не
+    начисляется вообще, не заметили сутки.
+    """
+    from app.domain import UnbilledReason
+
+    assert UnbilledReason.WAREHOUSE_UNAVAILABLE.value == "WAREHOUSE_UNAVAILABLE"
+    assert UnbilledReason.WAREHOUSE_UNAVAILABLE is not UnbilledReason.NO_QUANTITY

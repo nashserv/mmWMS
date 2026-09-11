@@ -384,9 +384,15 @@ class BillingService:
             try:
                 quantity = Decimal(places(str(cabinet["seller_external_id"])))
             except Exception as failure:  # noqa: BLE001 — один кабинет не валит остальные
-                results.append({"outcome": "unbilled", "reason": "NO_QUANTITY",
+                # Склад не ответил — это НЕ «нет количества». Разница не
+                # косметическая: по первой причине дежурный идёт смотреть
+                # пустые склады, по второй — связь с `wms`. Хранение не
+                # начислялось никому целые сутки именно потому, что 401
+                # приходил под видом отсутствия коробок.
+                reason = UnbilledReason.WAREHOUSE_UNAVAILABLE
+                results.append({"outcome": "unbilled", "reason": reason.value,
                                 "seller": cabinet["seller_external_id"], "detail": str(failure)})
-                UNBILLED.labels(reason=UnbilledReason.NO_QUANTITY.value).inc()
+                UNBILLED.labels(reason=reason.value).inc()
                 continue
             if quantity <= 0:
                 # Клиент, у которого в этот день не стояло ни одной коробки,

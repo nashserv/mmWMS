@@ -54,7 +54,16 @@ def box_places(seller_external_id: str) -> int:
     """
     base = os.getenv("WMS_BASE_URL", "http://wms:8080").rstrip("/")
     path = os.getenv("WMS_API_PATH", "/api/mmx/wms/v1")
-    response = httpx.post(f"{base}{path}/storage/lookup", timeout=15.0, json={
+    # Склад спрашивает, кто пришёл (находка 1.3), и соседний сервис
+    # представляется сервисным токеном. Без него запрос возвращает 401 — а
+    # выглядит это как «у клиента ноль коробко-мест», потому что отказ
+    # считался отсутствием количества.
+    headers = {}
+    token = (os.getenv("SERVICE_TOKEN") or "").strip()
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    response = httpx.post(f"{base}{path}/storage/lookup", timeout=15.0,
+                          headers=headers, json={
         "jsonrpc": "2.0", "method": "call", "id": 1,
         "params": {"seller_external_id": seller_external_id}})
     response.raise_for_status()
