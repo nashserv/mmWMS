@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -124,7 +125,10 @@ def test_step_01_opening_stock_lands_in_the_ledger_not_only_in_the_balance(
     wms.result("/wb/accounts", {
         "op": "upsert", "external_id": data.WB_ACCOUNT, "seller_external_id": data.SELLER,
         "display_name": "Кабинет полного прогона", "secret_ref": data.WB_SECRET_REF,
-        "mode": "shadow", "status": "ACTIVE"})
+        # Склад обязателен: без него остаток НЕ публикуется вовсе (этап 2.10).
+        # Раньше подставлялся склад №1 — чужой, и остаток клиента уезжал туда,
+        # где его нет, а инвариант 7 при этом считался выполненным.
+        "mode": "shadow", "status": "ACTIVE", "wb_warehouse_id": data.WB_WAREHOUSE_ID})
 
     # Клиент, товары и кабинет есть — дальше шаги могут идти своей дорогой,
     # даже если сам документ начального остатка не применится. Иначе один
@@ -763,15 +767,11 @@ def test_step_12_every_billable_operation_is_accrued_45_15_30(
             f"делается, а тарифицировать её нечем. Именно так упаковка — самая "
             f"частая операция склада — шла клиенту бесплатно")
 
-        # Неизвестный тип в списке включённых — тоже находка: он не
-        # тарифицируется, и узнать об этом можно только здесь.
-        enabled = {row["event_type"] for row in billing.rows(
-            "SELECT event_type FROM billing_billable_event WHERE active")}
-        unknown = sorted(enabled - set(data.BILLABLE_EVENT_TYPES))
-        assert not unknown, (
-            f"включены типы, которых прогон не видел ни разу: {unknown}. "
-            f"Либо их никто не издаёт, либо прогон их не покрывает — и то и "
-            f"другое значит невыставленный счёт")
+        # Включённый тип, которого не издаёт НИКТО, ловится отдельно и
+        # точнее — `services/billing/tests/test_tariffs.py` сверяет список
+        # тарифицируемого с каталогом событий. Здесь такой проверки нет
+        # намеренно: прогон покрывает не все услуги (возврата в нём нет), и
+        # «не встретилось за прогон» это не «никто не издаёт».
 
         for event in billable:
             accrual = billing.row(
@@ -780,13 +780,42 @@ def test_step_12_every_billable_operation_is_accrued_45_15_30(
                 f"на операцию {event['type']} (event_id={event['event_id']}) "
                 f"нет начисления: физическое действие = движение + событие + начисление "
                 f"(инвариант 13)")
-            amount = int(accrual["amount"])
-            partner = int(accrual["partner_amount"])
-            net = int(accrual.get("net_amount") if accrual.get("net_amount") is not None
-                      else amount - partner)
-            assert (amount, partner, net) == (data.AMOUNT, data.PARTNER_AMOUNT, data.NET_AMOUNT), (
-                f"{event['type']}: amount={amount}, partner_amount={partner}, net_amount={net}; "
-                f"ожидалось {data.AMOUNT}/{data.PARTNER_AMOUNT}/{data.NET_AMOUNT}")
+            # Арифметика начисления, а не одно заученное число.
+            #
+            # Раньше здесь ждали 45/15/30 от КАЖДОГО события. Это цена
+            # упаковки из раздела 1, а не общее правило: приёмка стоит 15 + 15,
+            # стикеровка 10 + 15, и количество у приёмки — принятые штуки, не
+            # единица. Пока тарифицировалась одна услуга, разницы не было
+            # видно; с тремя проверка требовала, чтобы все стоили одинаково.
+            quantity = Decimal(str(accrual["quantity"]))
+            unit_price = Decimal(str(accrual["unit_price"]))
+            markup = Decimal(str(accrual["markup"]))
+            amount = Decimal(str(accrual["amount"]))
+            partner = Decimal(str(accrual["partner_amount"]))
+            net = Decimal(str(accrual["net_amount"] if accrual.get("net_amount") is not None
+                              else amount - partner))
+
+            assert amount == quantity * (unit_price + markup), (
+                f"{event['type']}: {quantity} × ({unit_price} + {markup}) ≠ {amount}. "
+                f"Клиент платит тариф MM-Express плюс наценку партнёра, и обе "
+                f"части обязаны сойтись с итогом")
+            assert partner == quantity * markup, (
+                f"{event['type']}: наценка партнёра {partner} ≠ {quantity} × {markup}")
+            assert net == amount - partner, (
+                f"{event['type']}: {amount} − {partner} ≠ {net}")
+
+        # Модель раздела 1 — на упаковке: клиент платит 45, партнёр получает
+        # 15, MM-Express 30. Это то самое число, которым меряют деньги.
+        packing = billing.row(
+            f"SELECT * FROM {table} WHERE service = 'packing' "  # noqa: S608
+            f" ORDER BY created_at DESC LIMIT 1")
+        assert packing, "за прогон не начислено ни одной упаковки"
+        assert (int(packing["amount"]), int(packing["partner_amount"]),
+                int(packing["net_amount"])) == (
+                    data.AMOUNT, data.PARTNER_AMOUNT, data.NET_AMOUNT), (
+            f"упаковка: {packing['amount']}/{packing['partner_amount']}/"
+            f"{packing['net_amount']}, ожидалось "
+            f"{data.AMOUNT}/{data.PARTNER_AMOUNT}/{data.NET_AMOUNT}")
     finally:
         billing.close()
 
@@ -1008,7 +1037,7 @@ def test_step_16_ten_thousand_tasks_per_hour_without_errors_and_locks_under_100m
         "op": "upsert", "external_id": data.LOAD_WB_ACCOUNT,
         "seller_external_id": data.LOAD_SELLER,
         "display_name": "Кабинет нагрузки", "secret_ref": data.WB_SECRET_REF,
-        "mode": "shadow", "status": "ACTIVE"})
+        "mode": "shadow", "status": "ACTIVE", "wb_warehouse_id": data.WB_WAREHOUSE_ID})
     # Остатка должно хватить на всё окно: клапан ledger_short здесь не
     # проверяется, а недостача исказила бы измерение удержания блокировки.
     wms.result("/warehouse/documents", {
