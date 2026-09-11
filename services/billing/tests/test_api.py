@@ -48,7 +48,7 @@ def test_the_client_sees_45_and_where_they_go(
     """Клиент должен видеть 45 и понимать, что 30 — MM-Express, 15 — партнёру,
     а не считать нас источником завышенной цены (файл 04)."""
     client.post("/api/billing/v1/events",
-                json=event("order.packed.v1", {"seller_id": "seller-1"}))
+                json=event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
 
     body = client.get("/api/billing/v1/accruals", params={"period": "2026-09"}).json()
     assert body["count"] == 1
@@ -77,7 +77,7 @@ def test_unbilled_report_names_what_did_not_reach_the_bill(
         client: TestClient, stand: dict[str, Any]) -> None:
     """Отчёт о потерянной выручке, а не лог ошибок."""
     client.post("/api/billing/v1/events",
-                json=event("order.packed.v1", {"нет_владельца": True}))
+                json=event("wms.packing.completed.v1", {"нет_владельца": True}))
     reasons = client.get("/api/billing/v1/reports/unbilled").json()["reasons"]
     assert [row["reason"] for row in reasons] == ["SELLER_UNKNOWN"]
     assert reasons[0]["events"] == 1
@@ -86,6 +86,6 @@ def test_unbilled_report_names_what_did_not_reach_the_bill(
 def test_cabinets_that_arrived_by_event_are_listed_for_onboarding(
         client: TestClient, stand: dict[str, Any]) -> None:
     client.post("/api/billing/v1/events",
-                json=event("order.packed.v1", {"seller_id": "seller-мимо-процесса"}))
+                json=event("wms.packing.completed.v1", {"seller_id": "seller-мимо-процесса"}))
     body = client.get("/api/billing/v1/cabinets", params={"needs_onboarding": True}).json()
     assert [row["seller_external_id"] for row in body["cabinets"]] == ["seller-мимо-процесса"]

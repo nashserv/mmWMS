@@ -17,7 +17,7 @@ def test_a_packed_order_becomes_an_accrual_of_45_15_30(
         database: Database, stand: dict[str, Any]) -> None:
     """Шаг 12 полного прогона, дословно: amount=45, partner_amount=15, net=30."""
     service = BillingService(database)
-    result = service.ingest(event("order.packed.v1", {"seller_id": "seller-1", "task_id": "t-1"}))
+    result = service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1", "task_id": "t-1"}))
 
     assert result["outcome"] == "accrued", result
     accrual = rows(database, "SELECT * FROM billing_accrual")[0]
@@ -38,7 +38,7 @@ def test_the_same_event_twice_does_not_bill_the_client_twice(
         database: Database, stand: dict[str, Any]) -> None:
     """Шина доставляет at-least-once. Повтор обязан быть безвредным (инвариант 5)."""
     service = BillingService(database)
-    message = event("order.packed.v1", {"seller_id": "seller-1"})
+    message = event("wms.packing.completed.v1", {"seller_id": "seller-1"})
 
     first = service.ingest(message)
     second = service.ingest(message)
@@ -104,7 +104,7 @@ def test_a_billable_event_without_a_tariff_lands_in_unbilled_not_in_silence(
         cursor.execute("UPDATE billing_tariff SET active = false")
 
     result = BillingService(database).ingest(
-        event("order.packed.v1", {"seller_id": "seller-1"}))
+        event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
 
     assert result["outcome"] == "unbilled"
     assert result["reason"] == "NO_TARIFF"
@@ -120,7 +120,7 @@ def test_an_unapproved_price_never_reaches_the_client(
         cursor.execute("UPDATE billing_tariff_version SET approved = false, "
                        "approved_by = NULL, approved_at = NULL")
 
-    result = BillingService(database).ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
+    result = BillingService(database).ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
 
     assert result["reason"] == "TARIFF_NOT_APPROVED"
     assert rows(database, "SELECT * FROM billing_accrual") == []
@@ -135,7 +135,7 @@ def test_a_cabinet_that_arrived_by_event_is_billed_but_marked_for_onboarding(
     молча; поэтому счёт выставляется, а кабинет помечен.
     """
     result = BillingService(database).ingest(
-        event("order.packed.v1", {"seller_id": "seller-неизвестный"}))
+        event("wms.packing.completed.v1", {"seller_id": "seller-неизвестный"}))
 
     assert result["outcome"] == "accrued"
     cabinet = rows(database, "SELECT * FROM cabinet WHERE seller_external_id = %s",
@@ -145,7 +145,7 @@ def test_a_cabinet_that_arrived_by_event_is_billed_but_marked_for_onboarding(
 
 def test_a_broken_envelope_is_recorded_rather_than_dropped(database: Database) -> None:
     """Событие, которого биллинг не понял, обязано остаться видимым."""
-    result = BillingService(database).ingest({"type": "order.packed.v1", "payload": {}})
+    result = BillingService(database).ingest({"type": "wms.packing.completed.v1", "payload": {}})
 
     assert result["reason"] == "BAD_ENVELOPE"
     assert len(rows(database, "SELECT * FROM billing_unbilled")) == 1
@@ -170,7 +170,7 @@ def test_physical_actions_feed_the_shift_report_even_when_not_billed(
 def test_an_accrual_announces_itself_on_the_bus(
         database: Database, stand: dict[str, Any]) -> None:
     """Начисление и его событие пишутся одной транзакцией — outbox, не вызов."""
-    BillingService(database).ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
+    BillingService(database).ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
 
     outbox = rows(database, "SELECT * FROM billing_outbox")
     assert len(outbox) == 1

@@ -31,8 +31,8 @@ def test_expenses_are_split_by_the_rule_written_in_the_row(
     _second_cabinet(database)
     service = BillingService(database)
     for _ in range(3):
-        service.ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
-    service.ingest(event("order.packed.v1", {"seller_id": "seller-2"}))
+        service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
+    service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-2"}))
 
     admin = Admin(database, wms=None)  # type: ignore[arg-type]
     admin.add_expense("2026-09", "payroll", Decimal("40000"), "ФОТ смены за сентябрь")
@@ -51,7 +51,7 @@ def test_margin_is_revenue_minus_partner_fee_minus_cost(
     """выручка − наценка партнёра − себестоимость = маржа по кабинету."""
     service = BillingService(database)
     for _ in range(4):
-        service.ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
+        service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
 
     admin = Admin(database, wms=None)  # type: ignore[arg-type]
     admin.add_expense("2026-09", "rent", Decimal("50"), "аренда, доля сентября")

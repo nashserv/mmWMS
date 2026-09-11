@@ -585,6 +585,61 @@ services:
       - ../../services/billing/migrations:/migrations:ro
     entrypoint: ["/bin/bash", "/migrate.sh"]
 
+  # Схемы в тестовых базах остальных сервисов. Ровно та же причина, что у
+  # wms-test-migrate: база есть, а schema_migrations в ней пуст — и тесты
+  # либо падают на первой таблице, либо уходят в рабочую базу.
+  billing-test-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/billing_test
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/billing/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  identity-test-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/identity_test
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/identity/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  portal-test-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/portal_test
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/portal/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  internal-admin-test-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/internal_admin_test
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/internal-admin/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
   # Сид стенда: партнёры, кабинеты и тарифы поверх тех же продавцов, что уже
   # посеяны в базе wms (reference/stand-seed). Идемпотентен — ON CONFLICT DO
   # NOTHING, повторный запуск ничего не меняет.

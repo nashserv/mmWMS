@@ -38,6 +38,10 @@ SHIFT_OPERATIONS = {
     "wms.picking.completed.v1": "подбор",
     "wms.label.attached.v1": "стикеровка",
     "wms.return.received.v1": "приём возврата",
+    # Приёмка — операция смены, и её выработку считают так же, как подбор.
+    # Событие заведено в версии 1.3 мастера; без строки здесь приёмщик в
+    # отчёте смены выглядел бездельником.
+    "wms.receipt.completed.v1": "приёмка",
     "inventory.movement.recorded.v1": "движение товара",
     "order.packed.v1": "упаковка",
     "label.printed.v1": "печать этикетки",

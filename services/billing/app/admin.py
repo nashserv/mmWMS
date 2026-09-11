@@ -252,8 +252,25 @@ class Admin:
             created = self.wms.ensure_owner(seller_external_id, name, inn)
             # Запоминаем owner.id склада: события физического действия несут
             # именно его, а не внешний ключ продавца.
-            owner_id = ((created.get("seller") or {}).get("owner_id")
+            # Контракт `SellerResult` отдаёт `owner_id` НА ВЕРХНЕМ УРОВНЕ.
+            # Читали вложенный `seller.owner_id`, которого там нет: поле
+            # оставалось пустым всегда, а `cabinet.wms_owner_id` — NULL.
+            # События настоящего `wms` несут именно `owner_id`, и по пустому
+            # ключу консьюмер заводил кабинет-дубль на каждое событие.
+            #
+            # Вложенные варианты оставлены запасными: так отвечала заглушка
+            # потока 0, и переключение на настоящий сервис не должно ломать
+            # онбординг на полпути.
+            owner_id = (created.get("owner_id")
+                        or (created.get("seller") or {}).get("owner_id")
                         or (created.get("seller") or {}).get("id"))
+            if not owner_id:
+                # Молчать нельзя: кабинет без `wms_owner_id` не свяжется ни с
+                # одним событием склада, и клиент не получит счёт вовсе.
+                steps.append({"step": "владелец в wms", "state": "ошибка",
+                              "detail": "wms не вернул owner_id: кабинет не свяжется "
+                                        "с событиями склада, счёт не выставится"})
+                return {"cabinet": cabinet, "steps": steps, "state": "incomplete"}
             if owner_id:
                 with self.db.transaction() as cursor:
                     cursor.execute(

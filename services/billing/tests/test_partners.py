@@ -42,7 +42,7 @@ def test_handing_a_cabinet_over_does_not_rewrite_the_past(
     admin = Admin(database, wms=None)  # type: ignore[arg-type]
     service = BillingService(database)
 
-    august = event("order.packed.v1", {"seller_id": "seller-1"},
+    august = event("wms.packing.completed.v1", {"seller_id": "seller-1"},
                    occurred_at="2026-08-15T10:00:00+00:00")
     service.ingest(august)
 
@@ -52,7 +52,7 @@ def test_handing_a_cabinet_over_does_not_rewrite_the_past(
                        (successor, stand["senior"]))
     admin.assign_cabinet(stand["cabinet"], successor, "account_manager", date(2026, 9, 1))
 
-    september = event("order.packed.v1", {"seller_id": "seller-1"},
+    september = event("wms.packing.completed.v1", {"seller_id": "seller-1"},
                       occurred_at="2026-09-15T10:00:00+00:00")
     service.ingest(september)
 
@@ -94,7 +94,7 @@ def test_a_markup_can_be_overridden_for_one_client(
         stand["senior"], "packing", Decimal("25"), date(2026, 1, 1),
         cabinet_id=stand["cabinet"])
 
-    BillingService(database).ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
+    BillingService(database).ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
 
     accrual = rows(database, "SELECT * FROM billing_accrual")[0]
     assert accrual["markup"] == Decimal("25.00")
@@ -109,9 +109,9 @@ def test_a_markup_change_applies_from_its_date_and_not_backwards(
         stand["senior"], "packing", Decimal("20"), date(2026, 9, 1))
     service = BillingService(database)
 
-    service.ingest(event("order.packed.v1", {"seller_id": "seller-1"},
+    service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"},
                          occurred_at="2026-08-15T10:00:00+00:00"))
-    service.ingest(event("order.packed.v1", {"seller_id": "seller-1"},
+    service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"},
                          occurred_at="2026-09-15T10:00:00+00:00"))
 
     by_period = {row["period"]: row["partner_amount"]
@@ -123,7 +123,7 @@ def test_the_partner_is_not_paid_before_the_client_pays(
         database: Database, stand: dict[str, Any]) -> None:
     """Признание по факту оплаты (файл 04): pending до денег, payable после."""
     admin = Admin(database, wms=None)  # type: ignore[arg-type]
-    BillingService(database).ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
+    BillingService(database).ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
 
     assert rows(database, "SELECT partner_payout_state FROM billing_accrual")[0][
         "partner_payout_state"] == "pending"
@@ -143,7 +143,7 @@ def test_the_partner_is_not_paid_before_the_client_pays(
 def test_commission_of_a_manager_shows_own_and_branch_separately(
         database: Database, stand: dict[str, Any]) -> None:
     """Менеджер видит свою комиссию, старший — ветку целиком."""
-    BillingService(database).ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
+    BillingService(database).ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
     service = BillingService(database)
 
     senior = service.commission(stand["senior"], "2026-09")

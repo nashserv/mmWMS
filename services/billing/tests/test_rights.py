@@ -99,8 +99,8 @@ def test_accruals_of_a_foreign_cabinet_are_not_listed(
         cursor.execute("INSERT INTO cabinet (id, seller_external_id, name) "
                        "VALUES (%s, 'seller-чужой', 'Чужой ИП')", (other,))
     service = BillingService(database)
-    service.ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
-    service.ingest(event("order.packed.v1", {"seller_id": "seller-чужой"}))
+    service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
+    service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-чужой"}))
 
     mine = client.get("/api/billing/v1/accruals", headers=as_("manager")).json()
     assert [row["cabinet_seller"] for row in mine["accruals"]] == ["seller-1"]
@@ -120,8 +120,8 @@ def test_a_client_sees_their_own_cabinet_and_nothing_else(
         cursor.execute("INSERT INTO cabinet (id, seller_external_id, name) "
                        "VALUES (gen_random_uuid(), 'seller-чужой', 'Чужой ИП')")
     service = BillingService(database)
-    service.ingest(event("order.packed.v1", {"seller_id": "seller-1"}))
-    service.ingest(event("order.packed.v1", {"seller_id": "seller-чужой"}))
+    service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
+    service.ingest(event("wms.packing.completed.v1", {"seller_id": "seller-чужой"}))
 
     body = client.get("/api/billing/v1/accruals", headers=as_("client")).json()
     assert [row["cabinet_seller"] for row in body["accruals"]] == ["seller-1"]
@@ -180,7 +180,7 @@ def test_ingesting_an_event_needs_the_right_to_write_money(client: TestClient) -
     наоборот, не выставить — повторив событие с чужим `event_id`.
     """
     payload = {"event_id": "11111111-1111-4111-8111-111111111111",
-               "type": "order.packed.v1", "occurred_at": "2026-09-11T10:00:00Z",
+               "type": "wms.packing.completed.v1", "occurred_at": "2026-09-11T10:00:00Z",
                "payload": {"seller_id": "seller-1"}}
     assert client.post("/api/billing/v1/events", json=payload).status_code == 401
     assert client.post("/api/billing/v1/events", json=payload,
@@ -192,7 +192,7 @@ def test_the_consumer_may_ingest_with_a_service_token(
     """Консьюмер шины не человек, и роли человека ему не нужны."""
     monkeypatch.setenv("SERVICE_TOKEN", "service-token-for-tests")
     payload = {"event_id": "22222222-2222-4222-8222-222222222222",
-               "type": "order.packed.v1", "occurred_at": "2026-09-11T10:00:00Z",
+               "type": "wms.packing.completed.v1", "occurred_at": "2026-09-11T10:00:00Z",
                "payload": {"seller_id": "seller-1"}}
     response = client.post("/api/billing/v1/events", json=payload,
                            headers={"Authorization": "Bearer service-token-for-tests"})

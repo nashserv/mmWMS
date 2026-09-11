@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import base64
+import pathlib
 
 import uuid
 from datetime import date
 from typing import Any
 
 import pytest
+import yaml
 
 from app.admin import Admin, OnboardingError, check_secret_ref
 from app.db import Database
@@ -35,8 +37,53 @@ def _shaped_like_a_token() -> str:
 SHAPED_LIKE_A_TOKEN = _shaped_like_a_token()
 
 
+_CONTRACT_PATH = (pathlib.Path(__file__).resolve().parents[3]
+                  / "services" / "wms" / "contracts" / "openapi.yaml")
+
+
+def _contract() -> dict[str, Any]:
+    if not _CONTRACT_PATH.is_file():
+        return {}
+    with _CONTRACT_PATH.open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def _by_contract(schema_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Проверяет ответ заглушки по схеме контракта wms и возвращает его.
+
+    Заглушка, отвечающая не по контракту, делает тест зелёным на сломанном
+    коде — а найти это можно будет только в бою.
+    """
+    document = _contract()
+    schema = ((document.get("components") or {}).get("schemas") or {}).get(schema_name)
+    if schema is None:
+        return payload
+    jsonschema = pytest.importorskip("jsonschema", reason="нужен jsonschema")
+    from jsonschema import Draft202012Validator
+    from referencing import Registry, Resource
+    from referencing.jsonschema import DRAFT202012
+
+    uri = "urn:mmx:wms:contracts:openapi"
+    registry = Registry().with_resource(
+        uri, Resource.from_contents(document, default_specification=DRAFT202012))
+    validator = Draft202012Validator(
+        {"$ref": f"{uri}#/components/schemas/{schema_name}"}, registry=registry)
+    problems = sorted(validator.iter_errors(payload), key=lambda item: item.path)
+    assert not problems, (
+        f"заглушка wms отвечает не по контракту ({schema_name}): "
+        + "; ".join(f"{'/'.join(str(part) for part in error.path) or '(корень)'}: "
+                    f"{error.message}" for error in problems))
+    return payload
+
+
 class FakeWms:
-    """Поток A ещё не готов — работаем против контракта (правило 9.5.4)."""
+    """Поток A ещё не готов — работаем против контракта (правило 9.5.4).
+
+    Ответы здесь ПО КОНТРАКТУ, а не «как удобно тесту». Заглушка, отвечающая
+    иначе, чем настоящий сервис, — это зелёный тест на сломанном коде: ровно
+    так `wms_owner_id` оставался пустым на проде, а тест онбординга при этом
+    проходил.
+    """
 
     def __init__(self, owner_id: str | None = None) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -44,7 +91,21 @@ class FakeWms:
 
     def ensure_owner(self, seller_external_id: str, name: str, inn: str | None) -> dict[str, Any]:
         self.calls.append(("ensure_owner", {"seller": seller_external_id, "name": name}))
-        return {"seller": {"owner_id": self.owner_id, "seller_external_id": seller_external_id}}
+        # Форма `SellerResult` из `services/wms/contracts/openapi.yaml`:
+        # `owner_id` на верхнем уровне, без обёртки `seller`.
+        answer: dict[str, Any] = {
+            "owner_id": self.owner_id,
+            "owner_external_id": seller_external_id,
+            "name": name,
+            "active": True,
+            "allow_ledger_short": False,
+            "created": True,
+        }
+        if inn:
+            # Пустой ИНН не отправляется вовсе: схема описывает поле строкой, и
+            # `null` в нём — не «не знаем», а нарушение контракта.
+            answer["inn"] = inn
+        return _by_contract("SellerResult", answer)
 
     def connect_wb_account(self, external_id: str, seller_external_id: str,
                            display_name: str, secret_ref: str) -> dict[str, Any]:

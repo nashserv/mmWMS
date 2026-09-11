@@ -142,8 +142,12 @@ def stand(database: Database) -> dict[str, Any]:
             "VALUES (%s, %s, NULL, 30.00)",
             (ids["tier"], ids["version"]))
         cursor.execute(
+            # Те же типы, что в сиде стенда: `order.packed.v1` эмитило старое
+            # рабочее место, новый wms шлёт `wms.packing.completed.v1`.
+            # Обвязка, отстающая от сида, делает тесты зелёными на том, что в
+            # бою не тарифицируется вовсе.
             "INSERT INTO billing_billable_event (event_type, service, quantity_path, comment) "
-            "VALUES ('order.packed.v1', 'packing', NULL, 'тест'), "
+            "VALUES ('wms.packing.completed.v1', 'packing', NULL, 'тест'), "
             "       ('wb.supply.shipped.v1', 'shipping', 'orders', 'тест')")
     return ids
 
