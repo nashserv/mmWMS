@@ -128,12 +128,21 @@ class EventPublisher:
                 self._channel = self._connection.channel()
                 self._channel.exchange_declare(
                     exchange=EXCHANGE, exchange_type="topic", durable=True)
+                # Подтверждения брокера. Без них `basic_publish` возвращается
+                # успешно, как только байты ушли в сокет: событие считается
+                # опубликованным, а RabbitMQ мог его не принять вовсе. Тогда
+                # `published_at` проставлен, из outbox строка ушла, и событие
+                # потеряно молча — ровно то, что outbox и должен исключать.
+                self._channel.confirm_delivery()
             channel = self._channel
             channel.basic_publish(
                 exchange=EXCHANGE,
                 routing_key=routing_key,
                 body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                 properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
+                # Некуда положить — отказ, а не тишина. Событие без очереди
+                # уходит в никуда: обмен принимает его и выбрасывает.
+                mandatory=True,
             )
         except Exception as failure:
             # Склад не зависит от шины (раздел 6.1). Событие уже в памяти;

@@ -222,9 +222,14 @@ class WbSyncWorker:
         wait = SYNC_INTERVAL
         if failure.rate_limited:
             status, wait = "RATE_LIMITED", max(failure.retry_after, 1.0)
-            with self._pool.connection() as connection:
-                with single(connection) as cursor:
-                    rate_limit.block(cursor, account["id"], wait)
+            # `block()` — только на ответ настоящего Wildberries. Собственный
+            # отказ ограничителя (`LOCAL_RATE_LIMIT`) кабинет не блокирует: в
+            # сеть мы и так не пошли, а пауза после своего же отказа удлиняет
+            # её на ровном месте и выглядит как блокировка со стороны WB.
+            if failure.code != "LOCAL_RATE_LIMIT":
+                with self._pool.connection() as connection:
+                    with single(connection) as cursor:
+                        rate_limit.block(cursor, account["id"], wait)
         elif failure.auth_rejected:
             # Токен отозван или сменился. Дальше долбить бессмысленно и вредно:
             # WB считает повторные 401 поводом для блокировки.

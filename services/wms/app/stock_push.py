@@ -103,14 +103,23 @@ class StockPublisher:
     def _drain_account(self, account_id: uuid.UUID) -> None:
         """Выгребает накопленное по владельцу, пока оно не кончится."""
         try:
+            current = account_id
             while True:
                 with self._lock:
-                    skus = self._pending.pop(account_id, set())
-                    marked = self._marked_at.pop(account_id, None)
+                    skus = self._pending.pop(current, set())
+                    marked = self._marked_at.pop(current, None)
                     if not skus:
-                        self._in_flight.discard(account_id)
-                        return
-                self._push(account_id, skus, marked)
+                        self._in_flight.discard(current)
+                        # Очередь своего владельца пуста — забираем чужую,
+                        # если её некому взять. Иначе накопленное у владельца,
+                        # чей поток уже завершился, лежит до следующего
+                        # движения по нему: остаток в Wildberries отстаёт
+                        # неизвестно насколько (инвариант 7).
+                        current = self._orphaned()
+                        if current is None:
+                            return
+                        continue
+                self._push(current, skus, marked)
         except Exception:
             log.exception("публикация остатка кабинета %s оборвалась", account_id)
             with self._lock:
@@ -118,6 +127,17 @@ class StockPublisher:
         finally:
             with self._lock:
                 self._threads.discard(threading.current_thread())
+
+    def _orphaned(self) -> uuid.UUID | None:
+        """Владелец с накопленным остатком, за которым никто не пришёл.
+
+        Вызывается под `self._lock`.
+        """
+        for owner_id, skus in self._pending.items():
+            if skus and owner_id not in self._in_flight:
+                self._in_flight.add(owner_id)
+                return owner_id
+        return None
 
     def _push(self, owner_id: uuid.UUID, sku_ids: set[uuid.UUID],
               marked_at: float | None) -> None:
@@ -133,6 +153,18 @@ class StockPublisher:
         for account in accounts:
             if not writes_allowed(account["mode"]):
                 # В shadow в Wildberries не пишут вообще ничего (раздел 11).
+                continue
+            if not account.get("wb_warehouse_id"):
+                # Раньше подставлялся склад №1 — чужой. Остаток клиента
+                # уезжал на склад, которого у него нет, и WB его либо
+                # отвергал, либо принимал не туда. Молчать об этом нельзя:
+                # инвариант 7 обещает опубликованный остаток, а он не
+                # публикуется вовсе.
+                STOCK_PUSH.labels(outcome="no_warehouse").inc()
+                log.error("кабинет %s: не задан wb_warehouse_id — остаток "
+                          "не публикуется. Инвариант 7 не выполняется для "
+                          "этого кабинета, пока склад не задан",
+                          account["external_id"])
                 continue
             self._push_one(account, payload, sku_ids, marked_at)
 
@@ -156,7 +188,7 @@ class StockPublisher:
         try:
             with WbClient(account_external_id=account["external_id"],
                           secret_ref=account["secret_ref"]) as client:
-                client.put_stocks(account["wb_warehouse_id"] or 1, payload)
+                client.put_stocks(account["wb_warehouse_id"], payload)
         except (WbError, SecretUnavailable) as failure:
             outcome = "error"
             log.warning("кабинет %s: остаток не опубликован (%s)",

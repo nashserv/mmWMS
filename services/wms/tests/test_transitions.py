@@ -287,3 +287,24 @@ def test_an_expired_lease_frees_the_task_in_any_state(
         "задание в `picked` осталось за пропавшим сборщиком: "
         "оно не потеряно только на бумаге")
     assert task["claim_expires_at"] is None
+
+
+def test_a_claimed_task_comes_back_with_its_lease(
+        pool: ConnectionPool, client: dict) -> None:
+    """В ответе на выдачу — кто взял и до какого времени.
+
+    `_TASK_VIEW` читал `wms_task` в том же операторе, что и UPDATE, а видел
+    снимок ДО него: приезжали `assignee: null` и `leased_until: null`. Рабочее
+    место получало задание, за которым по ответу никто не закреплён.
+    """
+    task_id = reserve(pool, client)
+    answer = TaskOperations(pool, WmsService(pool)).pull(
+        {"assignee": "picker-1", "claim": True, "limit": 10,
+         "owner_external_ids": [client["seller"]], "lease_seconds": 600})
+
+    item = next(one for one in answer["tasks"] if one["task"]["task_id"] == task_id)
+    assert item["leased_until"], (
+        "leased_until пуст: рабочему месту нечем показать, до какого времени "
+        "задание за сборщиком, и нечем понять, что лизинг истёк")
+    assert item["task"]["assignee"], "в ответе никто не взял задание"
+    assert item["task"]["claim_expires_at"] == item["leased_until"]

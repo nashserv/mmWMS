@@ -490,6 +490,27 @@ def consume_reservation(cursor: Cursor, reservation_id: uuid.UUID) -> None:
         (reservation_id,))
 
 
+def reserved_places(cursor: Cursor, *, owner_id: uuid.UUID, sku_id: uuid.UUID,
+                    for_update: bool = False) -> list[dict[str, Any]]:
+    """Где сейчас лежит зарезервированный товар владельца.
+
+    Откат резерва брал раскладку из ИСТОРИЧЕСКИХ движений резерва. За время
+    жизни резерва товар могли переложить: инвентаризация, перемещение между
+    ячейками, разбор коробки. Возврат по старым движениям писал товар в
+    ячейку, где его давно нет, и заводил там отрицательный остаток, а в
+    настоящей ячейке — излишек.
+
+    Текущий баланс знает, где вещь лежит на самом деле.
+    """
+    cursor.execute(
+        "SELECT cell_id, box_id, qty FROM stock_balance "
+        " WHERE owner_id = %s AND sku_id = %s AND state = 'reserved' AND qty > 0 "
+        " ORDER BY qty DESC, cell_id"
+        + (" FOR UPDATE" if for_update else ""),
+        (owner_id, sku_id))
+    return cursor.fetchall()
+
+
 def release_reservation(cursor: Cursor, reservation_id: uuid.UUID, reason: str) -> None:
     cursor.execute(
         "UPDATE reservation SET state = 'released', released_at = now(), release_reason = %s "
@@ -548,18 +569,33 @@ def insert_outbox(cursor: Cursor, *, event_id: uuid.UUID, event_type: str, tenan
     return row
 
 
-def pending_outbox(cursor: Cursor, limit: int = 200) -> list[dict[str, Any]]:
-    """Очередь публикатора.
+def pending_outbox(cursor: Cursor, limit: int = 200,
+                   lease_seconds: int = 30) -> list[dict[str, Any]]:
+    """Очередь публикатора с явным лизингом.
 
-    SKIP LOCKED: публикаторов может быть несколько, и одно событие не должно
-    уехать в шину дважды из-за того, что второй воркер ждал первого.
+    `FOR UPDATE SKIP LOCKED` держит строку ровно до конца запроса: пачка
+    прочитана, блокировки отпущены, а публикация только началась. Второй
+    публикатор в этот момент видит те же строки непубликованными и отправляет
+    их второй раз — потребитель получает дубль.
+
+    `claimed_until` переживает конец запроса. SKIP LOCKED остаётся: он
+    разводит двух публикаторов, стартовавших одновременно, по разным пачкам.
+    Просроченный лизинг снова свободен — публикатор мог упасть посреди пачки.
     """
     cursor.execute(
-        "SELECT id, event_id, type, tenant_id, occurred_at, payload, correlation_id, "
-        "       aggregate_id, sequence, attempts "
-        "  FROM outbox WHERE published_at IS NULL "
-        " ORDER BY occurred_at, id LIMIT %s FOR UPDATE SKIP LOCKED", (limit,))
-    return cursor.fetchall()
+        "WITH due AS ("
+        "    SELECT id, occurred_at FROM outbox "
+        "     WHERE published_at IS NULL "
+        "       AND (claimed_until IS NULL OR claimed_until <= now()) "
+        "     ORDER BY occurred_at, id LIMIT %(limit)s FOR UPDATE SKIP LOCKED) "
+        "UPDATE outbox o SET claimed_until = now() + make_interval(secs => %(lease)s) "
+        "  FROM due WHERE o.id = due.id AND o.occurred_at = due.occurred_at "
+        "RETURNING o.id, o.event_id, o.type, o.tenant_id, o.occurred_at, o.payload, "
+        "          o.correlation_id, o.aggregate_id, o.sequence, o.attempts",
+        {"limit": limit, "lease": lease_seconds})
+    rows = cursor.fetchall()
+    rows.sort(key=lambda row: (row["occurred_at"], row["id"]))
+    return rows
 
 
 def mark_published(cursor: Cursor, rows: Sequence[tuple[int, Any]]) -> None:
@@ -769,6 +805,38 @@ def tasks_awaiting_labels(cursor: Cursor, *, limit: int = 100,
         {"limit": limit, "only": list(only_accounts) if only_accounts else None,
          "skip": list(exclude_accounts) if exclude_accounts else None,
          "modes": list(modes)})
+    return cursor.fetchall()
+
+
+def tasks_needing_supply(cursor: Cursor, *, limit: int = 100,
+                         only_accounts: Sequence[str] | None = None,
+                         exclude_accounts: Sequence[Any] | None = None,
+                         modes: Sequence[str] = ("live",)) -> list[dict[str, Any]]:
+    """Задания со стикером, но без поставки.
+
+    Такое бывает после `deliver`: несобранное освобождается из поставки, чтобы
+    машина уехала с тем, что лежит в коробе. Стикер у задания при этом
+    действующий, и `tasks_awaiting_labels` его больше не видит — там условие
+    «стикера нет». Задание остаётся вне поставки навсегда: `deliver` его не
+    возьмёт (его нет в поставке), а стикеровщик не тронет (стикер есть).
+
+    Этим заданиям нужен не стикер, а только `add_orders` + `attach`.
+    """
+    cursor.execute(
+        "SELECT t.id, t.wb_order_id, t.wb_account_id, t.owner_id, t.supply_id, "
+        "       a.external_id AS account_external_id, a.secret_ref "
+        "  FROM wms_task t "
+        "  JOIN wb_account a ON a.id = t.wb_account_id "
+        "  JOIN wb_label l ON l.task_id = t.id AND l.invalidated_at IS NULL "
+        " WHERE t.state = ANY(%(alive)s) AND t.supply_id IS NULL "
+        "   AND a.mode = ANY(%(modes)s) AND a.status = 'ACTIVE' "
+        "   AND (%(only)s::text[] IS NULL OR a.external_id = ANY(%(only)s)) "
+        "   AND (%(skip)s::uuid[] IS NULL OR NOT (t.wb_account_id = ANY(%(skip)s))) "
+        " ORDER BY t.deadline NULLS LAST, t.created_at "
+        " LIMIT %(limit)s",
+        {"limit": limit, "only": list(only_accounts) if only_accounts else None,
+         "skip": list(exclude_accounts) if exclude_accounts else None,
+         "modes": list(modes), "alive": list(ATTACHABLE_STATES)})
     return cursor.fetchall()
 
 
@@ -1310,13 +1378,24 @@ def claim_tasks(cursor: Cursor, *, assignee: Any, limit: int, states: Sequence[s
                          " ORDER BY t.deadline NULLS LAST, t.created_at", arguments)
         return cursor.fetchall()
 
+    # Поля исполнителя берутся из `RETURNING`, а не из таблицы.
+    #
+    # `_TASK_VIEW` читает `wms_task` в том же операторе, что и UPDATE, а
+    # видит снимок ДО него: в ответе на выдачу приезжали `assignee: null` и
+    # `leased_until: null`. Рабочее место получало задание, за которым по
+    # ответу никто не закреплён, и не могло показать, до какого времени оно
+    # у сборщика.
     cursor.execute(
         f"WITH picked AS ({selection}), "
         "     taken AS ("
         "         UPDATE wms_task t SET assignee = %(assignee)s, claimed_at = now(), "
         "                claim_expires_at = now() + make_interval(secs => %(lease)s) "
-        "           FROM picked p WHERE t.id = p.id RETURNING t.id) "
-        + _TASK_VIEW + " JOIN taken k ON k.id = t.id "
+        "           FROM picked p WHERE t.id = p.id "
+        "       RETURNING t.id, t.assignee, t.claimed_at, t.claim_expires_at, t.version) "
+        + _TASK_VIEW.replace("t.assignee, t.claimed_at, t.claim_expires_at, ",
+                             "k.assignee, k.claimed_at, k.claim_expires_at, ")
+                    .replace("t.version, ", "k.version, ")
+        + " JOIN taken k ON k.id = t.id "
         " ORDER BY t.deadline NULLS LAST, t.created_at", arguments)
     return cursor.fetchall()
 
@@ -1844,6 +1923,22 @@ def mark_diverged(cursor: Cursor, task_id: uuid.UUID, *, wb_status: str | None) 
         "UPDATE wms_task SET state = 'diverged', wb_status = COALESCE(%s, wb_status), "
         "                    last_reconciled_at = now(), version = version + 1 "
         " WHERE id = %s", (wb_status, task_id))
+
+
+def owners_with_stock(cursor: Cursor) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Владельцы и их товары, у которых есть остаток.
+
+    Нужна страховочной публикации: потерянный вызов оставляет остаток в
+    Wildberries расходящимся до следующего движения по тому же товару, а у
+    редкого товара это недели (инвариант 7).
+    """
+    cursor.execute(
+        "SELECT owner_id, sku_id FROM stock_balance "
+        " WHERE state = 'good' AND qty <> 0 GROUP BY owner_id, sku_id")
+    result: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for row in cursor.fetchall():
+        result.setdefault(row["owner_id"], set()).add(row["sku_id"])
+    return result
 
 
 def divergence_report(cursor: Cursor, *, limit: int = 500) -> list[dict[str, Any]]:

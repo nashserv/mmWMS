@@ -70,14 +70,52 @@ class WbLabelWorker:
                 pending = repo.tasks_awaiting_labels(
                     cursor, limit=BATCH, only_accounts=self._only,
                     exclude_accounts=paused, modes=_writable_modes())
+        # Задания со стикером, но без поставки. Такое остаётся после
+        # `deliver`: несобранное освобождается из поставки, чтобы машина
+        # уехала с тем, что лежит в коробе. Стикеровщик его больше не видит
+        # (стикер есть), а `deliver` не возьмёт (в поставке нет) — оно висит
+        # вне поставки навсегда. Ему нужен не стикер, а только add_orders.
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                orphans = repo.tasks_needing_supply(
+                    cursor, limit=BATCH, only_accounts=self._only,
+                    exclude_accounts=paused, modes=_writable_modes())
+        attached = 0
+        if orphans:
+            by_orphan: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+            for task in orphans:
+                by_orphan[task["wb_account_id"]].append(task)
+            attached = sum(self._attach_only(account_id, tasks)
+                           for account_id, tasks in by_orphan.items())
+
         if not pending:
-            return 0
+            return attached
 
         by_account: dict[Any, list[dict[str, Any]]] = defaultdict(list)
         for task in pending:
             by_account[task["wb_account_id"]].append(task)
-        return sum(self._fetch_for_account(account_id, tasks)
-                   for account_id, tasks in by_account.items())
+        return attached + sum(self._fetch_for_account(account_id, tasks)
+                              for account_id, tasks in by_account.items())
+
+    def _attach_only(self, account_id: Any, tasks: list[dict[str, Any]]) -> int:
+        """Кладёт в поставку задания, у которых стикер уже есть."""
+        account_external = tasks[0]["account_external_id"]
+        secret_ref = tasks[0]["secret_ref"]
+        # Два вызова: открыть поставку (если её ещё нет) и положить заказы.
+        if not self._reserve_calls(account_id, count=2):
+            return 0
+        try:
+            with WbClient(account_external_id=account_external,
+                          secret_ref=secret_ref) as client:
+                supply = self._ensure_supply(client, account_id)
+                self._put_into_supply(client, supply, tasks)
+        except (WbError, SecretUnavailable) as failure:
+            log.warning("кабинет %s: %d заданий со стикером не положены "
+                        "в поставку (%s)", account_external, len(tasks), failure)
+            return 0
+        log.info("кабинет %s: в поставку возвращено %d заданий со стикером",
+                 account_external, len(tasks))
+        return len(tasks)
 
     def _fetch_for_account(self, account_id: Any, tasks: list[dict[str, Any]]) -> int:
         account_external = tasks[0]["account_external_id"]

@@ -26,6 +26,9 @@ from .loop import Worker, configure_logging
 log = logging.getLogger("wms.outbox")
 
 BATCH = int(os.getenv("WMS_OUTBOX_BATCH", "200"))
+# На сколько пачка закрепляется за публикатором. Больше, чем занимает её
+# отправка, и меньше, чем человек готов ждать восстановления после падения.
+LEASE_SECONDS = int(os.getenv("WMS_OUTBOX_LEASE_SECONDS", "30"))
 IDLE_SECONDS = float(os.getenv("WMS_OUTBOX_IDLE_SECONDS", "0.2"))
 # Сколько дней держать опубликованное. Партиция удаляется целиком и только
 # если в ней не осталось ни одного неопубликованного события.
@@ -89,15 +92,18 @@ class OutboxPublisher:
     def _claim(self) -> list[dict[str, Any]]:
         """Короткая транзакция: прочитать пачку и сразу отпустить блокировки.
 
-        FOR UPDATE SKIP LOCKED здесь всё ещё нужен: он разводит двух
-        публикаторов, стартовавших одновременно, по разным пачкам.
+        Лизинг явный (`claimed_until`), а не только `FOR UPDATE SKIP LOCKED`:
+        блокировка строки живёт до конца запроса, а публикация начинается
+        после него — второй публикатор в это окно видел те же события
+        непубликованными и отправлял их второй раз.
         """
         with self._pool.connection() as connection:
             # Одиночный запрос без явной транзакции: блокировка строк всё равно
             # живёт ровно до конца этого запроса, а BEGIN/COMMIT вокруг него
             # только добавляют круг до сервера и промежуток idle in transaction.
             with single(connection) as cursor:
-                return [dict(row) for row in repo.pending_outbox(cursor, BATCH)]
+                return [dict(row) for row in repo.pending_outbox(
+                    cursor, BATCH, lease_seconds=LEASE_SECONDS)]
 
     def _maintain(self) -> None:
         """Партиции вперёд и чистка опубликованного.

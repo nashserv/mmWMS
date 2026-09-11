@@ -53,7 +53,9 @@ def cabinet(pool: ConnectionPool) -> dict:
     catalog.upsert_wb_account({
         "op": "upsert", "external_id": account, "seller_external_id": seller,
         "display_name": "Кабинет стикеров", "secret_ref": f"vault://mmx/test/{account}",
-        "mode": "live", "status": "ACTIVE"})
+        # Склад обязателен: без него остаток не публикуется вовсе, а не
+        # уезжает на чужой склад №1 (инвариант 7).
+        "mode": "live", "status": "ACTIVE", "wb_warehouse_id": 1})
     catalog.ensure_product({"seller_external_id": seller, "barcode": barcode})
     stock.apply_document({
         "seller_external_id": seller, "reference": unique("open"), "doc_type": "opening",

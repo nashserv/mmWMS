@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import httpx
+from urllib.parse import urlsplit
 
 from .config import LOCAL_ENVIRONMENTS, app_environment
 from .rate_limit import Pace
@@ -120,6 +121,10 @@ class WbClient:
         self._client = client or httpx.Client(timeout=timeout)
         self._owns_client = client is None
 
+    def _is_read(self, method: str, path: str) -> bool:
+        return (method.upper() in self.READ_ONLY_METHODS
+                or path in self.READING_POSTS)
+
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
@@ -142,8 +147,16 @@ class WbClient:
             "Accept": "application/json",
         }
 
+    # Методы, которые ЧИТАЮТ. Всё остальное пишет в кабинет клиента.
+    READ_ONLY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+    # `POST /api/v3/orders/status` и Content API читают, хотя и POST: у
+    # Wildberries список номеров не помещается в строку запроса.
+    READING_POSTS = frozenset({"/api/v3/orders/status", "/content/v2/get/cards/list"})
+
     def _call(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               json: Any = None) -> Any:
+        if not self._is_read(method, path):
+            _assert_write_target_is_safe(self._base_url)
         self._pace.wait()
         try:
             response = self._client.request(
@@ -348,6 +361,40 @@ def _sticker_bytes(payload: str, sticker_format: str) -> bytes:
         except Exception:
             return payload.encode("utf-8")
     return payload.encode("utf-8")
+
+
+# Хосты, куда разрешено ПИСАТЬ без явного подтверждения. Симулятор стенда и
+# ничего больше.
+SIMULATOR_HOSTS = frozenset({"wb-simulator", "127.0.0.1", "localhost", "::1"})
+
+
+class WbWriteRefused(RuntimeError):
+    """Запись направлена не в симулятор, и это не подтверждено явно."""
+
+
+def _assert_write_target_is_safe(base_url: str) -> None:
+    """Последние ворота перед записью в кабинет клиента.
+
+    Режим кабинета проверяется выше (`writes_allowed`), но он говорит «этому
+    кабинету писать можно», а не «писать можно ВОТ СЮДА». Одна переменная
+    окружения — `WB_API_URL=https://marketplace-api.wildberries.ru` на
+    стенде, — и стенд начинает создавать поставки в настоящем кабинете
+    клиента. Необратимо, и узнает об этом клиент, а не мы (раздел 12).
+
+    Разрешено: хост из `SIMULATOR_HOSTS`, либо явное
+    `WB_WRITES_TARGET=production` — единственный способ сказать «да, я
+    действительно пишу в боевой Wildberries».
+    """
+    target = (os.getenv("WB_WRITES_TARGET") or "").strip().lower()
+    if target == "production":
+        return
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host in SIMULATOR_HOSTS or target == "simulator":
+        return
+    raise WbWriteRefused(
+        f"запись в Wildberries по адресу {host!r} запрещена: это не симулятор "
+        f"стенда. Настоящий кабинет клиента пишется только при явном "
+        f"WB_WRITES_TARGET=production")
 
 
 def writes_allowed(mode: str) -> bool:

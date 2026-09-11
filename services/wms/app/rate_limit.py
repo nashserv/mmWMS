@@ -48,24 +48,34 @@ def take(cursor: Cursor, account_id: uuid.UUID, *, cost: int = 1) -> Permit:
     Окно выравнивается по минуте, а не скользит: у WB оно именно такое, и
     считать честнее так же, как считает он.
     """
+    # Явная пауза кабинета проверяется первой и живёт НЕ в минутном окне.
+    #
+    # Раньше `blocked_until` лежал у строки окна: со сменой минуты строка
+    # становилась другой, и пауза после 429 забывалась через считаные
+    # секунды. Кабинет шёл долбить Wildberries дальше, а WB считает повторные
+    # 429 поводом для настоящей блокировки.
+    cursor.execute(
+        "SELECT EXTRACT(EPOCH FROM (blocked_until - now())) AS wait "
+        "  FROM wb_account WHERE id = %s AND blocked_until > now()", (account_id,))
+    paused = cursor.fetchone()
+    if paused is not None:
+        return Permit(False, max(0.0, float(paused["wait"] or 0)), LIMIT_PER_MINUTE)
+
     cursor.execute(
         "INSERT INTO wb_rate_limit (account_id, window_start, used) "
         "VALUES (%(account)s, date_trunc('minute', now()), %(cost)s) "
         "ON CONFLICT (account_id, window_start) DO UPDATE SET "
         "    used = wb_rate_limit.used + %(cost)s "
         "  WHERE wb_rate_limit.used + %(cost)s <= %(limit)s "
-        "    AND (wb_rate_limit.blocked_until IS NULL OR wb_rate_limit.blocked_until <= now()) "
         "RETURNING used, "
         "          EXTRACT(EPOCH FROM (window_start + interval '1 minute' - now())) AS wait",
         {"account": account_id, "cost": cost, "limit": LIMIT_PER_MINUTE})
     row = cursor.fetchone()
     if row is None:
-        # Либо окно выбрано, либо кабинет под явной блокировкой. И то и другое
-        # значит одно: следующий вызов — после окна.
+        # Окно выбрано: следующий вызов — после окна.
         cursor.execute(
-            "SELECT used, GREATEST("
-            "    EXTRACT(EPOCH FROM (window_start + interval '1 minute' - now())), "
-            "    COALESCE(EXTRACT(EPOCH FROM (blocked_until - now())), 0)) AS wait "
+            "SELECT used, "
+            "       EXTRACT(EPOCH FROM (window_start + interval '1 minute' - now())) AS wait "
             "  FROM wb_rate_limit "
             " WHERE account_id = %s AND window_start = date_trunc('minute', now())",
             (account_id,))
@@ -75,16 +85,44 @@ def take(cursor: Cursor, account_id: uuid.UUID, *, cost: int = 1) -> Permit:
 
 
 def block(cursor: Cursor, account_id: uuid.UUID, seconds: float) -> None:
-    """Кабинет получил 429 или 409: придерживаем очередь до конца паузы."""
+    """Кабинет получил 429 или 409 ОТ WILDBERRIES: держим паузу до её конца.
+
+    Зовётся только на ответ настоящего WB. Собственный отказ ограничителя —
+    не повод придерживать кабинет: мы и так не пошли в сеть, а пауза после
+    своего же отказа удлиняет её на ровном месте и выглядит как блокировка со
+    стороны Wildberries.
+
+    Пауза пишется кабинету, а не строке минутного окна: она переживает минуту.
+    """
     cursor.execute(
-        "INSERT INTO wb_rate_limit (account_id, window_start, used, blocked_until) "
-        "VALUES (%(account)s, date_trunc('minute', now()), %(cost)s, "
-        "        now() + make_interval(secs => %(seconds)s)) "
+        "UPDATE wb_account SET blocked_until = "
+        "    GREATEST(COALESCE(blocked_until, now()), "
+        "             now() + make_interval(secs => %(seconds)s)) "
+        "  WHERE id = %(account)s",
+        {"account": account_id, "seconds": float(seconds)})
+    cursor.execute(
+        "INSERT INTO wb_rate_limit (account_id, window_start, used) "
+        "VALUES (%(account)s, date_trunc('minute', now()), %(cost)s) "
         "ON CONFLICT (account_id, window_start) DO UPDATE SET "
-        "    used = wb_rate_limit.used + %(cost)s, "
-        "    blocked_until = GREATEST(COALESCE(wb_rate_limit.blocked_until, now()), "
-        "                             now() + make_interval(secs => %(seconds)s))",
-        {"account": account_id, "cost": CONFLICT_COST, "seconds": float(seconds)})
+        "    used = wb_rate_limit.used + %(cost)s",
+        {"account": account_id, "cost": CONFLICT_COST})
+
+
+def retention(cursor: Cursor, *, days: int = 7) -> int:
+    """Чистит служебные журналы лимита и публикаций остатка.
+
+    На проде `integration_outbox` дорос до 136 210 записей без чистки
+    (раздел 3.6). `wb_rate_limit` растёт по строке на кабинет в минуту —
+    это полмиллиона строк в год на один кабинет, и все они нужны ровно
+    минуту.
+    """
+    removed = 0
+    for table, column in (("wb_rate_limit", "window_start"), ("wb_stock_push", "pushed_at")):
+        cursor.execute(
+            f"DELETE FROM {table} WHERE {column} < now() - make_interval(days => %s)",
+            (days,))
+        removed += cursor.rowcount
+    return removed
 
 
 class Pace:

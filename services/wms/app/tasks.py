@@ -318,19 +318,41 @@ class TaskOperations:
                 owner_id = row["owner_id"]
                 reservation = repo.held_reservation(cursor, row["id"], for_update=True)
                 if reservation is not None:
-                    # Товар возвращается ровно туда, откуда был взят: движения
-                    # резерва хранят точную раскладку по ячейкам и коробкам.
-                    for index, move in enumerate(repo.reservation_moves(
-                            cursor, reservation["id"])):
+                    # Товар возвращается туда, где он ЛЕЖИТ СЕЙЧАС, а не туда,
+                    # откуда его когда-то взяли. За время жизни резерва вещь
+                    # могли переложить — инвентаризацией, перемещением,
+                    # разбором коробки; возврат по историческим движениям писал
+                    # её в пустую ячейку и заводил там отрицательный остаток.
+                    left = int(reservation["qty"])
+                    places = repo.reserved_places(
+                        cursor, owner_id=row["owner_id"], sku_id=reservation["sku_id"],
+                        for_update=True)
+                    if not places:
+                        # Резерв есть, а зарезервированного товара в остатке
+                        # нет: клапан «собрать без остатка» (раздел 6.5).
+                        # Возвращаем туда, где резерв был взят.
+                        places = [{"cell_id": move["cell_to"], "box_id": move["box_to"],
+                                   "qty": int(move["qty"])}
+                                  for move in repo.reservation_moves(
+                                      cursor, reservation["id"])]
+                    for index, place in enumerate(places):
+                        if left <= 0:
+                            break
+                        qty = min(left, int(place["qty"]))
+                        left -= qty
                         repo.insert_move(
                             cursor, owner_id=row["owner_id"], sku_id=reservation["sku_id"],
-                            qty=int(move["qty"]),
-                            cell_from=move["cell_to"], cell_to=move["cell_to"],
-                            box_from=move["box_to"], box_to=move["box_to"],
+                            qty=qty,
+                            cell_from=place["cell_id"], cell_to=place["cell_id"],
+                            box_from=place["box_id"], box_to=place["box_id"],
                             state_from="reserved", state_to="good",
                             reason=release_reason.split(":")[0],
                             doc_type="reservation", doc_ref=str(reservation["id"]),
                             idem_key=f"release:{reservation['id']}:{idempotency}:{index}")
+                    if left > 0:
+                        log.warning("задание %s: резерв на %d единиц снят не полностью, "
+                                    "не нашлось %d — разбирать по /discrepancies",
+                                    row["id"], int(reservation["qty"]), left)
                     repo.release_reservation(cursor, reservation["id"], release_reason)
                     sku_ids.add(reservation["sku_id"])
 

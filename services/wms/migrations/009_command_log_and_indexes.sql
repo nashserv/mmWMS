@@ -81,3 +81,19 @@ CREATE INDEX IF NOT EXISTS discrepancy_task_idx
 -- события считал по ним наклейки. Наклейка одна, печатей сколько угодно.
 ALTER TABLE wb_label ADD COLUMN IF NOT EXISTS printed_at timestamptz;
 ALTER TABLE wb_label ADD COLUMN IF NOT EXISTS prints integer NOT NULL DEFAULT 0;
+
+-- 7. Пауза кабинета переживает минуту.
+--
+-- `blocked_until` лежал в `wb_rate_limit`, у строки минутного окна. Пауза
+-- после 429 у Wildberries — это минуты, а иногда часы: со сменой минуты
+-- строка становилась другой, и пауза забывалась. Кабинет шёл долбить WB
+-- дальше, а WB считает повторные 429 поводом для настоящей блокировки.
+ALTER TABLE wb_account ADD COLUMN IF NOT EXISTS blocked_until timestamptz;
+
+-- 8. Явный лизинг строк outbox.
+--
+-- `FOR UPDATE SKIP LOCKED` держит строку ровно до конца запроса: пачка
+-- прочитана, блокировки отпущены, а публикация только началась. Второй
+-- публикатор в этот момент видит те же строки непубликованными и отправляет
+-- их второй раз. Явный лизинг переживает конец запроса.
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS claimed_until timestamptz;

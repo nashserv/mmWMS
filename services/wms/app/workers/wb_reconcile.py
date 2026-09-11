@@ -54,13 +54,21 @@ PAGE = int(os.getenv("WB_RECONCILE_PAGE", "1000"))
 STATUS_BATCH = 1000
 # Ежедневный отчёт расхождений по owner × sku (раздел 11, шаг 2).
 REPORT_INTERVAL = float(os.getenv("WB_RECONCILE_REPORT_SECONDS", "86400"))
+# Сколько держать служебные журналы лимита и публикаций остатка.
+RETENTION_DAYS = int(os.getenv("WB_RETENTION_DAYS", "7"))
+# Страховочная полная публикация остатка (инвариант 7).
+SWEEP_INTERVAL = float(os.getenv("WB_STOCK_SWEEP_SECONDS", "600"))
 
 
 class WbReconcileWorker:
     def __init__(self, pool: ConnectionPool, *,
                  only_accounts: Sequence[str] | None = None,
-                 tasks: Any = None) -> None:
+                 tasks: Any = None,
+                 publish_stock: Any = None) -> None:
         self._pool = pool
+        # Страховка инварианта 7: раз в десять минут остаток публикуется
+        # целиком, что бы ни случилось с отдельными вызовами.
+        self._publish = publish_stock if publish_stock is not None else _default_publish(pool)
         # Операции над заданиями: сверка отменяет то, что отменил клиент у WB.
         # Передаётся снаружи, чтобы воркер не собирал половину сервиса сам.
         self._tasks = tasks if tasks is not None else _default_tasks(pool)
@@ -74,6 +82,9 @@ class WbReconcileWorker:
         # Первый отчёт — сразу после старта: если расхождения уже накопились,
         # узнать об этом надо не через сутки.
         self._next_report = 0.0
+        # А вот страховочная публикация не нужна сразу: на старте остаток
+        # только что опубликован тем, кто его двигал.
+        self._next_sweep = time.monotonic() + SWEEP_INTERVAL
 
     def tick(self) -> int:
         with self._pool.connection() as connection:
@@ -88,10 +99,55 @@ class WbReconcileWorker:
         for account in due:
             self._next_allowed[account["id"]] = time.monotonic() + INTERVAL
         self._refresh_gauge()
+        if time.monotonic() >= self._next_sweep:
+            self._republish_everything()
+            self._next_sweep = time.monotonic() + SWEEP_INTERVAL
         if time.monotonic() >= self._next_report:
             self._report()
+            self._retention()
             self._next_report = time.monotonic() + REPORT_INTERVAL
         return checked
+
+    def _republish_everything(self) -> None:
+        """Полная публикация остатка всех владельцев — страховка инварианта 7.
+
+        Публикация идёт сразу после движения, без таймеров, и это правильно.
+        Но потерянный вызов — упавший контейнер, сеть, 429 — оставляет остаток
+        в Wildberries расходящимся до следующего движения по тому же товару. У
+        редкого товара это недели.
+
+        Развёртка редкая (раз в десять минут) и намеренно тупая: взять всех
+        владельцев и сказать публикатору «эти изменились».
+        """
+        if self._publish is None:
+            return
+        try:
+            with self._pool.connection() as connection:
+                with single(connection) as cursor:
+                    owners = repo.owners_with_stock(cursor)
+            for owner_id, sku_ids in owners.items():
+                self._publish(owner_id, sku_ids)
+        except Exception:  # noqa: BLE001 — страховка не роняет сверку
+            log.exception("полная публикация остатка не удалась")
+            return
+        if owners:
+            log.info("страховочная публикация остатка: владельцев %d", len(owners))
+
+    def _retention(self) -> None:
+        """Чистит служебные журналы. На проде outbox дорос до 136 210 записей.
+
+        `wb_rate_limit` растёт по строке на кабинет в минуту — это полмиллиона
+        строк в год на один кабинет, и нужны они ровно минуту.
+        """
+        try:
+            with self._pool.connection() as connection:
+                with transaction(connection) as cursor:
+                    removed = rate_limit.retention(cursor, days=RETENTION_DAYS)
+        except Exception:  # noqa: BLE001 — уборка не роняет сверку
+            log.exception("уборка служебных журналов не удалась")
+            return
+        if removed:
+            log.info("убрано строк служебных журналов: %d", removed)
 
     def _reconcile(self, account: dict[str, Any]) -> int:
         # Спрашиваем адресно про свои незакрытые задания, а не читаем первую
@@ -252,6 +308,17 @@ def _default_tasks(pool: ConnectionPool) -> Any:
     except Exception:  # noqa: BLE001
         log.exception("не удалось собрать операции над заданиями: "
                       "сверка будет только отмечать расхождения")
+        return None
+
+
+def _default_publish(pool: ConnectionPool) -> Any:
+    """Публикатор остатка. Не роняет воркер, если собрать его не вышло."""
+    try:
+        from ..stock_push import publisher as stock_publisher_for
+        return stock_publisher_for(pool).notify
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось собрать публикатор остатка: "
+                      "страховка инварианта 7 отключена")
         return None
 
 
