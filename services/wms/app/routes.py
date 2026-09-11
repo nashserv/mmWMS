@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from typing import Any, Callable
 
 from fastapi import APIRouter, Request
@@ -184,10 +185,17 @@ def create_router(pool: ConnectionPool) -> APIRouter:
             except NotImplementedError as missing:
                 observe_http(501, time.monotonic() - started)
                 return _error(body, JSONRPC_NOT_IMPLEMENTED, str(missing))
-            except Exception as failure:                    # noqa: BLE001
-                log.exception("маршрут упал")
+            except Exception:                               # noqa: BLE001
+                # Текст исключения наружу не уходит НИКОГДА. В нём бывает
+                # фрагмент SQL, имя схемы, а у psycopg — и значения
+                # параметров: клиент получал кусок чужой строки вместе с
+                # отказом. Наружу — только номер, по которому эту же ошибку
+                # находят в логе целиком.
+                request_id = uuid.uuid4().hex[:12]
+                log.exception("маршрут упал, request_id=%s", request_id)
                 observe_http(500, time.monotonic() - started)
-                return _error(body, JSONRPC_INTERNAL, f"внутренняя ошибка: {failure}")
+                return _error(body, JSONRPC_INTERNAL,
+                              f"внутренняя ошибка, request_id={request_id}")
             observe_http(200, time.monotonic() - started)
             return _result(body, payload)
 
@@ -224,10 +232,14 @@ def create_router(pool: ConnectionPool) -> APIRouter:
             except ValueError as invalid:
                 observe_http(400, time.monotonic() - started)
                 return _error(body, JSONRPC_INVALID_PARAMS, str(invalid))
-            except Exception as failure:                    # noqa: BLE001
-                log.exception("маршрут %s упал", path)
+            except Exception:                               # noqa: BLE001
+                # Текст исключения наружу не уходит: в нём бывает фрагмент SQL
+                # и значения параметров. Наружу — только номер для лога.
+                request_id = uuid.uuid4().hex[:12]
+                log.exception("маршрут %s упал, request_id=%s", path, request_id)
                 observe_http(500, time.monotonic() - started)
-                return _error(body, JSONRPC_INTERNAL, f"внутренняя ошибка: {failure}")
+                return _error(body, JSONRPC_INTERNAL,
+                              f"внутренняя ошибка, request_id={request_id}")
             observe_http(200, time.monotonic() - started)
             return _result(body, payload)
 

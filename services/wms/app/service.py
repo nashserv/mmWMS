@@ -32,10 +32,17 @@ import psycopg
 from . import repositories as repo
 from .domain import ErrorCode, EventEnvelope, TaskState
 from .events import assert_no_secrets
-from .metrics import STOCK_SHORTFALL, track_lock
+from .metrics import STOCK_PUSH, STOCK_SHORTFALL, track_lock
 from .postgres import ConnectionPool, is_retryable, single, transaction
 
 log = logging.getLogger("wms.service")
+
+# Что можно завести документом. Совпадает с CHECK в миграции 004: незнакомое
+# значение роняло документ на вставке сообщением про ограничение схемы.
+DOCUMENT_TYPES = frozenset({"opening", "receipt", "adjustment", "move"})
+# Документом заводят годный товар и брак. `reserved` ставит только резерв:
+# проставить его документом значит завести бронь без задания.
+DOCUMENT_STATES = frozenset({"good", "defect"})
 
 TENANT_ID = os.getenv("MMX_TENANT_ID", "mm-express")
 
@@ -465,8 +472,13 @@ class WmsService:
             self._on_stock_changed(outcome.owner_id, outcome.moved_sku_ids)
         except Exception:
             # Публикация остатка не имеет права уронить резерв: задание уже
-            # заведено, товар уже удержан, и это важнее.
-            pass
+            # заведено, товар уже удержан, и это важнее. Но тихо проглотить
+            # её тоже нельзя: инвариант 7 обещает опубликованный остаток, и
+            # непрошедшая публикация — это его нарушение, а не мелочь.
+            STOCK_PUSH.labels(outcome="lost").inc()
+            log.exception("остаток клиента %s не отправлен на публикацию после "
+                          "резерва: инвариант 7 нарушен до следующего движения",
+                          outcome.owner_id)
 
 
 def _was_ledger_short(cursor: psycopg.Cursor, reservation_id: uuid.UUID) -> bool:
@@ -580,7 +592,11 @@ class CatalogOperations:
             return {"seller_external_id": seller, "cards": [], "next_cursor": None,
                     "generated_at": _now_iso()}
 
-        account = accounts[0]
+        # Кабинет называется явно, если у клиента их несколько. «Первый из
+        # списка» — это карточки чужого кабинета под видом своих: у клиента с
+        # двумя кабинетами ответ зависел от порядка строк в базе.
+        wanted_account = _text(params.get("wb_account_external_id"))
+        account = _sole_or_named(accounts, wanted_account, seller)
         with WbClient(account_external_id=account["external_id"],
                       secret_ref=account["secret_ref"]) as client:
             rows, next_cursor = client.cards(cursor=cursor_value, limit=limit)
@@ -692,8 +708,11 @@ class StockOperations:
             self._on_stock_changed(owner_id, sku_ids)
         except Exception:
             # Товар уже принят и записан в журнал. Непрошедшая публикация —
-            # повод для метрики, а не для отката приёмки.
-            pass
+            # повод для метрики и разбора, а не для отката приёмки. Молчать о
+            # ней нельзя: остаток в Wildberries разойдётся с нашим до
+            # следующего движения по тому же товару.
+            STOCK_PUSH.labels(outcome="lost").inc()
+            log.exception("остаток клиента %s не отправлен на публикацию", owner_id)
 
     def apply_document(self, params: dict[str, Any]) -> dict[str, Any]:
         """Складской документ: строки едут прямо в журнал (инвариант 3).
@@ -710,10 +729,19 @@ class StockOperations:
         lines = params.get("lines") or []
         if not seller or not reference or not lines:
             raise ValueError("seller_external_id, reference и lines обязательны")
+        if doc_type not in DOCUMENT_TYPES:
+            # `doc_type` уезжает в `stock_move.doc_type`, а там CHECK. Незнакомое
+            # значение роняло документ уже на вставке — сообщением про
+            # ограничение схемы, по которому не понять, что именно не так.
+            raise ValueError(
+                f"doc_type {doc_type!r} неизвестен: одно из "
+                f"{', '.join(sorted(DOCUMENT_TYPES))}")
 
+        owner_id: uuid.UUID | None = None
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
                 owner, _ = repo.upsert_owner(cursor, seller)
+                owner_id = owner["id"]
                 written = 0
                 touched: set[uuid.UUID] = set()
                 for index, line in enumerate(lines):
@@ -721,6 +749,14 @@ class StockOperations:
                     quantity = int(line.get("quantity") or 0)
                     if not barcode or quantity <= 0:
                         continue
+                    state = str(line.get("state") or "good").strip()
+                    if state not in DOCUMENT_STATES:
+                        # Документом заводят годный товар и брак. `reserved`
+                        # ставит только резерв, и позволить проставить его
+                        # документом значит завести бронь без задания.
+                        raise ValueError(
+                            f"строка {index}: состояние {state!r} документом не "
+                            f"проставляется, только {', '.join(sorted(DOCUMENT_STATES))}")
                     sku, _ = repo.upsert_sku(
                         cursor, owner["id"], barcode,
                         seller_sku=_text(line.get("seller_sku")), name=_text(line.get("name")))
@@ -736,7 +772,7 @@ class StockOperations:
                     move = repo.insert_move(
                         cursor, owner_id=owner["id"], sku_id=sku["id"], qty=quantity,
                         cell_to=cell["id"], box_to=box["id"] if box else None,
-                        state_to=str(line.get("state") or "good"),
+                        state_to=state,
                         reason=doc_type, doc_type=doc_type, doc_ref=reference,
                         # Владелец — часть ключа. Без него «ОТК-1» клиента A и
                         # «ОТК-1» клиента B — один и тот же ключ, и документ
@@ -746,7 +782,6 @@ class StockOperations:
                     if move is not None:
                         written += 1
                         touched.add(sku["id"])
-                    owner_id = owner["id"]
         # Транзакция закрыта — остаток можно публиковать (инвариант 2).
         self._announce(owner_id, touched)
         return {"reference": reference, "owner_external_id": seller,
@@ -947,3 +982,23 @@ def _json_or_none(value: Any) -> str | None:
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False)
+
+
+def _sole_or_named(accounts: list[dict[str, Any]], wanted: str | None,
+                   seller: str) -> dict[str, Any]:
+    """Единственный кабинет клиента либо названный явно.
+
+    «Первый из списка» у клиента с двумя кабинетами — это чужие карточки и
+    чужая поставка под видом своих: ответ зависел от порядка строк в базе.
+    """
+    if wanted:
+        for account in accounts:
+            if account["external_id"] == wanted:
+                return account
+        raise ValueError(
+            f"кабинет {wanted!r} не принадлежит клиенту {seller!r}")
+    if len(accounts) == 1:
+        return accounts[0]
+    raise ValueError(
+        f"у клиента {seller!r} кабинетов {len(accounts)}: назовите нужный в "
+        f"wb_account_external_id — иначе ответ зависит от порядка строк в базе")

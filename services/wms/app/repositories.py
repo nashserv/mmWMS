@@ -393,11 +393,19 @@ def ensure_box(cursor: Cursor, barcode: str, *, owner_id: uuid.UUID,
         "ON CONFLICT (barcode) DO UPDATE SET "
         "    sku_id = COALESCE(box.sku_id, EXCLUDED.sku_id), "
         "    cell_id = COALESCE(EXCLUDED.cell_id, box.cell_id) "
+        "  WHERE box.owner_id = EXCLUDED.owner_id "
         "RETURNING id, barcode, owner_id, sku_id, cell_id, quantity, counted, comment, state",
         {"id": uuid.uuid4(), "barcode": barcode, "owner": owner_id, "sku": sku_id,
          "cell": cell_id, "comment": comment, "actor": created_by})
     row = cursor.fetchone()
-    assert row is not None
+    if row is None:
+        # Ключ `box.barcode` глобален, а коробка принадлежит клиенту. Коробка
+        # с таким штрихкодом уже есть у ДРУГОГО клиента: `ON CONFLICT DO
+        # UPDATE` без проверки владельца перекладывал в неё чужой товар —
+        # изоляция владельца (инвариант 6) кончалась на штрихкоде коробки.
+        raise ValueError(
+            f"коробка {barcode!r} принадлежит другому клиенту: "
+            f"штрихкод коробки уникален на складе, а не у владельца")
     return row
 
 
@@ -1039,10 +1047,35 @@ def insert_receipt(cursor: Cursor, *, owner_id: uuid.UUID, reference: str,
 def insert_receipt_line(cursor: Cursor, *, receipt_id: uuid.UUID, sku_id: uuid.UUID,
                         expected_qty: int | None, actual_qty: int | None,
                         box_id: uuid.UUID | None, cell_id: uuid.UUID | None) -> None:
+    """Строка приёмки. Одна на товар и ячейку — приёмку досчитывают повтором.
+
+    Без ключа каждый повтор добавлял вторую строку про тот же товар, и
+    «сколько чего принято» переставало читаться из таблицы вовсе. Пересчёт
+    перезаписывает объявленное и фактическое, но не стирает уже
+    пересчитанное пустым значением.
+    """
     cursor.execute(
         "INSERT INTO receipt_line (id, receipt_id, sku_id, expected_qty, actual_qty, "
-        "                          box_id, cell_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        "                          box_id, cell_id) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (receipt_id, sku_id, cell_id) WHERE cell_id IS NOT NULL "
+        "DO UPDATE SET expected_qty = COALESCE(EXCLUDED.expected_qty, "
+        "                                      receipt_line.expected_qty), "
+        "              actual_qty = COALESCE(EXCLUDED.actual_qty, receipt_line.actual_qty), "
+        "              box_id = COALESCE(EXCLUDED.box_id, receipt_line.box_id)",
         (uuid.uuid4(), receipt_id, sku_id, expected_qty, actual_qty, box_id, cell_id))
+
+
+def receipt_is_fully_counted(cursor: Cursor, receipt_id: uuid.UUID) -> bool:
+    """Все ли строки приёмки пересчитаны — по таблице, а не по этому вызову.
+
+    Досчёт приходит только с недостающими строками: судить о готовности
+    приёмки по ним одним значит закрывать её, пока половина не пересчитана.
+    """
+    cursor.execute(
+        "SELECT count(*) AS n FROM receipt_line "
+        " WHERE receipt_id = %s AND actual_qty IS NULL", (receipt_id,))
+    row = cursor.fetchone()
+    return not (row and int(row["n"]))
 
 
 def set_receipt_state(cursor: Cursor, receipt_id: uuid.UUID, state: str) -> None:
@@ -1490,9 +1523,17 @@ def record_scan(cursor: Cursor, *, task_id: uuid.UUID, owner_id: uuid.UUID,
         return
     # Строки листа подбора ещё нет — сессию заводит поток B, а скан уже
     # случился. Заводим одиночную строку, чтобы факт не потерялся.
+    #
+    # `actor_id` — исполнитель задания, а НЕ свежий uuid4. Случайный
+    # идентификатор выглядел как настоящий человек: «кто это сделал»
+    # отвечалось числом, которого нет ни в одной системе, и вопрос «кто
+    # спотыкается на этой полке» оставался без ответа. Нет исполнителя — NULL,
+    # и это честно.
+    cursor.execute("SELECT assignee FROM wms_task WHERE id = %s", (task_id,))
+    holder = cursor.fetchone()
     cursor.execute(
         "INSERT INTO pick_session (id, actor_id, state) VALUES (%s, %s, 'picking') "
-        "RETURNING id", (uuid.uuid4(), uuid.uuid4()))
+        "RETURNING id", (uuid.uuid4(), holder["assignee"] if holder else None))
     session = cursor.fetchone()
     assert session is not None
     cursor.execute(

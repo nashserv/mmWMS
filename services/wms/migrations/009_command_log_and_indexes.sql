@@ -113,3 +113,23 @@ CREATE TABLE IF NOT EXISTS wb_order_rejected (
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
     seen         integer NOT NULL DEFAULT 1
 );
+
+-- 10. Лист подбора без исполнителя — законное состояние.
+--
+-- `record_scan` заводит одиночную строку листа, когда скан случился раньше,
+-- чем поток B открыл сессию. Исполнителя у такой строки может не быть, а
+-- `actor_id NOT NULL` заставлял подставлять свежий `uuid4()`. Случайный
+-- идентификатор выглядел как настоящий человек: на вопрос «кто это сделал»
+-- отвечало число, которого нет ни в одной системе.
+ALTER TABLE pick_session ALTER COLUMN actor_id DROP NOT NULL;
+
+-- 11. Строка приёмки — одна на товар и ячейку.
+--
+-- Приёмку в состоянии `counting` досчитывают повторным вызовом. Без ключа
+-- каждый повтор добавлял вторую строку про тот же товар, и «сколько чего
+-- принято» переставало читаться из таблицы вовсе.
+DELETE FROM receipt_line a USING receipt_line b
+ WHERE a.ctid < b.ctid AND a.receipt_id = b.receipt_id AND a.sku_id = b.sku_id
+   AND a.cell_id IS NOT DISTINCT FROM b.cell_id;
+CREATE UNIQUE INDEX IF NOT EXISTS receipt_line_one_per_place_idx
+    ON receipt_line (receipt_id, sku_id, cell_id) WHERE cell_id IS NOT NULL;

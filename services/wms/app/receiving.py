@@ -68,19 +68,32 @@ class ReceivingOperations:
                 # клиенту A приёмку клиента B вместе с чужими строками
                 # (инвариант 6).
                 existing = repo.receipt_by_reference(cursor, reference, owner["id"])
-                if existing is not None:
-                    # Повтор приёмки ничего не добавляет: тот же ответ, а не
-                    # второй приход товара (инвариант 5).
+                if existing is not None and existing["state"] != "counting":
+                    # Повтор закрытой приёмки ничего не добавляет: тот же
+                    # ответ, а не второй приход товара (инвариант 5).
                     return self._existing_receipt(cursor, existing, seller)
                 foreign = repo.receipt_by_reference(cursor, reference)
-                if foreign is not None:
+                if foreign is not None and foreign["owner_id"] != owner["id"]:
                     raise ValueError(
                         f"reference {reference!r} занят другим владельцем: "
                         f"номер документа уникален в пределах клиента")
-                warehouse = repo.ensure_warehouse(cursor, warehouse_code)
-                receipt = repo.insert_receipt(
-                    cursor, owner_id=owner["id"], reference=reference,
-                    warehouse_id=warehouse["id"], actor_id=actor)
+                if existing is not None:
+                    # Приёмка досчитывается. Часть строк была объявлена, но не
+                    # пересчитана, и приёмка встала в `counting`. Раньше повтор
+                    # возвращал её как есть — досчитать было НЕЧЕМ, и приёмка
+                    # висела незакрытой навсегда: событие о ней не уходило, и
+                    # счёт клиенту не выставлялся вовсе.
+                    #
+                    # Ключ идемпотентности движения — товар и ячейка, а не
+                    # номер строки: во втором вызове строки идут в другом
+                    # порядке, и по индексу уже принятое приняли бы дважды.
+                    receipt = existing
+                    warehouse = None
+                else:
+                    warehouse = repo.ensure_warehouse(cursor, warehouse_code)
+                    receipt = repo.insert_receipt(
+                        cursor, owner_id=owner["id"], reference=reference,
+                        warehouse_id=warehouse["id"], actor_id=actor)
 
                 accepted, accepted_qty, counted_all, discrepancies = 0, 0, True, []
                 for index, line in enumerate(lines):
@@ -122,7 +135,7 @@ class ReceivingOperations:
                             cell_to=cell["id"], box_to=box["id"] if box else None,
                             state_to="good", reason="receipt", doc_type="receipt",
                             doc_ref=reference, actor_id=actor,
-                            idem_key=f"receipt:{owner['id']}:{reference}:{index}")
+                            idem_key=f"receipt:{owner['id']}:{reference}:{barcode}:{cell['address']}")
                         touched.add(sku["id"])
                         accepted_qty += actual
                     accepted += 1
@@ -141,6 +154,10 @@ class ReceivingOperations:
                             "cell_address": cell["address"],
                             "created_at": _isoformat(created["created_at"])})
 
+                # Готовность считается по ТАБЛИЦЕ, а не по строкам этого
+                # вызова: досчёт приходит только с недостающими строками.
+                counted_all = counted_all and repo.receipt_is_fully_counted(
+                    cursor, receipt["id"])
                 state = "accepted" if counted_all else "counting"
                 repo.set_receipt_state(cursor, receipt["id"], state)
 

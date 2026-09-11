@@ -83,7 +83,8 @@ class ShipmentOperations:
         """Открывает поставку кабинета. Одна открытая на кабинет (приложение D)."""
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
-                owner, account = self._owner_and_account(cursor, seller)
+                owner, account = self._owner_and_account(
+                    cursor, seller, _text(params.get("wb_account_external_id")))
                 supply = repo.open_supply(cursor, account["id"])
                 shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
                                                 supply_id=supply["id"])
@@ -118,7 +119,8 @@ class ShipmentOperations:
 
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
-                owner, account = self._owner_and_account(cursor, seller)
+                owner, account = self._owner_and_account(
+                    cursor, seller, _text(params.get("wb_account_external_id")))
                 supply = repo.open_supply(cursor, account["id"])
                 shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
                                                 supply_id=supply["id"])
@@ -147,7 +149,8 @@ class ShipmentOperations:
     def _close(self, seller: str, params: dict[str, Any]) -> dict[str, Any]:
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
-                owner, account = self._owner_and_account(cursor, seller)
+                owner, account = self._owner_and_account(
+                    cursor, seller, _text(params.get("wb_account_external_id")))
                 supply = repo.supply_of_account(cursor, account["id"],
                                                 _text(params.get("wb_supply_id")))
                 shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
@@ -179,7 +182,8 @@ class ShipmentOperations:
         left_behind: list[int] = []
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
-                owner, account = self._owner_and_account(cursor, seller)
+                owner, account = self._owner_and_account(
+                    cursor, seller, _text(params.get("wb_account_external_id")))
                 supply = repo.supply_of_account(cursor, account["id"],
                                                 _text(params.get("wb_supply_id")))
                 shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
@@ -310,7 +314,8 @@ class ShipmentOperations:
         handed_by = _text(params.get("handed_over_by"))
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
-                owner, account = self._owner_and_account(cursor, seller)
+                owner, account = self._owner_and_account(
+                    cursor, seller, _text(params.get("wb_account_external_id")))
                 supply = repo.supply_of_account(cursor, account["id"],
                                                 _text(params.get("wb_supply_id")))
                 shipment = repo.ensure_shipment(cursor, owner_id=owner["id"],
@@ -356,7 +361,8 @@ class ShipmentOperations:
         """
         with self._pool.connection() as connection:
             with single(connection) as cursor:
-                owner, account = self._owner_and_account(cursor, seller)
+                owner, account = self._owner_and_account(
+                    cursor, seller, _text(params.get("wb_account_external_id")))
                 supply = repo.supply_of_account(cursor, account["id"],
                                                 _text(params.get("wb_supply_id")))
                 tasks = repo.tasks_of_supply(cursor, supply["id"])
@@ -422,17 +428,32 @@ class ShipmentOperations:
         from .tasks import _projection
         return {"tasks": [_projection(row) for row in rows], "next_cursor": None}
 
-    def _owner_and_account(self, cursor: Any, seller: str) -> tuple[dict, dict]:
+    def _owner_and_account(self, cursor: Any, seller: str,
+                           wanted: str | None = None) -> tuple[dict, dict]:
+        """Клиент и его кабинет. Несколько кабинетов — назвать нужный явно.
+
+        «Первый из списка» — это поставка в чужой кабинет: у клиента с двумя
+        кабинетами машина уезжала в тот, чья строка оказалась раньше в базе.
+        """
         owner = repo.find_owner(cursor, seller)
         if owner is None:
             raise ValueError(f"продавец {seller!r} не заведён")
         account = repo.sole_account_of_owner(cursor, owner["id"])
-        if account is None:
-            accounts = repo.accounts_of_owner(cursor, owner["id"])
-            if not accounts:
-                raise ValueError(f"у продавца {seller!r} нет кабинета Wildberries")
-            account = accounts[0]
-        return owner, account
+        if account is not None and not wanted:
+            return owner, account
+        accounts = repo.accounts_of_owner(cursor, owner["id"])
+        if not accounts:
+            raise ValueError(f"у продавца {seller!r} нет кабинета Wildberries")
+        if wanted:
+            for candidate in accounts:
+                if candidate["external_id"] == wanted:
+                    return owner, candidate
+            raise ValueError(f"кабинет {wanted!r} не принадлежит клиенту {seller!r}")
+        if len(accounts) > 1:
+            raise ValueError(
+                f"у клиента {seller!r} кабинетов {len(accounts)}: назовите нужный "
+                f"в wb_account_external_id — иначе поставка уедет в чужой")
+        return owner, accounts[0]
 
     @staticmethod
     def _view(shipment: dict[str, Any], supply: dict[str, Any], seller: str, *,
