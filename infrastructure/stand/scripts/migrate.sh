@@ -93,7 +93,10 @@ SQL
     psql_do --single-transaction \
         -v name="$name" -v sum="$sum" -v lock="$LOCK_ID" -v file="$file" <<'SQL'
 SELECT pg_advisory_xact_lock(:'lock'::bigint);
-\i :'file'
+-- Путь БЕЗ кавычек: `\i` берёт аргумент как есть, и `:'file'` передал бы
+-- ему имя вместе с кавычками. Путь наш собственный и пробелов не содержит;
+-- имя файла, которое идёт в SQL, экранируется отдельно (`:'name'`).
+\i :file
 INSERT INTO schema_migrations (filename, checksum)
 VALUES (:'name', :'sum')
 ON CONFLICT (filename) DO UPDATE SET checksum = EXCLUDED.checksum;
