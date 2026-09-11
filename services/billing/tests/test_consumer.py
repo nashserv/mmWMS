@@ -239,3 +239,32 @@ def test_a_warehouse_that_refuses_is_not_reported_as_missing_quantity() -> None:
 
     assert UnbilledReason.WAREHOUSE_UNAVAILABLE.value == "WAREHOUSE_UNAVAILABLE"
     assert UnbilledReason.WAREHOUSE_UNAVAILABLE is not UnbilledReason.NO_QUANTITY
+
+
+def test_the_storage_worker_says_out_loud_when_it_did_not_accrue(caplog) -> None:
+    """Отказ хранения виден в логе, а не только в счётчике.
+
+    Пока воркер ходил в закрытый склад без токена, лог молчал: строка писалась
+    только про начисленное. Хранение не начислялось никому, и узнать об этом
+    можно было лишь по счётчику — а счётчик смотрят, когда уже загорелось.
+    """
+    import logging
+    import threading
+
+    from app import worker
+
+    class Refusing:
+        def accrue_storage(self, day, places, tenant):  # noqa: ANN001, ARG002
+            return [{"outcome": "unbilled", "reason": "WAREHOUSE_UNAVAILABLE",
+                     "seller": "кабинет-1", "detail": "401 нужен Bearer-токен"},
+                    {"outcome": "unbilled", "reason": "WAREHOUSE_UNAVAILABLE",
+                     "seller": "кабинет-2", "detail": "401 нужен Bearer-токен"}]
+
+    loop = worker.StorageLoop(Refusing(), threading.Event())
+    with caplog.at_level(logging.WARNING):
+        loop.once()
+
+    said = "\n".join(record.getMessage() for record in caplog.records)
+    assert "не начислено" in said, "воркер промолчал об отказе хранения"
+    assert "WAREHOUSE_UNAVAILABLE" in said, "в логе нет причины отказа"
+    assert "кабинет-1" in said, "в логе нет ни одного кабинета из отказавших"

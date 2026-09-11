@@ -642,6 +642,8 @@ ODOO_WMS_URL: http://wms:8080/api/mmx/wms/v1
 | Воркер хранения представляется складу сервисным токеном | `2e0d823` | `test_the_storage_worker_introduces_itself_to_the_warehouse` |
 | `billing-worker` получает `SERVICE_TOKEN` в compose — без него код бессилен | `2e0d823` | тот же тест на стенде: запрос отвечает 200, а не 401 |
 | Отказ склада получил свою причину `WAREHOUSE_UNAVAILABLE` и больше не маскируется под «нет количества» | `2e0d823` | `test_a_warehouse_that_refuses_is_not_reported_as_missing_quantity` |
+| Воркер логировал только начисленное: пока хранение не начислялось никому, в логе было пусто | `TBD` | `test_the_storage_worker_says_out_loud_when_it_did_not_accrue` |
+| Воркер тикал, не дождавшись склада: на каждом подъёме стенда — сутки хранения «недоступен» по всем кабинетам сразу | `TBD` | `depends_on: wms: service_healthy`; прирост счётчика после подъёма — ноль |
 
 После починки `/storage/lookup` отвечает 200 и на неизвестного склада
 клиента — пустым списком мест, а не отказом. Кабинет без коробок за хранение

@@ -248,6 +248,11 @@ services:
     healthcheck:
       # Готовность — доступность базы, а не «процесс жив». Мониторинг, следящий
       # за портом вместо работы, — раздел 3.5.
+      #
+      # Её ждёт не только человек: воркер хранения биллинга спрашивает у склада
+      # коробко-места первым же тактом после старта. Без ожидания он на каждом
+      # подъёме стенда помечает сутки хранения «склад недоступен» по всем
+      # кабинетам сразу — шум ровно той формы, которую алерт обязан ловить.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
       interval: 10s
       timeout: 5s
@@ -742,6 +747,9 @@ services:
         GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
+      # Склад — не роскошь, а источник данных: воркер хранения спрашивает у
+      # него коробко-места первым же тактом.
+      wms: {condition: service_healthy}
       billing-seed: {condition: service_completed_successfully}
       rabbitmq: {condition: service_healthy}
       rabbitmq-init: {condition: service_completed_successfully}

@@ -23,6 +23,7 @@ import signal
 import sys
 import threading
 import time
+from collections import Counter
 from datetime import timedelta
 from typing import Any
 
@@ -97,6 +98,20 @@ class StorageLoop:
             accrued = [row for row in results if row["outcome"] == "accrued"]
             if accrued:
                 log.info("хранение за %s: начислено кабинетам %d", day, len(accrued))
+            # Отказы — тоже в лог, и с причиной.
+            #
+            # Логировались только успехи. Пока воркер ходил в закрытый склад
+            # без токена, в логе было пусто: ни одной строки о том, что
+            # хранение не начислено НИ ОДНОМУ кабинету. Видно это было только
+            # в счётчике, а счётчик смотрят, когда уже загорелось.
+            refused = [row for row in results if row["outcome"] == "unbilled"]
+            if refused:
+                reasons = Counter(str(row.get("reason")) for row in refused)
+                log.warning(
+                    "хранение за %s: не начислено кабинетам %d (%s); первый: %s — %s",
+                    day, len(refused),
+                    ", ".join(f"{name} × {count}" for name, count in reasons.most_common()),
+                    refused[0].get("seller"), str(refused[0].get("detail"))[:200])
 
 
 class OutboxLoop:
