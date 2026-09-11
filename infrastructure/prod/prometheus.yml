@@ -1,0 +1,93 @@
+# Prometheus боевого контура. Отличается от стендового одним: здесь нет
+# симулятора Wildberries — его цели убраны, а не оставлены «на всякий
+# случай». Цель, которая никогда не отвечает, учит дежурного не смотреть
+# на красное.
+# Опрос стенда. Цели — сервисы, которые обязаны отвечать метриками работы,
+# а не только признаком «процесс жив» (урок раздела 3.5 мастера).
+#
+# Цель здесь ОБЯЗАНА быть у каждого процесса, который что-то делает. В боевом
+# контуре четыре воркера стояли Up с зелёным healthcheck и нулём строк лога —
+# и увидеть это было нечем: метрики они считали, забирать их было некому.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+  - /etc/prometheus/workstation-alerts.yml
+
+# Куда уходят сработавшие алерты. Без этой секции Prometheus считает их
+# молча: правило горит, а не знает об этом никто — то же молчание, только с
+# графиком.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: wms
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["wms:8080"]
+
+  # Воркеры wms. У каждого свой порт (WMS_METRICS_PORT в compose): без цели
+  # здесь «воркер молчит» остаётся незамеченным (инвариант 14).
+  - job_name: wms-wb-sync
+    static_configs:
+      - targets: ["wms-wb-sync:9101"]
+  - job_name: wms-wb-labels
+    static_configs:
+      - targets: ["wms-wb-labels:9102"]
+  - job_name: wms-wb-reconcile
+    static_configs:
+      - targets: ["wms-wb-reconcile:9103"]
+  - job_name: wms-outbox
+    static_configs:
+      - targets: ["wms-outbox:9104"]
+
+  # Деньги. Консьюмер и публикатор — отдельными целями: молчащий консьюмер
+  # это неоплаченная работа, и выглядит она как тишина.
+  - job_name: billing
+    static_configs:
+      - targets: ["billing:8080"]
+  - job_name: billing-inbox-consumer
+    static_configs:
+      - targets: ["billing-inbox-consumer:8081"]
+  - job_name: billing-worker
+    static_configs:
+      - targets: ["billing-worker:8081"]
+
+  # Рабочее место и агент печати (заявка 3 потока B).
+  - job_name: workstation
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["workstation:8080"]
+  # Агент печати живёт НЕ в контуре, а на компьютере оператора: он говорит с
+  # USB-принтером, которого в контейнере нет. Адрес подставляется под конкретную
+  # стойку при развёртывании; пока он не заменён, цель будет красной — и это
+  # правильнее, чем убрать её и не заметить, что печать не наблюдается вовсе.
+  - job_name: workstation-print-agent
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ЗАМЕНИТЬ-НА-АДРЕС-СТОЙКИ:8091"]
+
+  - job_name: portal
+    static_configs:
+      - targets: ["portal:8080"]
+  - job_name: internal-admin
+    static_configs:
+      - targets: ["internal-admin:8080"]
+  - job_name: identity
+    static_configs:
+      - targets: ["identity:8080"]
+
+  # Инфраструктура. Postgres и RabbitMQ — не «чужая зона»: очередь, доросшая
+  # до диска, и база с нехваткой соединений выглядят как «склад тормозит».
+  - job_name: rabbitmq
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
