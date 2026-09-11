@@ -21,6 +21,7 @@ import hashlib
 import os
 import pathlib
 import uuid
+from datetime import date
 from dataclasses import dataclass
 from typing import Any
 from collections.abc import Iterator
@@ -308,6 +309,15 @@ def walk_every_route(walk: Walk) -> None:
     walk.post("/boxes/remove", params={"barcode": f"CONF-BOX-{tag}-2", "reason": "проверка контракта"})
     walk.post("/storage/lookup", params={"seller_external_id": seller, "barcode": barcode})
     walk.post("/storage/count", params={"seller_external_id": seller, "barcode": barcode})
+    # Хранение: сколько коробо-мест занимал товар на конец суток и правка нормы
+    # «сколько единиц входит в короб» (контракт 1.4.0, решение владельца
+    # 12.09.2026). День обязателен — умолчание «сегодня» и было той поломкой,
+    # из-за которой досчёт за прошлые сутки считался по сегодняшнему остатку.
+    walk.post("/storage/places",
+              params={"seller_external_id": seller, "day": date.today().isoformat()})
+    walk.post("/catalog/units-per-box",
+              params={"seller_external_id": seller, "barcode": barcode,
+                      "units_per_box": 44})
 
     walk.post("/shipments", params={"seller_external_id": seller, "action": "open",
                                     "idempotency_key": f"conf-ship-{tag}"})

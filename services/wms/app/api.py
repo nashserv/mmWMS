@@ -55,6 +55,14 @@ def _result(request_body: Any, payload: Any) -> JSONResponse:
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": payload})
 
 
+def _error(request_body: Any, code: int, message: str) -> JSONResponse:
+    """Отказ в форме JSON-RPC. Заглушка обязана отказывать так же, как сервис:
+    расхождение в форме отказа ловится позже всего и дороже всего."""
+    request_id = request_body.get("id", 1) if isinstance(request_body, dict) else 1
+    return JSONResponse({"jsonrpc": "2.0", "id": request_id,
+                         "error": {"code": code, "message": message}})
+
+
 async def _body(request: Request) -> Any:
     try:
         return await request.json()
@@ -353,6 +361,44 @@ async def storage_lookup(request: Request) -> JSONResponse:
         "owner_external_id": seller,
         "placements": [row for row in state.placements_for(seller)
                        if not params.get("barcode") or row["barcode"] == params["barcode"]]})
+
+
+@router.post("/storage/places")
+async def storage_places(request: Request) -> JSONResponse:
+    """Коробо-места на конец суток — в заглушке от числа размещений.
+
+    Заглушка обязана отвечать в форме контракта, а не «примерно так»: ровно на
+    этом ловятся расхождения между ней и сервисом (заявка 4 потока B). Числа
+    здесь выдуманные, форма — настоящая.
+    """
+    body = await _body(request)
+    params = _params(body)
+    seller = params.get("seller_external_id")
+    if not params.get("day"):
+        return _error(body, -32602, "day обязателен: остаток берётся на конец этих суток")
+    placements = state.placements_for(seller)
+    return _result(body, {
+        "seller_external_id": seller,
+        "day": params["day"],
+        "places": round(sum(int(row.get("quantity") or 0) for row in placements) / 44, 2),
+        "skus_without_norm": 0,
+        "units_without_norm": 0})
+
+
+@router.post("/catalog/units-per-box")
+async def catalog_units_per_box(request: Request) -> JSONResponse:
+    """Правка нормы. В заглушке — эхо: своего каталога у неё нет."""
+    body = await _body(request)
+    params = _params(body)
+    if not params.get("seller_external_id") or not params.get("barcode"):
+        return _error(body, -32602, "seller_external_id и barcode обязательны")
+    units = params.get("units_per_box")
+    if units is not None and int(units) <= 0:
+        return _error(body, -32602, "норма должна быть больше нуля")
+    return _result(body, {
+        "seller_external_id": params["seller_external_id"],
+        "barcode": params["barcode"],
+        "units_per_box": units})
 
 
 @router.post("/storage/count")
