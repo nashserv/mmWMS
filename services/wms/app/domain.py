@@ -81,16 +81,43 @@ WB_STATUS_TO_STATE: dict[str, str] = {
 }
 
 
-def agrees_with_wb(state: str, wb_status: str | None) -> bool:
+# Состояния, для которых `confirm` у WB — норма, если задание уже лежит в
+# накопительной поставке.
+#
+# Стикер выдаётся только заданию, положенному в поставку, — это требование WB
+# (раздел 3.3), и воркер стикеров кладёт заказ туда сразу после резерва
+# (раздел 6.6). После этого WB отвечает `confirm`, а таблица 1 ждёт для
+# `reserved` статус `new` — и КАЖДОЕ задание через минуту уходило в `diverged`.
+#
+# Это не расхождение: наше состояние про физическую работу на складе («ещё не
+# собрано»), статус WB — про то, что заказ прикреплён к поставке. Они про
+# разное и одновременно верны.
+IN_SUPPLY_TOLERATES_CONFIRM = frozenset({
+    TaskState.RESERVED.value,
+    TaskState.PICKING.value,
+    TaskState.PICKED.value,
+    TaskState.PACKED.value,
+    TaskState.LABELED.value,
+})
+
+
+def agrees_with_wb(state: str, wb_status: str | None, *, in_supply: bool = False) -> bool:
     """Согласуются ли наше состояние и статус Wildberries.
 
     `diverged` согласуется с чем угодно: расхождение уже зафиксировано, и
     заново расходиться ему некуда. Неизвестный статус WB считается
     расхождением — незнакомое значение разбирает человек, а не догадка.
+
+    `in_supply` — задание уже в накопительной поставке (`supply_id` не пуст).
+    Тогда `confirm` у WB законен и для состояний подбора: см. комментарий к
+    `IN_SUPPLY_TOLERATES_CONFIRM`.
     """
     if state == TaskState.DIVERGED.value:
         return True
     if wb_status is None:
+        return True
+    if (in_supply and wb_status == "confirm"
+            and state in IN_SUPPLY_TOLERATES_CONFIRM):
         return True
     return EXPECTED_WB_STATUS.get(state) == wb_status
 

@@ -210,8 +210,13 @@ class TaskOperations:
         if not event_id:
             raise ValueError("cancellation_event_id обязателен: это ключ идемпотентности")
         handed_over = bool(params.get("handed_over"))
-        reason = ("отменено после передачи в доставку — разбор возврата"
-                  if handed_over else f"отменено по событию {event_id}")
+        # Причина явная, если её дали: «отменено у Wildberries (заказ 12345)»
+        # разбирается человеком, а «отменено по событию wb-cancel-12345» —
+        # нет. Пустую причину схема не пропустит (инвариант 11), поэтому
+        # подстановка остаётся.
+        reason = _text(params.get("reason")) or (
+            "отменено после передачи в доставку — разбор возврата"
+            if handed_over else f"отменено по событию {event_id}")
         return self._unwind(task_id, reason=reason, state=TaskState.CANCELLED.value,
                             release_reason=f"cancelled: {event_id}",
                             event="wms.order.cancelled.v1", idempotency=event_id,

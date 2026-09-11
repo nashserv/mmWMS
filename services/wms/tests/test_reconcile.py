@@ -17,12 +17,18 @@ from app import repositories as repo
 from app.domain import agrees_with_wb
 from app.postgres import ConnectionPool, single
 from app.service import CatalogOperations, StockOperations, WmsService
+from app.wb import WbClient
+from app.workers.wb_labels import WbLabelWorker
 from app.workers.wb_reconcile import WbReconcileWorker
 from app.workers.wb_sync import WbSyncWorker
 
 from dbfixtures import require_database, unique
 
 SIMULATOR = (os.getenv("WB_SIMULATOR_URL") or "http://127.0.0.1:8090").rstrip("/")
+
+# Ссылка на настоящий постраничный метод: тест ниже подменяет его на отказ
+# и обязан вернуть на место именно исходный, а не свою же подмену.
+_ORDERS_PAGE = WbClient.orders
 
 
 @pytest.fixture(scope="module")
@@ -249,3 +255,158 @@ def test_the_divergence_report_is_written_down_and_not_only_logged(
     assert saved[0]["state"] == "diverged"
     assert saved[0]["wb_status"] == "complete"
     assert int(saved[0]["tasks"]) == len(order_ids)
+
+
+# --------------------------------------------------- поставка, отмена, пропажа
+
+@pytest.fixture()
+def live_cabinet(pool: ConnectionPool) -> dict:
+    """Кабинет, которому разрешено писать в WB: без этого не собрать поставку."""
+    catalog, stock = CatalogOperations(pool), StockOperations(pool)
+    seller, account = unique("seller"), unique("wb")
+    barcode = f"46{uuid.uuid4().int % 10**11:011d}"
+    catalog.upsert_owner({"seller_external_id": seller, "name": "Сверка и поставка"})
+    catalog.upsert_wb_account({
+        "op": "upsert", "external_id": account, "seller_external_id": seller,
+        "display_name": "Кабинет поставки", "secret_ref": f"vault://mmx/test/{account}",
+        "mode": "live", "status": "ACTIVE"})
+    catalog.ensure_product({"seller_external_id": seller, "barcode": barcode})
+    stock.apply_document({
+        "seller_external_id": seller, "reference": unique("open"), "doc_type": "opening",
+        "lines": [{"barcode": barcode, "quantity": 10,
+                   "cell_address": unique("cell").upper(), "state": "good"}]})
+    return {"seller": seller, "account": account, "barcode": barcode}
+
+
+def _by_state(pool: ConnectionPool, seller: str) -> dict[str, int]:
+    """Остаток владельца по состояниям. `stock_balance` — проекция (инвариант 1)."""
+    return {row["state"]: int(row["qty"]) for row in rows(
+        pool, "SELECT b.state, sum(b.qty) AS qty FROM stock_balance b "
+              "  JOIN owner o ON o.id = b.owner_id "
+              " WHERE o.seller_external_id = %s GROUP BY b.state", (seller,))}
+
+
+def test_an_order_inside_a_supply_is_not_a_divergence(
+        pool: ConnectionPool, live_cabinet: dict) -> None:
+    """Задание в поставке законно имеет у WB статус `confirm`.
+
+    Стикеры берутся заранее (инвариант 9), а стикер WB выдаёт только заданию,
+    уже положенному в поставку. Значит сразу после резерва заказ у WB —
+    `confirm`, а у нас — `reserved`. Таблица 1 ждала `new`, и каждое живое
+    задание уходило в `diverged` в течение минуты: сверка отменяла работу
+    стикеровщика, а склад получал остановленные задания на ровном месте.
+    """
+    order_ids = seed(live_cabinet["account"], 2, live_cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[live_cabinet["account"]]).tick()
+    fetched = WbLabelWorker(pool, only_accounts=[live_cabinet["account"]]).tick()
+    assert fetched == 2, "стикеры не взяты — проверять нечего"
+
+    WbReconcileWorker(pool, only_accounts=[live_cabinet["account"]]).tick()
+
+    tasks = rows(pool, "SELECT state, wb_status, supply_id FROM wms_task "
+                       " WHERE wb_order_id = ANY(%s)", (order_ids,))
+    assert tasks and all(task["supply_id"] for task in tasks), "заказ не в поставке"
+    assert all(task["wb_status"] == "confirm" for task in tasks), \
+        "WB не вернул confirm — сцена не воспроизведена"
+    assert all(task["state"] == "reserved" for task in tasks), (
+        "задание ушло в diverged из-за собственной же поставки: "
+        f"состояния {[task['state'] for task in tasks]}")
+
+
+def test_a_cancellation_at_wildberries_cancels_the_task_and_frees_the_stock(
+        pool: ConnectionPool, cabinet: dict) -> None:
+    """Отмена у WB — команда, а не расхождение.
+
+    В боевом контуре 2645 отмен лежали с пустой причиной, а товар оставался в
+    резерве под заказ, которого больше нет: склад собирал бы его вручную.
+    Отмена обязана снять резерв, вернуть товар в good и записать разбираемую
+    причину (инвариант 11).
+    """
+    order_ids = seed(cabinet["account"], 1, cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    before = _by_state(pool, cabinet["seller"])
+    assert before.get("reserved") == 1, "резерв не встал — отменять нечего"
+
+    httpx.post(f"{SIMULATOR}/__stand__/cancel-orders", timeout=10.0,
+               json={"account": cabinet["account"], "orders": order_ids}).raise_for_status()
+
+    WbReconcileWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    task = rows(pool, "SELECT state, cancel_reason FROM wms_task WHERE wb_order_id = %s",
+                (order_ids[0],))[0]
+    assert task["state"] == "cancelled", (
+        f"состояние {task['state']}: заказ отменён у клиента, а задание живо — "
+        f"склад соберёт то, чего никто не ждёт")
+    assert task["cancel_reason"] and str(order_ids[0]) in task["cancel_reason"], \
+        f"причина отмены не разбираема: {task['cancel_reason']!r}"
+
+    after = _by_state(pool, cabinet["seller"])
+    assert after.get("reserved", 0) == 0, "резерв не снят под отменённый заказ"
+    assert after.get("good", 0) == before.get("good", 0) + 1, "товар не вернулся в good"
+
+    held = rows(pool, "SELECT r.state FROM reservation r JOIN wms_task t ON t.id = r.task_id "
+                      " WHERE t.wb_order_id = %s", (order_ids[0],))
+    assert held and all(row["state"] == "released" for row in held), "резерв остался held"
+
+
+def test_reconciliation_asks_about_our_own_tasks_not_the_first_page(
+        pool: ConnectionPool, cabinet: dict) -> None:
+    """Сверка спрашивает поимённо про свои незакрытые задания.
+
+    `GET /api/v3/orders` отдаёт историю кабинета с курсором, и её первая
+    страница — самые старые заказы за всё время. Открытое задание, за которым
+    у WB накопилась тысяча более ранних, в эту страницу не попадает никогда:
+    его расхождения не видит никто, а кабинет при этом числится сверенным.
+    """
+    order_ids = seed(cabinet["account"], 1, cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    asked: list[list[int]] = []
+    real_status = WbClient.orders_status
+
+    def watch(self, order_ids_arg):
+        asked.append([int(value) for value in order_ids_arg])
+        return real_status(self, order_ids_arg)
+
+    def refuse_page(*_args, **_kwargs):
+        raise AssertionError(
+            "сверка снова читает первую страницу GET /api/v3/orders: "
+            "открытые задания старше тысячи заказов она так не увидит")
+
+    WbClient.orders_status, WbClient.orders = watch, refuse_page
+    try:
+        WbReconcileWorker(pool, only_accounts=[cabinet["account"]]).tick()
+    finally:
+        WbClient.orders_status, WbClient.orders = real_status, _ORDERS_PAGE
+
+    assert asked, "сверка не спросила статусы поимённо"
+    assert order_ids[0] in asked[0], "нашего задания нет в запросе статусов"
+
+
+def test_a_task_wildberries_does_not_know_raises_an_alarm(
+        pool: ConnectionPool, cabinet: dict, caplog: pytest.LogCaptureFixture) -> None:
+    """Задание, о котором WB промолчал, — находка, а не тишина.
+
+    Молчание значит, что заказа в кабинете нет: подменили токен, смотрим не
+    тот кабинет, заказ удалён. Раньше такое задание просто не попадало в
+    выборку и жило у нас вечно.
+    """
+    seed(cabinet["account"], 1, cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    # Наше задание есть, а у WB такого заказа нет вовсе.
+    ghost = 990_000_000 + uuid.uuid4().int % 9_000_000
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "UPDATE wms_task SET wb_order_id = %s, last_reconciled_at = NULL "
+                "  WHERE wb_account_id = (SELECT id FROM wb_account WHERE external_id = %s)",
+                (ghost, cabinet["account"]))
+
+    with caplog.at_level("ERROR", logger="wms.wb_reconcile"):
+        WbReconcileWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    assert any("не знает" in record.getMessage() for record in caplog.records), (
+        "пропавшее у WB задание не подняло алерта: "
+        f"{[record.getMessage() for record in caplog.records]}")

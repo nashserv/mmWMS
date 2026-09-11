@@ -143,6 +143,37 @@ class Simulator:
             page = rows[next_cursor:]
             return page, next_cursor + len(page)
 
+    def statuses(self, account: str, order_ids: list[int]) -> list[dict[str, Any]]:
+        """Статусы заказов поимённо. `POST /api/v3/orders/status` у WB.
+
+        Отвечает только про заказы этого кабинета и только про те, которые
+        знает: о неизвестном номере WB молчит, и симулятор молчит так же —
+        иначе сверка никогда не увидит «задание пропало из кабинета».
+        """
+        with self._lock:
+            wanted = set(order_ids)
+            return [{"id": order["id"], "supplierStatus": order["supplierStatus"],
+                     "wbStatus": order["wbStatus"]}
+                    for order in self._orders
+                    if order["account"] == account and order["id"] in wanted]
+
+    def cancel_orders(self, account: str, order_ids: list[int]) -> int:
+        """Ручка стенда: клиент отменил заказы в кабинете.
+
+        У настоящего WB отмену делает покупатель или продавец, и наружу она
+        видна только статусом `cancel`. Ручки «отмени» в API нет, поэтому она
+        здесь, под префиксом `__stand__`.
+        """
+        with self._lock:
+            changed = 0
+            wanted = set(order_ids)
+            for order in self._orders:
+                if order["account"] == account and order["id"] in wanted:
+                    order["supplierStatus"] = "cancel"
+                    order["wbStatus"] = "canceled"
+                    changed += 1
+            return changed
+
     def create_supply(self, account: str) -> str:
         with self._lock:
             supply_id = f"WB-GI-{self._next_supply:08d}"
@@ -215,6 +246,20 @@ async def get_orders(request: Request, next: int = 0, limit: int = 1000) -> Any:
         return limited
     rows, cursor = simulator.orders(account, next)
     return {"next": cursor, "orders": rows[:limit]}
+
+
+@app.post("/api/v3/orders/status")
+async def orders_status(request: Request) -> Any:
+    """Статусы заданий поимённо, пачкой до 1000 (приложение D)."""
+    account = _account(request)
+    if (limited := _rate_limited(account)) is not None:
+        return limited
+    body = await request.json()
+    order_ids = [int(value) for value in (body.get("orders") or [])]
+    if len(order_ids) > 1000:
+        return JSONResponse({"code": 400, "message": "не более 1000 заданий за вызов"},
+                            status_code=400)
+    return {"orders": simulator.statuses(account, order_ids)}
 
 
 @app.post("/api/v3/orders/stickers")
@@ -312,6 +357,21 @@ async def seed_orders(request: Request) -> Any:
         barcode=str(body.get("barcode", "2000000000011")),
         deadline=body.get("deadline"))
     return {"created": len(created), "orders": created}
+
+
+@app.post("/__stand__/cancel-orders")
+async def cancel_orders(request: Request) -> Any:
+    """Ручка стенда: отменить заказы в кабинете.
+
+    Отмена у WB — то, что боевой контур не обрабатывал вовсе: 2645 отмен
+    лежали с пустой причиной. Чтобы проверять её на стенде, отмену надо уметь
+    устроить.
+    """
+    body = await request.json()
+    changed = simulator.cancel_orders(
+        account=str(body.get("account", "default")),
+        order_ids=[int(value) for value in (body.get("orders") or [])])
+    return {"cancelled": changed}
 
 
 @app.post("/content/v2/get/cards/list")

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 
@@ -175,6 +175,33 @@ class WbClient:
         body = self._call("GET", "/api/v3/orders", params={"next": cursor, "limit": limit})
         rows = body.get("orders") or []
         return [WbOrder.from_wb(row) for row in rows], int(body.get("next", cursor))
+
+    # Адресная сверка: не "что лежит на первой странице", а "что со списком
+    # наших заданий". `GET /api/v3/orders` отдаёт историю с курсором, и сверка
+    # по её первой странице видит первую тысячу заказов кабинета за всё время
+    # — то есть самые старые, давно закрытые. Открытое задание месячной
+    # давности в такой ответ не попадает никогда, и его расхождения не видит
+    # никто.
+    ORDERS_STATUS_BATCH = 1000
+
+    def orders_status(self, order_ids: Sequence[int]) -> dict[int, str]:
+        """`POST /api/v3/orders/status` — статусы поимённо, пачкой до 1000.
+
+        Возвращается отображение «номер заказа → supplierStatus». Заказа, о
+        котором WB промолчал, в словаре нет: это не «согласуется», это «WB его
+        не знает», и разбирать такое обязан вызывающий (инвариант 10).
+        """
+        result: dict[int, str] = {}
+        ids = [int(value) for value in order_ids]
+        for start in range(0, len(ids), self.ORDERS_STATUS_BATCH):
+            chunk = ids[start:start + self.ORDERS_STATUS_BATCH]
+            body = self._call("POST", "/api/v3/orders/status", json={"orders": chunk})
+            for row in body.get("orders") or []:
+                try:
+                    result[int(row["id"])] = str(row.get("supplierStatus") or "")
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return result
 
     # ------------------------------------------------------------- карточки
 

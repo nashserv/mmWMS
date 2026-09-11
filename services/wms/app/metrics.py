@@ -123,6 +123,14 @@ WB_CALLS = Counter(
     "Calls to Wildberries by operation and outcome.",
     ("operation", "outcome"),
 )
+# Наши незакрытые задания, о которых Wildberries промолчал при сверке.
+# Ненулевое значение — не «тихо», а «мы сверяем задания, которых у WB нет»:
+# подменённый токен, чужой кабинет, удалённый заказ.
+WB_ORDERS_MISSING = Gauge(
+    "mmx_wms_wb_orders_missing",
+    "Our open tasks that Wildberries did not return during reconciliation.",
+    ("account",),
+)
 # Инвариант 7: публикация остатка уходит сразу после движения, без таймеров.
 STOCK_PUSH = Counter(
     "mmx_wms_stock_push_total",

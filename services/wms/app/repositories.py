@@ -1648,9 +1648,32 @@ def accounts_due_for_reconcile(cursor: Cursor, *, limit: int, older_than_seconds
     return cursor.fetchall()
 
 
+def open_tasks_of_account(cursor: Cursor, account_id: uuid.UUID, *,
+                          limit: int) -> list[int]:
+    """Номера незакрытых заданий кабинета — то, о чём надо спросить WB.
+
+    Сверка читала первую страницу `GET /api/v3/orders`. Эта страница — начало
+    истории кабинета, то есть самые старые заказы за всё время; открытое
+    задание месячной давности в неё не попадает никогда, и его расхождения не
+    видит никто. Спрашивать надо адресно: вот наши незакрытые — что с ними.
+
+    `diverged` исключён: он уже остановлен и ждёт человека. `accepted` и
+    `cancelled` закрыты.
+    """
+    cursor.execute(
+        "SELECT wb_order_id FROM wms_task "
+        " WHERE wb_account_id = %s AND wb_order_id IS NOT NULL "
+        "   AND state NOT IN ('cancelled', 'accepted', 'diverged') "
+        " ORDER BY COALESCE(last_reconciled_at, to_timestamp(0)), wb_order_id "
+        " LIMIT %s", (account_id, limit))
+    return [int(row["wb_order_id"]) for row in cursor.fetchall()]
+
+
 def tasks_for_reconcile(cursor: Cursor, wb_order_ids: Sequence[int]) -> list[dict[str, Any]]:
     cursor.execute(
-        "SELECT id, wb_order_id, state, wb_status FROM wms_task "
+        # `supply_id` нужен сверке: задание в поставке законно имеет у WB
+        # статус `confirm`, даже когда у нас оно ещё `reserved`.
+        "SELECT id, wb_order_id, state, wb_status, supply_id FROM wms_task "
         " WHERE wb_order_id = ANY(%s) AND state <> 'diverged' FOR UPDATE",
         (list(wb_order_ids),))
     return cursor.fetchall()
