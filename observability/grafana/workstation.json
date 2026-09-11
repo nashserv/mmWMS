@@ -245,7 +245,7 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Печать: запись в устройство, p99 (цель < 50 мс)",
+      "title": "Печать: запись в спулер, p99 (цель < 50 мс)",
       "description": "Вторая половина. Это число не может измерить никто, кроме агента станции: запись RAW-байтов в USB видна только на месте.",
       "gridPos": {
         "h": 7,
@@ -265,7 +265,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(mmx_workstation_print_agent_write_seconds_bucket[10m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mmx_workstation_print_spooler_write_seconds_bucket[10m])))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",

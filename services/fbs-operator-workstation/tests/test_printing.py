@@ -94,8 +94,13 @@ def test_print_without_an_agent_says_so_instead_of_pretending(wms: FakeWms,
     with pytest.raises(PrintRefused) as failure:
         run(printing.print_label(task_id="a", station_id="st-1"))
     assert "агента печати" in str(failure.value)
-    job = run(store.print_job(next(iter(store.prints))))
-    assert job["outcome"] == "failed"
+    # Отказ случается ДО вызова в wms: стикер не запрашивается, печати нет, и
+    # записывать нечего. Раньше стикер запрашивался, в wms проставлялась
+    # печать и менялось состояние задания — а печатать его оказывалось некуда,
+    # и следующая попытка выглядела перепечаткой.
+    assert not store.prints, (
+        "печать записана там, где её не было: стикер запрошен вслепую")
+    assert not wms.calls, "wms позвали, хотя печатать некуда"
 
 
 def test_a_failing_printer_is_reported_not_swallowed(wms: FakeWms, store: FakeStore):
@@ -158,3 +163,128 @@ def test_checksum_is_compared_in_constant_time():
     body, _how = wms_client.decode_label_payload(
         base64.b64encode(payload).decode(), hashlib.sha256(payload).hexdigest())
     assert body == payload
+
+
+# ------------------------------------------------- идемпотентность и исход
+
+def test_a_double_click_prints_once(wms: FakeWms, store: FakeStore):
+    """Двойной клик по кнопке — одна этикетка, а не две.
+
+    Ключ печати содержал свежий `uid()`, и каждое нажатие было новой печатью.
+    Человек, нажавший дважды, получал две этикетки на одну вещь и наклеивал
+    вторую на следующую — то есть отправлял чужой заказ.
+    """
+    wms.on("/labels/a/print", lambda params: dict(
+        label_result(), task_id="a", station_id="st-1"))
+    printing, _hub, socket = build(wms, store)
+
+    first = run(printing.print_label(task_id="a", station_id="st-1"))
+    second = run(printing.print_label(task_id="a", station_id="st-1"))
+
+    assert first["idempotency_key"] == second["idempotency_key"], (
+        f"ключи печати разные ({first['idempotency_key']} и "
+        f"{second['idempotency_key']}): для wms это две разные печати, и "
+        f"человек получит вторую наклейку на ту же вещь")
+    assert first["idempotency_key"].startswith("print-a-")
+    assert len(store.prints) == 1, "в журнале две печати вместо одной"
+
+
+def test_a_reprint_always_gets_its_own_key(wms: FakeWms, store: FakeStore):
+    """Перепечатка — намеренное повторение, и считается отдельно.
+
+    Парная проверка: стабильный ключ не должен запретить перепечатать
+    зажёванную этикетку.
+    """
+    wms.on("/labels/a/print", lambda params: dict(
+        label_result(), task_id="a", station_id="st-1"))
+    printing, _hub, _socket = build(wms, store)
+
+    first = run(printing.print_label(task_id="a", station_id="st-1"))
+    again = run(printing.print_label(task_id="a", station_id="st-1",
+                                     reprint=True, reason="ленту зажевало"))
+    third = run(printing.print_label(task_id="a", station_id="st-1",
+                                     reprint=True, reason="ленту зажевало снова"))
+
+    assert again["idempotency_key"].startswith("reprint-a-")
+    assert again["idempotency_key"] != first["idempotency_key"]
+    assert again["idempotency_key"] != third["idempotency_key"], (
+        "две перепечатки получили один ключ — вторая не состоится")
+
+
+def test_a_silent_agent_gives_unknown_not_failed(wms: FakeWms, store: FakeStore):
+    """Агент не ответил — исход неизвестен, а не «не напечатано».
+
+    Байты ушли в сокет, и принтер мог напечатать. Сказать человеку «не
+    напечаталось» значит получить вторую наклейку на ту же вещь.
+    """
+    from app.printing import PrintUnknown
+
+    wms.on("/labels/a/print", lambda params: dict(
+        label_result(), task_id="a", station_id="st-1"))
+
+    class SilentSocket(FakeAgentSocket):
+        async def send_json(self, message: dict) -> None:
+            self.sent.append(message)          # подтверждения не будет
+
+    hub = AgentHub()
+    socket = SilentSocket(hub)
+    run(hub.register(AgentSession(station_id="st-1", station_name="Станция 1",
+                                  websocket=socket)))
+    printing = PrintService(wms.client(), hub, store, Projection())
+
+    import app.agent_hub as agent_hub
+    previous = agent_hub.ACK_TIMEOUT_SECONDS
+    agent_hub.ACK_TIMEOUT_SECONDS = 0.05
+    try:
+        with pytest.raises(PrintUnknown) as failure:
+            run(printing.print_label(task_id="a", station_id="st-1"))
+    finally:
+        agent_hub.ACK_TIMEOUT_SECONDS = previous
+
+    assert "могла напечататься" in str(failure.value)
+    job = run(store.print_job(next(iter(store.prints))))
+    assert job["outcome"] == "unknown", (
+        f"исход записан как {job['outcome']}: «неизвестно» и «не напечатано» — "
+        f"разные ответы человеку")
+    assert hub.get("st-1") is None, (
+        "молчащая сессия агента осталась в реестре: следующая печать уйдёт "
+        "в тот же немой сокет")
+
+
+def test_an_acknowledgement_from_another_station_is_refused():
+    """Чужое подтверждение не закрывает нашу печать.
+
+    Раньше `resolve` принимал ack от любой станции: агент соседнего стола мог
+    закрыть чужое задание, и «напечатано» значило «кто-то сказал, что
+    напечатал».
+    """
+    class QuietSocket(FakeAgentSocket):
+        """Сам не подтверждает: подтверждения в этом тесте шлём вручную."""
+
+        async def send_json(self, message: dict) -> None:
+            self.sent.append(message)
+
+    hub = AgentHub()
+    ours, theirs = QuietSocket(hub), QuietSocket(hub)
+    run(hub.register(AgentSession(station_id="st-1", station_name="Наша",
+                                  websocket=ours)))
+    run(hub.register(AgentSession(station_id="st-2", station_name="Соседняя",
+                                  websocket=theirs)))
+
+    async def scenario():
+        sending = asyncio.create_task(hub.send_print(
+            station_id="st-1", job_id="job-1", task_id="a",
+            payload=b"^XA^XZ", label_format="zplv",
+            content_type="application/x-zpl"))
+        await asyncio.sleep(0)
+        foreign = hub.resolve("job-1", {"ok": True, "write_ms": 1.0},
+                              station_id="st-2")
+        mine = hub.resolve("job-1", {"ok": True, "write_ms": 2.0},
+                           station_id="st-1")
+        return foreign, mine, await sending
+
+    foreign, mine, ack = run(scenario())
+
+    assert foreign is False, "чужая станция закрыла нашу печать"
+    assert mine is True
+    assert ack["write_ms"] == 2.0, "в ответе оказалось чужое подтверждение"

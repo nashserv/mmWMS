@@ -139,9 +139,14 @@ PRINT_CLICK_TO_AGENT = Histogram(
     "From the operator's click to handing bytes to the station agent.",
     buckets=(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.2, 0.3, 0.5, 1, 2, 5),
 )
+# Имя честное: это время до СПУЛЕРА, а не до бумаги. `WritePrinter`
+# возвращается, когда очередь приняла байты; головка двинется позже, а у
+# выключенного принтера не двинется вовсе. Называть это «записью в устройство»
+# значит мерить не то, что обещано, и получать зелёную метрику при пустом
+# лотке.
 PRINT_AGENT_WRITE = Histogram(
-    "mmx_workstation_print_agent_write_seconds",
-    "Agent-reported time of the RAW write into the USB device.",
+    "mmx_workstation_print_spooler_write_seconds",
+    "Agent-reported time of the RAW write into the print spooler (not the paper).",
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.3, 1),
 )
 PRINTS = Counter(

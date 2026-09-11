@@ -34,12 +34,12 @@ from typing import Any
 # Агент запускается и как модуль пакета, и как одиночный файл, скопированный на
 # складской ПК. Второе — основной способ, поэтому импорт умеет оба варианта.
 try:
-    from .printers import Printer, build_printer
+    from .printers import Printer, PrinterUnavailable, build_printer
     from .raster import TSPL_PROBE, ZPL_PROBE, png_to_tspl, png_to_zpl
     from .ws import WebSocket, WebSocketClosed, WebSocketError
 except ImportError:  # pragma: no cover — путь одиночного файла
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from printers import Printer, build_printer  # type: ignore
+    from printers import Printer, PrinterUnavailable, build_printer  # type: ignore
     from raster import TSPL_PROBE, ZPL_PROBE, png_to_tspl, png_to_zpl  # type: ignore
     from ws import WebSocket, WebSocketClosed, WebSocketError  # type: ignore
 
@@ -186,6 +186,12 @@ class PrintAgent:
             total_ms = 0.0
             for _ in range(copies):
                 total_ms += self.printer.write(prepared)
+        except PrinterUnavailable as error:
+            # Принтер есть, но печатать он сейчас не будет: лента, замятие,
+            # выключен. Спулер принял бы байты и промолчал, а человек стоял бы
+            # у пустого лотка. Говорим ему, что именно случилось.
+            self._fail(socket_client, job_id, task_id, str(error))
+            return
         except Exception as error:  # noqa: BLE001 — принтер отвалился, агент нет
             self._fail(socket_client, job_id, task_id, f"принтер не принял байты: {error}")
             return

@@ -34,7 +34,7 @@ from . import config, metrics, screens
 from .agent_hub import AgentBusy, AgentHub, AgentSession
 from .inbox import InboxConsumer, NullConsumer
 from .picking import PickingRefused, PickingService
-from .printing import PrintRefused, PrintService
+from .printing import PrintRefused, PrintService, PrintUnknown
 from .projection import Projection
 from .puller import Poller
 from .receiving import ReceivingRefused, ReceivingService
@@ -128,6 +128,10 @@ class PrintCommand(BaseModel):
     reprint: bool = False
     reason: str | None = None
     copies: int = Field(default=1, ge=1, le=10)
+    # Ключ идемпотентности печати. Экран присылает свой и блокирует кнопку до
+    # ответа: двойной клик по «печать» давал две этикетки на одну вещь, и
+    # вторая наклеивалась на следующую.
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class CancelCommand(BaseModel):
@@ -357,7 +361,13 @@ async def print_label(command: PrintCommand) -> JSONResponse:
         result = await state.printing.print_label(
             task_id=command.task_id, station_id=command.station_id,
             actor_id=command.actor_id, reprint=command.reprint,
-            reason=command.reason, copies=command.copies)
+            reason=command.reason, copies=command.copies,
+            idempotency_key=command.idempotency_key)
+    except PrintUnknown as error:
+        # 202, а не 409: «неизвестно» — не отказ. Экран обязан сказать
+        # человеку «посмотрите на принтер», а не «нажмите ещё раз».
+        return JSONResponse({"ok": False, "status": "unknown", "error": str(error)},
+                            status_code=202)
     except PrintRefused as error:
         return _refused(error)
     return _ok(result)

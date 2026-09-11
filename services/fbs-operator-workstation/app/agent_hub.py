@@ -60,7 +60,20 @@ class AgentSession:
 
 
 class AgentBusy(RuntimeError):
-    """Агент станции не подключён или не ответил."""
+    """Агент станции не подключён или оборвал соединение.
+
+    Значит «не напечатано»: байты до устройства не дошли.
+    """
+
+
+class AgentAckTimeout(AgentBusy):
+    """Байты ушли, а подтверждения нет.
+
+    Наследник `AgentBusy`, чтобы прежние обработчики продолжали ловить его, но
+    отдельный тип: «не напечатано» и «неизвестно, напечаталось ли» — разные
+    ответы человеку. Первый значит «нажмите ещё раз», второй — «посмотрите на
+    принтер, прежде чем нажимать».
+    """
 
 
 class AgentHub:
@@ -162,7 +175,7 @@ class AgentHub:
         try:
             return await asyncio.wait_for(future, timeout=ACK_TIMEOUT_SECONDS)
         except asyncio.TimeoutError as error:
-            raise AgentBusy(
+            raise AgentAckTimeout(
                 f"агент станции {station_id} не подтвердил запись за "
                 f"{ACK_TIMEOUT_SECONDS:.0f} с") from error
         finally:

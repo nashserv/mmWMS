@@ -362,21 +362,51 @@ el('pack-scan').addEventListener('keydown', async (event) => {
   await loadSession();
 });
 
+// Ключ печати живёт на экране, а не на сервере: двойной клик обязан быть
+// ОДНОЙ печатью, и решает это тот, кто видел оба клика. Кнопка при этом
+// блокируется до ответа — человек, нажавший дважды, получал две этикетки на
+// одну вещь и наклеивал вторую на следующую.
+let printing = false;
+const printKeys = {};
+const printKeyFor = (taskId, reprint) => {
+  if (reprint) { return 'reprint-' + taskId + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10); }
+  if (!printKeys[taskId]) { printKeys[taskId] = 'print-' + taskId + '-' + Date.now(); }
+  return printKeys[taskId];
+};
+
 const doPrint = async (reprint) => {
+  if (printing) { return; }
   const station = el('station').value.trim();
   if (!station) { flash('pack-flash', 'err', 'не указана станция — неизвестно, на какой принтер печатать'); return; }
   const reason = reprint ? (prompt('Причина перепечатки (обязательна):') || '') : null;
   if (reprint && !reason.trim()) { flash('pack-flash', 'err', 'перепечатка без причины не выполняется'); return; }
+  const taskId = el('pack-task').value;
+  printing = true;
+  el('print').disabled = true;
+  el('reprint').disabled = true;
   const started = performance.now();
-  const {ok, data} = await api('/api/workstation/v1/print', {
-    task_id: el('pack-task').value, station_id: station,
-    actor_id: el('actor').value.trim(), reprint, reason, copies: 1});
-  if (!ok) { flash('pack-flash', 'err', data.error || 'печать не прошла'); return; }
-  el('print-timing').textContent =
-    'до агента ' + text(data.click_to_agent_ms) + ' мс · запись в устройство '
-    + text(data.agent_write_ms) + ' мс · экран ' + Math.round(performance.now() - started) + ' мс'
-    + ' · формат ' + text(data.label_format);
-  flash('pack-flash', 'ok', 'этикетка отправлена в принтер');
+  try {
+    const {ok, status, data} = await api('/api/workstation/v1/print', {
+      task_id: taskId, station_id: station,
+      actor_id: el('actor').value.trim(), reprint, reason, copies: 1,
+      idempotency_key: printKeyFor(taskId, reprint)});
+    if (status === 202) {
+      // Исход неизвестен: байты ушли, ответа нет. Человеку нужно посмотреть
+      // на принтер, а не нажать ещё раз.
+      flash('pack-flash', 'err', data.error || 'исход печати неизвестен — посмотрите на принтер');
+      return;
+    }
+    if (!ok) { flash('pack-flash', 'err', data.error || 'печать не прошла'); return; }
+    el('print-timing').textContent =
+      'до спулера ' + text(data.click_to_agent_ms) + ' мс · запись в устройство '
+      + text(data.agent_write_ms) + ' мс · экран ' + Math.round(performance.now() - started) + ' мс'
+      + ' · формат ' + text(data.label_format);
+    flash('pack-flash', 'ok', 'этикетка отправлена в принтер');
+  } finally {
+    printing = false;
+    el('print').disabled = false;
+    el('reprint').disabled = false;
+  }
 };
 el('print').onclick = () => doPrint(false);
 el('reprint').onclick = () => doPrint(true);

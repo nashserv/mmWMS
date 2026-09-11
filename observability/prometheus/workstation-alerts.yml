@@ -97,7 +97,7 @@ groups:
 
   - name: workstation-printing
     rules:
-      # Критерий раздела 10: от нажатия «печать» до записи в устройство
+      # Критерий раздела 10: от нажатия «печать» до записи в спулер
       # меньше 50 мс, до движения головки — меньше 300 мс.
       - alert: WorkstationPrintSlowToAgent
         expr: |
@@ -115,11 +115,11 @@ groups:
       - alert: WorkstationPrintSlowInDevice
         expr: |
           histogram_quantile(0.99,
-            sum by (le) (rate(mmx_workstation_print_agent_write_seconds_bucket[10m]))) > 0.05
+            sum by (le) (rate(mmx_workstation_print_spooler_write_seconds_bucket[10m]))) > 0.05
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "p99 записи в устройство выше 50 мс"
+          summary: "p99 записи в спулер выше 50 мс"
           description: >-
             Похоже на печать через графический драйвер и спулер вместо RAW.
             Агент обязан писать WritePrinter с типом данных "RAW".

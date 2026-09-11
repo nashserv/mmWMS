@@ -24,7 +24,7 @@ import time
 from typing import Any
 
 from . import metrics
-from .agent_hub import AgentBusy, AgentHub, send_to_tcp_printer
+from .agent_hub import AgentAckTimeout, AgentBusy, AgentHub, send_to_tcp_printer
 from .domain import uid
 from .projection import Projection
 from .store import Store
@@ -38,6 +38,16 @@ NATIVE_FORMATS = frozenset({"zplv", "zplh", "zpl"})
 
 class PrintRefused(RuntimeError):
     """Печатать нельзя, и это ответ человеку, а не тихий отказ."""
+
+
+class PrintUnknown(RuntimeError):
+    """Байты ушли, а ответа нет: напечаталось или нет — неизвестно.
+
+    Отдельный тип, а не `PrintRefused`: «не напечатано» и «неизвестно» — разные
+    ответы человеку. Первый значит «нажмите ещё раз», второй — «посмотрите на
+    принтер, прежде чем нажимать». Спутать их значит получить вторую наклейку
+    на ту же вещь.
+    """
 
 
 class PrintService:
@@ -58,9 +68,18 @@ class PrintService:
             # перепечаток — метрика качества этикетки и принтера.
             raise PrintRefused("повторная печать требует причины")
 
-        key = idempotency_key or f"print-{task_id}-{uid()}"
         task = self._projection.get(task_id)
         expected_order = task.wb_order_id if task else None
+        key = idempotency_key or self._default_key(task_id, task, reprint=reprint)
+
+        # Агента проверяем ДО вызова в wms. Раньше стикер запрашивался, а
+        # печатать его оказывалось некуда: в wms при этом уже проставлена
+        # печать, состояние задания сменилось на `labeled`, и повторная
+        # попытка выглядела перепечаткой.
+        if self._hub.get(station_id) is None and not await self._tcp_printer(station_id):
+            raise PrintRefused(
+                f"на станции {station_id} нет подключённого агента печати. "
+                f"Стикер не запрашивался: печатать его некуда")
 
         started = time.perf_counter()
         try:
@@ -124,6 +143,33 @@ class PrintService:
             "idempotency_key": key,
         }
 
+    def _default_key(self, task_id: str, task: Any, *, reprint: bool) -> str:
+        """Ключ идемпотентности печати, если экран его не прислал.
+
+        Первая печать — ключ, одинаковый для одного и того же задания и одной
+        и той же версии стикера: двойной клик по кнопке даёт одну печать, а не
+        две. Раньше ключ содержал свежий `uid()`, и каждое нажатие было новой
+        печатью — человек, нажавший дважды, получал две этикетки на одну вещь
+        и наклеивал вторую на следующую.
+
+        Перепечата — намеренное повторение, и у неё ключ всегда новый: её
+        причину спрашивают отдельно, и считают её отдельно.
+        """
+        if reprint:
+            return f"reprint-{task_id}-{uid()}"
+        version = getattr(getattr(task, "label", None), "version", None) or 1
+        return f"print-{task_id}-{version}"
+
+    async def _tcp_printer(self, station_id: str) -> dict[str, Any] | None:
+        """Настроен ли на станции сетевой принтер."""
+        try:
+            printer = await self._store.printer(station_id)
+        except Exception:  # noqa: BLE001 — база экрана не решает, есть ли принтер
+            return None
+        if printer and str(printer.get("transport")) == "tcp" and printer.get("printer_name"):
+            return printer
+        return None
+
     async def _deliver(self, label: Label, *, station_id: str, task_id: str, key: str,
                        copies: int, reprint: bool, reason: str | None,
                        actor_id: str | None, started: float) -> tuple[float | None, str]:
@@ -137,6 +183,18 @@ class PrintService:
                     station_id=station_id, job_id=job_id, label_format=label.label_format,
                     content_type=label.content_type, payload=label.body, copies=copies,
                     task_id=task_id)
+            except AgentAckTimeout as error:
+                # Агент не ответил. Это НЕ «не напечатано»: байты ушли в
+                # сокет, и принтер мог напечатать — или не напечатать.
+                # Записать `failed` значит соврать человеку, что этикетки нет,
+                # и получить вторую наклейку на ту же вещь.
+                await self._unknown(key, task_id, station_id, label, copies, reprint,
+                                    reason, actor_id, str(error))
+                await self._hub.unregister(station_id)
+                raise PrintUnknown(
+                    f"агент станции {station_id} не ответил: этикетка могла "
+                    f"напечататься. Проверьте принтер, прежде чем печатать снова"
+                ) from error
             except AgentBusy as error:
                 await self._fail(key, task_id, station_id, label, copies, reprint,
                                  reason, actor_id, str(error))
@@ -153,8 +211,8 @@ class PrintService:
             return _float_or_none(ack.get("write_ms")), "agent"
 
         # Агента нет — пробуем сетевой принтер, если станция так настроена.
-        printer = await self._store.printer(station_id)
-        if printer and str(printer.get("transport")) == "tcp" and printer.get("printer_name"):
+        printer = await self._tcp_printer(station_id)
+        if printer:
             host, _, port = str(printer["printer_name"]).partition(":")
             write_ms = await send_to_tcp_printer(host, int(port or 9100), label.body)
             self._hub.note_write(task_id=task_id, station_id=station_id, write_ms=write_ms,
@@ -178,6 +236,20 @@ class PrintService:
             reason=reason, actor_id=actor_id)
         await self._store.finish_print(idempotency_key=key, outcome="failed", error=error[:500])
         logger.warning("печать не удалась: %s", error)
+
+    async def _unknown(self, key: str, task_id: str, station_id: str, label: Label,
+                       copies: int, reprint: bool, reason: str | None,
+                       actor_id: str | None, error: str) -> None:
+        """Исход печати неизвестен: агент не ответил, а байты ушли."""
+        metrics.PRINTS.labels(outcome="unknown", label_format=label.label_format).inc()
+        await self._store.start_print(
+            idempotency_key=key, task_id=task_id, station_id=station_id,
+            label_format=label.label_format, checksum=label.checksum,
+            payload_bytes=len(label.body), copies=copies, reprint=reprint,
+            reason=reason, actor_id=actor_id)
+        await self._store.finish_print(idempotency_key=key, outcome="unknown",
+                                       error=error[:500])
+        logger.warning("исход печати неизвестен: %s", error)
 
     async def probe_printer(self, station_id: str) -> dict[str, Any]:
         """Проверить на живом принтере, что он понимает.

@@ -11,11 +11,22 @@ Linux и принтера у него нет, но измерить путь и 
 """
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import time
 from pathlib import Path
 from typing import Protocol
+
+log = logging.getLogger("workstation.agent.printers")
+
+
+class PrinterUnavailable(RuntimeError):
+    """Принтер есть, но печатать он сейчас не будет.
+
+    Отдельный тип: «не отправилось» разбирают в сети, «кончилась лента» — у
+    принтера, и человеку надо сказать именно это.
+    """
 
 
 class Printer(Protocol):
@@ -34,7 +45,62 @@ class WindowsRawPrinter:
         import win32print  # noqa: F401 — проверяем наличие сразу, а не при первой печати
         self._win32print = win32print
 
+    # Состояния принтера, при которых писать бессмысленно. Значения
+    # win32print: очередь примет байты и в таком состоянии, а человек будет
+    # стоять у молчащего принтера и жать «печать» ещё раз.
+    PRINTER_STATUS_ERROR = 0x00000002
+    PRINTER_STATUS_PAPER_OUT = 0x00000010
+    PRINTER_STATUS_OFFLINE = 0x00000080
+    PRINTER_STATUS_PAPER_JAM = 0x00000008
+    PRINTER_STATUS_NOT_AVAILABLE = 0x00001000
+    BAD_STATUS = (PRINTER_STATUS_ERROR | PRINTER_STATUS_PAPER_OUT
+                  | PRINTER_STATUS_OFFLINE | PRINTER_STATUS_PAPER_JAM
+                  | PRINTER_STATUS_NOT_AVAILABLE)
+    # Сколько заданий в очереди считать затором. Спулер принимает их
+    # бесконечно; принтер, который не печатает, копит их до конца смены.
+    QUEUE_ALARM = 5
+
+    def check(self) -> str | None:
+        """Что не так с принтером. `None` — всё в порядке.
+
+        Спулер принимает байты и у выключенного принтера: `WritePrinter`
+        возвращается успешно, метрика «записано за 3 мс» зелёная, а этикетки
+        нет. Проверка состояния до записи — единственный способ отличить
+        «напечатано» от «отправлено в никуда».
+        """
+        try:
+            handle = self._win32print.OpenPrinter(self.printer_name)
+        except Exception as error:  # noqa: BLE001
+            return f"принтер {self.printer_name} не открывается: {error}"
+        try:
+            info = self._win32print.GetPrinter(handle, 2)
+            status = int(info.get("Status", 0))
+            names = {
+                self.PRINTER_STATUS_OFFLINE: "принтер отключён",
+                self.PRINTER_STATUS_PAPER_OUT: "кончилась лента",
+                self.PRINTER_STATUS_PAPER_JAM: "замятие ленты",
+                self.PRINTER_STATUS_ERROR: "ошибка принтера",
+                self.PRINTER_STATUS_NOT_AVAILABLE: "принтер недоступен",
+            }
+            if status & self.BAD_STATUS:
+                reasons = [text for bit, text in names.items() if status & bit]
+                return ", ".join(reasons) or f"состояние принтера {status}"
+            queued = len(self._win32print.EnumJobs(handle, 0, 99, 1) or ())
+            if queued >= self.QUEUE_ALARM:
+                return (f"в очереди {queued} заданий — принтер их не печатает, "
+                        f"и новое встанет следом")
+        except Exception as error:  # noqa: BLE001 — проверка не важнее печати
+            log.warning("состояние принтера %s не прочитано: %s",
+                        self.printer_name, error)
+            return None
+        finally:
+            self._win32print.ClosePrinter(handle)
+        return None
+
     def write(self, payload: bytes) -> float:
+        problem = self.check()
+        if problem is not None:
+            raise PrinterUnavailable(problem)
         started = time.perf_counter()
         handle = self._win32print.OpenPrinter(self.printer_name)
         try:
