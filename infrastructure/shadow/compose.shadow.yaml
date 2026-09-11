@@ -1,0 +1,127 @@
+# Shadow-контур: раздел 11, шаг 2 мастера.
+#
+# `wms` стоит рядом с боевым контуром, опрашивает Wildberries ИСКЛЮЧИТЕЛЬНО
+# `GET /api/v3/orders`, строит свою таблицу заданий и ежедневно отчитывается о
+# расхождениях. Ни одной записи: ни стикеров, ни поставок, ни публикации
+# остатков.
+#
+# ЗАПУСКАТЬ ТОЛЬКО ПОСЛЕ ЯВНОГО РАЗРЕШЕНИЯ ВЛАДЕЛЬЦА НА ЭТОТ КОНКРЕТНЫЙ ШАГ
+# (раздел 12). Перед первым подъёмом — scripts/preflight.sh: он проверяет, что
+# записывать в WB отсюда нечем.
+#
+# Чего здесь нет намеренно:
+#
+#   * wms-wb-labels — запрос стикера кладёт заказ в поставку, то есть ПИШЕТ в
+#     кабинет клиента. В shadow это запрещено.
+#   * wms-outbox и RabbitMQ вообще — публикатор отправил бы события shadow в
+#     боевую шину, и биллинг выставил бы клиенту счёт ВТОРОЙ раз за те же
+#     заказы. События копятся в своём outbox и никуда не едут: без брокера
+#     опубликовать их физически нечем.
+#   * публикации остатков — их делает stock_publisher по движению, а движений
+#     в shadow нет: остаток приезжает только на шаге 3.
+
+name: mmx-shadow
+
+x-shadow: &shadow
+  build:
+    context: ../../services/wms
+  restart: unless-stopped
+  depends_on:
+    migrate: {condition: service_completed_successfully}
+  environment: &shadow-env
+    # production — не косметика. `wb.writes_allowed` пускает запись в кабинет
+    # в режиме shadow только если окружение локальное И адрес Wildberries не
+    # задан. Здесь не выполнено ни одно из двух, и запрет абсолютен.
+    APP_ENV: production
+    WMS_MOCK: "false"
+    DATABASE_URL: postgresql://wms:${SHADOW_POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms
+
+    # Настоящий Wildberries. Обязателен: с пустым адресом сервис счёл бы, что
+    # рядом симулятор, и это единственная дорога, которой запрет обойти можно.
+    WB_API_URL: ${WB_API_URL:?set outside Git}
+
+    # РОВНО ОДИН кабинет. Раздел 11 требует переключать по одному, не пачкой,
+    # и разрешение владельца нужно на каждый следующий отдельно.
+    WB_SYNC_ONLY_ACCOUNTS: ${SHADOW_WB_ACCOUNT:?set outside Git}
+
+    # Доля бюджета лимита. У кабинета 300 запросов в минуту ВСЕГО, и боевой
+    # шлюз уже их тратит. Упереться в лимит на проде из-за теневого опроса
+    # недопустимо (раздел 11). Считает scripts/poll-budget.py.
+    WB_SYNC_INTERVAL_SECONDS: ${SHADOW_POLL_INTERVAL_SECONDS:?set outside Git}
+
+    # Токен только по ссылке. Значения здесь нет и быть не может (инвариант 15).
+    WB_SECRET_DIR: ${WB_SECRET_DIR:-/run/secrets/wb}
+    TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms}
+
+    # RABBITMQ_URL не задан НАМЕРЕННО. См. шапку файла.
+
+services:
+
+  # Своя база. Не боевая и не стендовая: shadow пишет только к себе.
+  postgres:
+    image: postgres:16.10-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wms
+      POSTGRES_USER: wms
+      POSTGRES_PASSWORD: ${SHADOW_POSTGRES_PASSWORD:?set outside Git}
+    volumes:
+      - shadow-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wms -d wms"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Порт наружу не публикуется: к базе shadow ходить незачем.
+
+  migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${SHADOW_POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ../stand/scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/wms/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+
+  wms:
+    <<: *shadow
+    environment:
+      <<: *shadow-env
+      WMS_ROLE: api
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # Только на петлю: отчёт расхождений читают с самой машины.
+    ports: ["127.0.0.1:18080:8080"]
+
+  # Опрос. Единственный вызов наружу за весь контур — GET /api/v3/orders.
+  wms-wb-sync:
+    <<: *shadow
+    environment:
+      <<: *shadow-env
+      WMS_ROLE: wb-sync
+    command: ["python", "-m", "app.workers.wb_sync"]
+    depends_on:
+      wms: {condition: service_healthy}
+
+  # Сверка. Тоже только чтение — и в shadow она главный инструмент: ежедневный
+  # отчёт расхождений и есть то, ради чего шаг 2 существует.
+  wms-wb-reconcile:
+    <<: *shadow
+    environment:
+      <<: *shadow-env
+      WMS_ROLE: wb-reconcile
+    command: ["python", "-m", "app.workers.wb_reconcile"]
+    depends_on:
+      wms: {condition: service_healthy}
+
+volumes:
+  shadow-postgres: {}

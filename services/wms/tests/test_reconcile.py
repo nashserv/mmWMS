@@ -216,3 +216,36 @@ def test_reconciliation_paces_itself_and_does_not_burn_the_cabinet_limit(
     assert worker.tick() == 0, (
         "второй цикл подряд снова пошёл в Wildberries — сверка выберет "
         "общий лимит кабинета и оставит без вызовов опрос заданий")
+
+
+def test_the_divergence_report_is_written_down_and_not_only_logged(
+        pool: ConnectionPool, cabinet: dict) -> None:
+    """Раздел 11, шаг 2: отчёт расхождений ложится в таблицу, а не только в лог.
+
+    Наблюдают неделю, и вопрос недели — «убывает ли разница». По логу его не
+    задать: он ротируется и исчезает вместе с контейнером. Копить расхождения
+    молча — ровно то, что делает боевой контур сегодня.
+    """
+    order_ids = seed(cabinet["account"], 2, cabinet["barcode"])
+    WbSyncWorker(pool, only_accounts=[cabinet["account"]]).tick()
+
+    # Разводим наше состояние с тем, что скажет WB: у нас отменено, у него
+    # отгружено. То самое расхождение боевого контура — 2467 заданий.
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "UPDATE wms_task SET state = 'diverged', wb_status = 'complete' "
+                " WHERE wb_order_id = ANY(%s)", (order_ids,))
+
+    WbReconcileWorker(pool, only_accounts=[cabinet["account"]])._report()
+
+    saved = rows(pool,
+                 "SELECT r.state, r.wb_status, r.tasks, r.observed_on "
+                 "  FROM shadow_divergence_report r "
+                 " WHERE r.seller_external_id = %s", (cabinet["seller"],))
+    assert saved, (
+        "расхождение не попало в shadow_divergence_report — за неделю наблюдения "
+        "сравнить день с днём будет нечем")
+    assert saved[0]["state"] == "diverged"
+    assert saved[0]["wb_status"] == "complete"
+    assert int(saved[0]["tasks"]) == len(order_ids)

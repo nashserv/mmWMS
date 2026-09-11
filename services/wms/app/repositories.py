@@ -1690,3 +1690,24 @@ def divergence_report(cursor: Cursor, *, limit: int = 500) -> list[dict[str, Any
         " GROUP BY o.seller_external_id, s.barcode, t.state, t.wb_status "
         " ORDER BY count(*) DESC LIMIT %s", (limit,))
     return cursor.fetchall()
+
+
+def save_divergence_report(cursor: Cursor, lines: Sequence[dict[str, Any]]) -> int:
+    """Сохранить снимок отчёта. Раздел 11, шаг 2.
+
+    Лог для недели наблюдения не годится: он ротируется, теряется при
+    пересоздании контейнера и не даёт сравнить «вчера двенадцать, сегодня
+    три». А именно это сравнение и есть смысл шага 2 — сходятся ли наши
+    задания с боевыми и убывает ли разница.
+    """
+    if not lines:
+        return 0
+    cursor.executemany(
+        "INSERT INTO shadow_divergence_report "
+        "    (seller_external_id, barcode, state, wb_status, tasks, oldest) "
+        "VALUES (%(seller_external_id)s, %(barcode)s, %(state)s, %(wb_status)s, "
+        "        %(tasks)s, %(oldest)s)",
+        [{"seller_external_id": line["seller_external_id"], "barcode": line.get("barcode"),
+          "state": line["state"], "wb_status": line.get("wb_status"),
+          "tasks": int(line["tasks"]), "oldest": line.get("oldest")} for line in lines])
+    return len(lines)
