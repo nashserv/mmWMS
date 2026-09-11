@@ -257,7 +257,9 @@ def test_step_04_five_wb_orders_become_tasks_and_reservations_in_one_transaction
 
     deadline = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
 
-    with TxnWatch(db) as watch:
+    # Резерв здесь делает опросчик: задание приходит от WB, а не от клиента.
+    # Смотреть на маршруты бессмысленно — они в этом шаге ничего не резервируют.
+    with TxnWatch(db, application="wms-wb-sync") as watch:
         started = time.monotonic()
         order_ids = seed_wb_orders(data.WB_ACCOUNT, data.WB_ORDERS, barcode, deadline)
         # Ждать полный набор, а не первое появившееся задание. Пятёрка

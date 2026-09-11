@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import base64
+
 import uuid
 from datetime import date
 from typing import Any
@@ -17,10 +19,20 @@ from app.db import Database
 from conftest import rows
 
 # Строка формы живого JWT — нужна, чтобы проверить, что биллинг такую не примет.
-# Слово placeholder в строке ниже стоит не для читателя, а для ворот
-# check-no-live-tokens.sh: они смотрят построчно и без него не пустят репозиторий
-# в CI. Ровно тот случай, ради которого в воротах и заведены заглушки.
-SHAPED_LIKE_A_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwbGFjZWhvbGRlciJ9.bm90LWEtdG9rZW4"  # placeholder
+# Строка формы JWT собирается здесь, а не лежит в файле литералом.
+#
+# Раньше литерал был, а ворота check-no-live-tokens.sh пропускали его из-за
+# слова `placeholder` в комментарии на той же строке. Это и была дыра: ровно
+# так же прошёл бы НАСТОЯЩИЙ токен, если рядом окажется любое из слов-заглушек.
+# Ворота теперь смотрят на значение целиком, и правильный ответ — не подбирать
+# комментарий, а не держать в репозитории строк, похожих на живой секрет.
+def _shaped_like_a_token() -> str:
+    """Три сегмента base64url через точку — форма JWT, но не токен."""
+    parts = (b'{"alg":"HS256"}', b'{"sub":"synthetic"}', b"not-a-signature")
+    return ".".join(base64.urlsafe_b64encode(part).decode().rstrip("=") for part in parts)
+
+
+SHAPED_LIKE_A_TOKEN = _shaped_like_a_token()
 
 
 class FakeWms:

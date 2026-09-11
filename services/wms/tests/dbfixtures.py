@@ -29,15 +29,44 @@ REQUIRED = (
     "Транзакция 6.2 проверяется блокировками и триггерами, на заглушке её нет."
 )
 
+# Имя базы обязано оканчиваться на `_test`. Это не вкусовщина: фолбэк на
+# DATABASE_URL уже стоил стенду 957 чужих владельцев `utest-*` из 997 и 85
+# отрицательных остатков. Тесты заводят продавцов, кабинеты и станции пачками —
+# в рабочей базе им не место, и опросчик, который берёт по восемь кабинетов за
+# такт, на девятистах перестаёт укладываться в две секунды.
+_TEST_SUFFIX = "_test"
+
+
+def _database_name(dsn: str) -> str:
+    from urllib.parse import urlparse
+
+    return (urlparse(dsn).path or "").lstrip("/").split("?")[0]
+
 
 def database_url() -> str | None:
-    return (os.getenv("WMS_TEST_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip() or None
+    """Адрес ТЕСТОВОЙ базы. Фолбэка на DATABASE_URL здесь нет намеренно.
+
+    Он был, и молча уводил тесты в рабочую базу, когда переменную забывали
+    задать. Забыть — это норма; уронить из-за этого стенд — нет.
+    """
+    return (os.getenv("WMS_TEST_DATABASE_URL") or "").strip() or None
 
 
 def require_database() -> str:
     url = database_url()
     if not url:
         pytest.skip(REQUIRED)
+    name = _database_name(url)
+    if not name.endswith(_TEST_SUFFIX):
+        # Не skip и не fail отдельного теста: продолжать нельзя вообще, иначе
+        # следующий же тест начнёт писать в рабочую базу.
+        pytest.exit(
+            f"WMS_TEST_DATABASE_URL указывает на базу {name!r}, а имя обязано "
+            f"оканчиваться на {_TEST_SUFFIX!r}. Юнит-тесты заводят продавцов и "
+            f"кабинеты пачками — в рабочей базе им не место: так уже натекло "
+            f"957 владельцев utest-* и опросчик перестал укладываться в бюджет. "
+            f"Поднимите wms_test (сервис wms-test-migrate в compose стенда).",
+            returncode=2)
     return url
 
 

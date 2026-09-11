@@ -22,3 +22,8 @@ infrastructure/stand/env/*
 # Локальное
 .DS_Store
 *.log
+
+# Бэкапы баз стенда: снимаются перед любой уборкой (правило 8),
+# в Git им не место — там боевые объёмы и данные клиентов.
+infrastructure/stand/backups/*
+!infrastructure/stand/backups/.gitkeep

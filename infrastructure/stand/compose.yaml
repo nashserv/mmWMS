@@ -19,12 +19,22 @@ name: mmx-stand
 x-restart: &restart
   restart: unless-stopped
 
+# Логи без потолка однажды съедают диск стенда целиком, и первым это замечает
+# Postgres, которому некуда писать. Пятьдесят мегабайт на файл, пять файлов —
+# это примерно сутки болтливого воркера.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
 # Общее окружение сервисов потока C. Перенесено вместе с ними из
 # compose.stream-c.yaml.
 x-billing-env: &billing-env
   APP_ENV: development
-  DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
-  RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+  DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/billing
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:?set outside Git}@rabbitmq:5672/
   MMX_EVENTS_EXCHANGE: mmx.events
   MMX_TENANT_ID: mm-express
   # Контракт wms (приложение B). До готовности потока A на этом адресе стоит
@@ -48,19 +58,30 @@ services:
       - ./scripts/check-no-live-tokens.sh:/check.sh:ro
       - ./dump:/scan/dump:ro
       - ./env:/scan/env:ro
-    entrypoint: ["/bin/bash", "/check.sh", "/scan/dump", "/scan/env"]
+      # .env и сам compose тоже под проверкой: токен чаще всего кладут именно
+      # туда — «на минутку, чтобы проверить», и он там остаётся.
+      - ./.env:/scan/dotenv:ro
+      - ./compose.yaml:/scan/compose.yaml:ro
+    entrypoint: ["/bin/bash", "/check.sh", "/scan/dump", "/scan/env",
+                 "/scan/dotenv", "/scan/compose.yaml"]
 
   # ------------------------------------------------------------------ хранилища
   postgres:
     image: postgres:16.10-bookworm
-    <<: *restart
+    <<: [*restart, *logging]
+    # Восемь ядер и 32 ГБ на стенде делят Postgres, RabbitMQ, четыре воркера,
+    # рабочее место, четыре сервиса потока C и сам прогон. Без потолков одна
+    # нагрузочная минута выдавливает соседей, и красное показывает не то.
+    deploy:
+      resources:
+        limits: {cpus: "3.0", memory: 4G}
     depends_on:
       token-guard: {condition: service_completed_successfully}
     environment:
       POSTGRES_DB: wms
       POSTGRES_USER: wms
       # Пароль стенда, не боевой. Живых секретов на стенде нет вовсе.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set outside Git}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./scripts/create-databases.sh:/docker-entrypoint-initdb.d/10-create-databases.sh:ro
@@ -71,14 +92,32 @@ services:
       retries: 10
     ports: ["127.0.0.1:5432:5432"]
 
+  # Ежедневный дамп всех баз. Правило 8: ничего не удаляем в рабочей базе без
+  # бэкапа — а «сделаю руками, когда понадобится» это не бэкап, это намерение.
+  pg-backup:
+    image: postgres:16.10-bookworm
+    <<: [*restart, *logging]
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set outside Git}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    entrypoint: ["/bin/bash", "/backup.sh"]
+
   rabbitmq:
     image: rabbitmq:4.1.2-management
-    <<: *restart
+    <<: [*restart, *logging]
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 1G}
     depends_on:
       token-guard: {condition: service_completed_successfully}
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-mmx}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-stand-only-change-me}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set outside Git}
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
@@ -98,7 +137,7 @@ services:
       rabbitmq: {condition: service_healthy}
     environment:
       RABBITMQ_USER: ${RABBITMQ_USER:-mmx}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-stand-only-change-me}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set outside Git}
     volumes:
       - ./scripts/rabbitmq-init.sh:/init.sh:ro
     entrypoint: ["/bin/sh", "/init.sh"]
@@ -110,11 +149,42 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     environment:
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/wms
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms
       MIGRATIONS_DIR: /migrations
     volumes:
       - ./scripts/migrate.sh:/migrate.sh:ro
       - ../../services/wms/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Схема в тестовой базе. Без неё «правильный путь» из README не работал:
+  # create-databases.sh базу создавал, но schema_migrations в ней оставался
+  # пустым, и юнит-тесты падали на первой же таблице — после чего их гоняли
+  # против рабочей базы, и в неё натекло 957 чужих владельцев.
+  wms-test-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms_test
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/wms/migrations:/migrations:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+
+  # Та же схема для тестов рабочего места (этап 3.7).
+  workstation-test-migrate:
+    image: postgres:16.10-bookworm
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/workstation_test
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ../../services/fbs-operator-workstation/migrations:/migrations:ro
     entrypoint: ["/bin/bash", "/migrate.sh"]
 
   # Рабочие места. Станций пять (раздел 4), меняются они реже, чем переезжает
@@ -125,7 +195,7 @@ services:
     depends_on:
       migrate: {condition: service_completed_successfully}
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set outside Git}
     volumes:
       - ./seed:/seed:ro
     entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "wms",
@@ -135,6 +205,8 @@ services:
   wms:
     build:
       context: ../../services/wms
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -151,8 +223,8 @@ services:
       # можно переменной, а не пересборкой (правило 9.5.4).
       WMS_MOCK: ${WMS_MOCK:-false}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/wms
-      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:?set outside Git}@rabbitmq:5672/
       MMX_EVENTS_EXCHANGE: mmx.events
       MMX_TENANT_ID: mm-express
       WB_SIMULATOR_URL: http://wb-simulator:8090
@@ -183,15 +255,20 @@ services:
   wms-wb-sync: &wms-worker
     build:
       context: ../../services/wms
-    <<: *restart
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    <<: [*restart, *logging]
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
     depends_on:
       wms: {condition: service_healthy}
     environment: &wms-worker-env
       APP_ENV: development
       WMS_MOCK: ${WMS_MOCK:-false}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,wms,testserver}
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/wms
-      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/wms
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:?set outside Git}@rabbitmq:5672/
       MMX_EVENTS_EXCHANGE: mmx.events
       MMX_TENANT_ID: mm-express
       WB_SIMULATOR_URL: http://wb-simulator:8090
@@ -207,6 +284,15 @@ services:
       WB_SYNC_INTERVAL_SECONDS: ${WB_SYNC_INTERVAL_SECONDS:-1.0}
       WMS_ROLE: wb-sync
     command: ["python", "-m", "app.workers.wb_sync"]
+    healthcheck:
+      # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
+      # воркера стояли Up с зелёной пробой и нулём строк лога (раздел 3.5) —
+      # ровно потому, что проба смотрела на процесс (инвариант 14).
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "wb_sync"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # Стикеры заранее, пачкой до 100 (раздел 6.6).
   wms-wb-labels:
@@ -215,6 +301,15 @@ services:
       <<: *wms-worker-env
       WMS_ROLE: wb-labels
     command: ["python", "-m", "app.workers.wb_labels"]
+    healthcheck:
+      # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
+      # воркера стояли Up с зелёной пробой и нулём строк лога (раздел 3.5) —
+      # ровно потому, что проба смотрела на процесс (инвариант 14).
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "wb_labels"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # Сверка статусов с WB. Читает только GET /api/v3/orders, поэтому работает
   # и в shadow — там она главный инструмент (раздел 11, шаг 2).
@@ -224,6 +319,15 @@ services:
       <<: *wms-worker-env
       WMS_ROLE: wb-reconcile
     command: ["python", "-m", "app.workers.wb_reconcile"]
+    healthcheck:
+      # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
+      # воркера стояли Up с зелёной пробой и нулём строк лога (раздел 3.5) —
+      # ровно потому, что проба смотрела на процесс (инвариант 14).
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "wb_reconcile"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # События из outbox в шину, плюс партиции и ретеншен. На проде
   # integration_outbox дорос до 136 210 записей без чистки (раздел 3.6).
@@ -233,10 +337,21 @@ services:
       <<: *wms-worker-env
       WMS_ROLE: outbox
     command: ["python", "-m", "app.workers.outbox_publisher"]
+    healthcheck:
+      # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
+      # воркера стояли Up с зелёной пробой и нулём строк лога (раздел 3.5) —
+      # ровно потому, что проба смотрела на процесс (инвариант 14).
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "outbox"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   wb-simulator:
     build:
       context: ../../services/wb-simulator
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       token-guard: {condition: service_completed_successfully}
@@ -256,7 +371,12 @@ services:
   # ------------------------------------------------------------------ наблюдаемость
   prometheus:
     image: prom/prometheus:v3.4.1
-    <<: *restart
+    <<: [*restart, *logging]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     depends_on:
       token-guard: {condition: service_completed_successfully}
     volumes:
@@ -267,10 +387,15 @@ services:
 
   grafana:
     image: grafana/grafana:11.6.1
-    <<: *restart
+    <<: [*restart, *logging]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     depends_on: [prometheus]
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-stand-only-change-me}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set outside Git}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
@@ -287,6 +412,8 @@ services:
   workstation:
     build:
       context: ../../services/fbs-operator-workstation
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     restart: unless-stopped
     depends_on:
       wms: {condition: service_healthy}
@@ -300,12 +427,12 @@ services:
       # один и тот же (приложение B мастера).
       WMS_BASE_URL: http://wms:8080
 
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/workstation
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/workstation
 
       # Шина — ускоритель экрана, не источник истины (раздел 6.1). Убрать эту
       # строку целиком — законная конфигурация: рабочее место продолжит
       # работать опросом. Это ровно пункт 14 полного прогона.
-      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:-stand-only-change-me}@rabbitmq:5672/
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mmx}:${RABBITMQ_PASSWORD:?set outside Git}@rabbitmq:5672/
       MMX_EVENTS_EXCHANGE: mmx.events
       MMX_TENANT_ID: mm-express
 
@@ -331,7 +458,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     environment:
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/workstation
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/workstation
       MIGRATIONS_DIR: /migrations
     volumes:
       - ./scripts/migrate.sh:/migrate.sh:ro
@@ -345,6 +472,8 @@ services:
   workstation-agent:
     build:
       context: ../../services/fbs-operator-workstation
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     restart: unless-stopped
     depends_on:
       workstation: {condition: service_healthy}
@@ -361,6 +490,15 @@ services:
       APP_ENV: development
     # Телеметрия записи в устройство: PRINT_AGENT_STATS_URL шага 10 прогона.
     ports: ["127.0.0.1:8091:8091"]
+    healthcheck:
+      # Агент отвечает своей же телеметрией: если сокет к рабочему месту
+      # оборвался, отвечать будет нечему.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   # ================================================================ поток C
   # Деньги и кабинеты. Перенесено из compose.stream-c.yaml как есть.
@@ -376,7 +514,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     environment:
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/identity
       MIGRATIONS_DIR: /migrations
     volumes:
       - ./scripts/migrate.sh:/migrate.sh:ro
@@ -389,7 +527,7 @@ services:
     depends_on:
       identity-migrate: {condition: service_completed_successfully}
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set outside Git}
     volumes:
       - ../../services/identity/seed:/seed:ro
     entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "identity",
@@ -398,12 +536,14 @@ services:
   identity:
     build:
       context: ../../services/identity
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       identity-seed: {condition: service_completed_successfully}
     environment:
       APP_ENV: development
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/identity
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/identity
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
       # Пусто — на стенде боевого identity нет, и стендовые токены stand:<uuid>
       # разрешены только потому, что APP_ENV локальный. В защищённой среде
@@ -423,7 +563,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     environment:
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/billing
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/billing
       MIGRATIONS_DIR: /migrations
     volumes:
       # Скрипт потока 0 переиспользуется как есть: существующие миграции не
@@ -441,7 +581,7 @@ services:
     depends_on:
       billing-migrate: {condition: service_completed_successfully}
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-stand-only-change-me}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set outside Git}
     volumes:
       - ../../services/billing/seed:/seed:ro
     entrypoint: ["psql", "-h", "postgres", "-U", "wms", "-d", "billing",
@@ -451,6 +591,8 @@ services:
   billing:
     build:
       context: ../../services/billing
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       billing-seed: {condition: service_completed_successfully}
@@ -471,6 +613,8 @@ services:
   billing-worker:
     build:
       context: ../../services/billing
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       billing-seed: {condition: service_completed_successfully}
@@ -495,6 +639,8 @@ services:
   billing-inbox-consumer:
     build:
       context: ../../services/billing
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       billing-migrate: {condition: service_completed_successfully}
@@ -518,7 +664,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     environment:
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/internal_admin
       MIGRATIONS_DIR: /migrations
     volumes:
       - ./scripts/migrate.sh:/migrate.sh:ro
@@ -528,6 +674,8 @@ services:
   internal-admin:
     build:
       context: ../../services/internal-admin
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       internal-admin-migrate: {condition: service_completed_successfully}
@@ -535,7 +683,7 @@ services:
       identity: {condition: service_healthy}
     environment:
       APP_ENV: development
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/internal_admin
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/internal_admin
       BILLING_URL: http://billing:8080
       IDENTITY_URL: http://identity:8080
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,billing,identity,internal-admin,portal,testserver}
@@ -553,7 +701,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     environment:
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/portal
       MIGRATIONS_DIR: /migrations
     volumes:
       - ./scripts/migrate.sh:/migrate.sh:ro
@@ -565,6 +713,8 @@ services:
   portal:
     build:
       context: ../../services/portal
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     <<: *restart
     depends_on:
       portal-migrate: {condition: service_completed_successfully}
@@ -572,7 +722,7 @@ services:
       identity: {condition: service_healthy}
     environment:
       APP_ENV: development
-      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:-stand-only-change-me}@postgres:5432/portal
+      DATABASE_URL: postgresql://wms:${POSTGRES_PASSWORD:?set outside Git}@postgres:5432/portal
       BILLING_URL: http://billing:8080
       IDENTITY_URL: http://identity:8080
       WMS_BASE_URL: http://wms:8080

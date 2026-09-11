@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
@@ -113,10 +114,12 @@ def tidy_stand(wms: Wms, db: Db) -> Iterator[None]:
     до запуска нужна отдельно: она чинит уже накопленное, не дожидаясь, пока
     все прогоны станут аккуратными.
     """
-    _cancel_leftovers(wms, db, "до прогона")
+    _purge_run_data(db, "до прогона")
+    _reset_simulator("до прогона")
     _wait_for_the_cabinet_limit(db)
     yield
-    _cancel_leftovers(wms, db, "после прогона")
+    _purge_run_data(db, "после прогона")
+    _reset_simulator("после прогона")
 
 
 def _wait_for_the_cabinet_limit(db: Db) -> None:
@@ -180,30 +183,56 @@ def _wait_for_the_cabinet_limit(db: Db) -> None:
         time.sleep(2)
 
 
-def _cancel_leftovers(wms: Wms, db: Db, when: str) -> None:
-    """Снять незакрытые задания клиентов прогона. Тихо: это уборка, не проверка."""
+def _purge_run_data(db: Db, when: str) -> None:
+    """Удалить данные прогона целиком. Не отменить — удалить.
+
+    Отмена через API была неверна дважды. Она складская операция: возвращает
+    товар на полку, пишет движения, публикует остаток — сто шестьдесят отмен
+    подряд выбирали лимит кабинета, и следующий прогон не мог опросить WB
+    вовремя. И симулятор об отмене не знает: у него заказ остаётся `new`, у нас
+    становится `cancelled`, сверка честно называет это расхождением — так
+    накопился 401 `diverged` из заданий, которых давно нет.
+
+    Данные прогона синтетические и пересоздаются следующим запуском, поэтому их
+    правильно удалять. Подробности и обоснование по инварианту 3 — в самом
+    purge.sql.
+    """
     from scenario import LOAD_SELLER, SELLER
 
+    script = (Path(__file__).resolve().parent / "purge.sql").read_text(encoding="utf-8")
+    sellers = [SELLER, LOAD_SELLER]
     try:
-        rows = db.rows(
-            "SELECT t.id FROM wms_task t JOIN owner o ON o.id = t.owner_id "
-            " WHERE o.seller_external_id = ANY(%s) "
-            "   AND t.state IN ('new', 'reserved', 'picking', 'picked') "
-            " ORDER BY t.created_at LIMIT 5000", ([SELLER, LOAD_SELLER],))
-    except Exception:  # noqa: BLE001 — уборка не имеет права ронять прогон
+        # Список клиентов — отдельным параметризованным запросом: psycopg не
+        # выполняет многооператорный скрипт с параметрами, а подставлять имена
+        # в текст руками нельзя.
+        db.execute_script(
+            "DROP TABLE IF EXISTS run_owner; DROP TABLE IF EXISTS run_owner_name;")
+        db.execute("CREATE TEMP TABLE run_owner_name AS "
+                   "SELECT unnest(%s::text[]) AS seller_external_id", (sellers,))
+        db.execute("CREATE TEMP TABLE run_owner AS SELECT id FROM owner "
+                   " WHERE seller_external_id = ANY(%s)", (sellers,))
+        db.execute_script(script)
+        db.execute_script("DROP TABLE IF EXISTS run_owner; "
+                          "DROP TABLE IF EXISTS run_owner_name;")
+    except Exception as failure:  # noqa: BLE001 — уборка не имеет права ронять прогон
+        print(f"\nуборка {when}: не удалось убрать данные прогона ({failure})")
         return
+    print(f"\nуборка {when}: данные прогона удалены")
 
-    cancelled = 0
-    for row in rows:
-        try:
-            wms.result(f"/tasks/{row['id']}/cancel", {
-                "cancellation_event_id": f"full-run-tidy-{row['id']}",
-                "handed_over": False})
-            cancelled += 1
-        except Exception:  # noqa: BLE001 — задание могло уйти дальше по автомату
-            continue
-    if cancelled:
-        print(f"\nуборка {when}: отменено {cancelled} незакрытых заданий прогона")
+
+def _reset_simulator(when: str) -> None:
+    """Сбросить симулятор WB — вторую сторону той же картины.
+
+    Без этого у него остаются заказы прогона, которых в нашей базе уже нет:
+    сверка видит несовпадение и плодит `diverged` на пустом месте.
+    """
+    import httpx
+
+    base = (os.getenv("WB_SIMULATOR_URL") or "http://127.0.0.1:8090").rstrip("/")
+    try:
+        httpx.post(f"{base}/__stand__/reset", timeout=10.0).raise_for_status()
+    except Exception as failure:  # noqa: BLE001
+        print(f"\nуборка {when}: симулятор не сбросился ({failure})")
 
 
 @pytest.fixture(scope="session")
@@ -278,6 +307,18 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
     write("=" * 100)
     write("ПОЛНЫЙ ПРОГОН — раздел 9.6 мастер-контекста, 16 проверок")
     write("Владелец — поток, который чинит красный (правило 9.5.5).")
+
+    # Из какого коммита собран стенд. Прогон без этой строки говорит «зелёно»,
+    # но не говорит «зелёно У ЧЕГО»: образ мог быть собран вчера из другого
+    # клона, и выглядел бы он точно так же.
+    from runner import repository_revision, stand_revision
+
+    stand, repo = stand_revision(), repository_revision()
+    if stand == repo:
+        write(f"Стенд собран из {stand[:12]} — тот же коммит, что в рабочем каталоге.")
+    else:
+        write(f"ВНИМАНИЕ: стенд собран из {stand[:12]}, а в рабочем каталоге {repo[:12]}.")
+        write("Прогон проверяет ОБРАЗ СТЕНДА, а не то, что лежит в файлах.")
     write("=" * 100)
     write(f"{'шаг':>3}  {'владелец':<9} {'статус':<10} проверка")
     write("-" * 100)

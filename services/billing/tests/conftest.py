@@ -21,6 +21,25 @@ from psycopg.rows import dict_row
 
 from app.db import Database
 
+
+def _guard_test_database(dsn: str, variable: str) -> str:
+    """Не пускать тесты в рабочую базу.
+
+    Фолбэк на DATABASE_URL уже стоил стенду 957 чужих владельцев `utest-*`:
+    переменную забывали задать, и тесты молча уходили писать туда, где живут
+    настоящие данные. Забыть — это норма; уронить из-за этого стенд — нет.
+    """
+    from urllib.parse import urlparse
+
+    name = (urlparse(dsn).path or "").lstrip("/").split("?")[0]
+    if not name.endswith("_test"):
+        pytest.exit(
+            f"{variable} указывает на базу {name!r}, а имя обязано оканчиваться "
+            f"на '_test'. Тесты заводят данные пачками — в рабочей базе им не место.",
+            returncode=2)
+    return dsn
+
+
 MIGRATIONS = pathlib.Path(__file__).resolve().parents[1] / "migrations"
 
 # Дата, на которую считают все тесты. Фиксированная: «сегодня» в тесте про
@@ -29,12 +48,12 @@ TODAY = date(2026, 9, 10)
 
 
 def admin_url() -> str:
-    url = os.getenv("BILLING_TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
+    url = os.getenv("BILLING_TEST_DATABASE_URL")
     if not url:
         raise RuntimeError(
             "нужен BILLING_TEST_DATABASE_URL: тесты биллинга идут против настоящего "
             "Postgres, потому что половина правил держится схемой, а не кодом")
-    return url
+    return _guard_test_database(url, "BILLING_TEST_DATABASE_URL")
 
 
 @pytest.fixture(scope="session")

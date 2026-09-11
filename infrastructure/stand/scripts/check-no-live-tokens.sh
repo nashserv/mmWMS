@@ -25,7 +25,12 @@ JWT_RE='eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
 SECRET_ASSIGN_RE='(WB_TOKEN|WB_API_KEY|WB_CLIENT_SECRET|API_KEY|api_key|secret_ref|authorization)[[:space:]]*[:=][[:space:]]*"?[A-Za-z0-9_/+.-]{20,}'
 
 # Явные заглушки — их наличие ожидаемо и не является находкой.
-PLACEHOLDER_RE='(test-token-|development-only-|change-me|placeholder|REDACTED|vault://|\$\{[A-Za-z_]+:\?)'
+#
+# Проверяется ЗНАЧЕНИЕ целиком, а не вхождение подстроки в строку. Иначе
+# настоящий токен в строке, где рядом стоит слово change-me, проходит ворота
+# насквозь: «# TODO: change-me» в комментарии рядом с ключом — и мы пропустили
+# именно то, ради чего ворота стоят.
+PLACEHOLDER_VALUE_RE='^(test-token-[A-Za-z0-9_-]*|development-only-[A-Za-z0-9_-]*|stand-fake-secret-[0-9]+|placeholder[A-Za-z0-9_-]*|REDACTED|vault://.*|\$\{[A-Za-z_]+:[?-].*)$'
 
 found=0
 scanned=0
@@ -35,8 +40,10 @@ scan_one() {
     local label="$2"
 
     while IFS= read -r hit; do
-        # Отбрасываем строки, которые целиком объясняются заглушкой.
-        if grep -Eq "$PLACEHOLDER_RE" <<<"$hit"; then
+        # Берём именно значение секрета, а не всю строку, и отбрасываем только
+        # если ЗНАЧЕНИЕ целиком — заглушка.
+        value="$(sed -E 's/.*[:=][[:space:]]*"?//; s/"?[,;].*$//; s/[[:space:]]*$//' <<<"$hit")"
+        if grep -Eq "$PLACEHOLDER_VALUE_RE" <<<"$value"; then
             continue
         fi
         if [ $found -eq 0 ]; then
@@ -53,6 +60,14 @@ for target in "${TARGETS[@]}"; do
     if [ ! -e "$target" ]; then
         echo "проверять нечего: $target не существует" >&2
         continue
+    fi
+    # Пустой каталог — это НЕ пройденная проверка. Смонтировали не тот том,
+    # забыли положить дамп — ворота обязаны отказать, а не отрапортовать
+    # «чисто» о пустоте.
+    if [ -d "$target" ] && [ -z "$(find "$target" -type f -print -quit 2>/dev/null)" ]; then
+        echo "СТЕНД НЕ ПОДНЯТ: каталог $target пуст — проверять нечего." >&2
+        echo "Пустая проверка — это не пройденная проверка." >&2
+        exit 2
     fi
     scanned=$((scanned + 1))
     scan_one "$target" "$target"

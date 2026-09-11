@@ -16,6 +16,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable, NoReturn
 from urllib.parse import urlparse
 
@@ -154,6 +155,32 @@ class Db:
         except Exception as failure:  # noqa: BLE001
             not_ready(f"запрос к базе не выполнился ({failure}); схема потока 0 применена?")
 
+    def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
+        """Один оператор без чтения результата. `rows` для этого не годится:
+        `CREATE TABLE … AS SELECT` записей не возвращает."""
+        connection = self._connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, tuple(params))
+        except Exception as failure:  # noqa: BLE001
+            not_ready(f"запрос к базе не выполнился ({failure})")
+
+    def execute_script(self, sql: str, params: dict[str, Any] | None = None) -> None:
+        """Выполнить многооператорный скрипт одной транзакцией.
+
+        Отдельно от `rows`, потому что тот приводит параметры к кортежу, а
+        скрипт уборки адресует их по имени, и потому что результат здесь не
+        читают — важно, что либо прошло всё, либо ничего.
+        """
+        connection = self._connect()
+        previous = connection.autocommit
+        try:
+            connection.autocommit = True     # BEGIN/COMMIT стоят в самом скрипте
+            with connection.cursor() as cursor:
+                cursor.execute(sql, params or {})
+        finally:
+            connection.autocommit = previous
+
     def row(self, sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
         found = self.rows(sql, params)
         return found[0] if found else None
@@ -237,6 +264,11 @@ class TxnWatch:
     #
     # Различать их стало можно потому, что у каждого процесса теперь своё
     # `application_name` (WMS_ROLE). До этого все представлялись `wms`.
+    # Чьи транзакции смотреть. Резерв делает тот процесс, который его вызвал:
+    # в шаге 4 это опросчик (задания приходят от WB), в шаге 16 — маршрут
+    # `/reservations`, который дёргает нагрузка. Смотреть «всё сразу» нельзя:
+    # тогда в выборку попадают фоновые транзакции публикатора outbox и сверки,
+    # к резерву отношения не имеющие.
     APPLICATION = "wms-api"
 
     SQL = """
@@ -251,8 +283,10 @@ class TxnWatch:
            AND application_name = %s
     """
 
-    def __init__(self, db: Db, interval_s: float = 0.005) -> None:
+    def __init__(self, db: Db, interval_s: float = 0.005,
+                 application: str | None = None) -> None:
         self._db = db.spawn()
+        self._application = application or self.APPLICATION
         self._interval = interval_s
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -273,7 +307,7 @@ class TxnWatch:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                for row in self._db.rows(self.SQL, (self.APPLICATION,)):
+                for row in self._db.rows(self.SQL, (self._application,)):
                     self.samples.append(TxnSample(
                         state=str(row.get("state") or ""),
                         age_ms=float(row.get("age_ms") or 0.0),
@@ -508,3 +542,42 @@ def percentile_from_buckets(before: dict[float, float], after: dict[float, float
         if count >= target:
             return float("inf") if edge == float("inf") else edge * 1000.0
     return None
+
+
+# ------------------------------------------------------- из чего собран стенд
+
+
+def stand_revision(wms_container: str = "mmx-stand-wms-1") -> str:
+    """Коммит, из которого собран образ, поднятый на стенде.
+
+    «Стенд поднят из main» без этого — утверждение, а не факт: контейнер,
+    собранный вчера из другого клона, выглядит точно так же. Метка
+    `org.opencontainers.image.revision` проставляется при сборке из GIT_SHA.
+
+    Читается через docker, а не через сам сервис: сервис о своём образе не
+    знает, и спрашивать его значило бы верить ему на слово.
+    """
+    import subprocess
+
+    try:
+        done = subprocess.run(
+            ["docker", "inspect", wms_container, "--format",
+             '{{index .Config.Labels "org.opencontainers.image.revision"}}'],
+            capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001 — отчёт не имеет права падать из-за подписи
+        return "неизвестен"
+    revision = (done.stdout or "").strip()
+    return revision or "неизвестен"
+
+
+def repository_revision() -> str:
+    """Коммит рабочего каталога — с чем сравнивать образ стенда."""
+    import subprocess
+
+    try:
+        done = subprocess.run(["git", "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10,
+                              cwd=str(Path(__file__).resolve().parents[2]))
+    except Exception:  # noqa: BLE001
+        return "неизвестен"
+    return (done.stdout or "").strip() or "неизвестен"

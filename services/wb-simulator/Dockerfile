@@ -5,6 +5,12 @@ COPY requirements.txt .
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* \
  && pip install --no-cache-dir -r requirements.txt
 COPY --chown=65532:65532 app ./app
+# Из какого коммита собран образ. Без этого «стенд поднят из main» —
+# утверждение, а не факт: контейнер, собранный вчера из другого клона,
+# выглядит точно так же (`docker inspect` покажет revision).
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA
+
 EXPOSE 8090
 USER 65532:65532
 CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8090"]
