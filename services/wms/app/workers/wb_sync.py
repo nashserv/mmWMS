@@ -43,6 +43,22 @@ SYNC_INTERVAL = float(os.getenv("WB_SYNC_INTERVAL_SECONDS", "0.5"))
 # повторный опрос идемпотентен по wb_order_id (инвариант 5).
 SYNC_OVERLAP = int(os.getenv("WB_SYNC_OVERLAP", "10"))
 ACCOUNTS_PER_TICK = int(os.getenv("WB_SYNC_ACCOUNTS_PER_TICK", "8"))
+
+# Пауза, когда опрашивать было нечего. Это НЕ то же самое, что SYNC_INTERVAL, и
+# путать их дорого.
+#
+# SYNC_INTERVAL — как часто опрашивать ОДИН кабинет, и он про бюджет лимита
+# Wildberries: 300 запросов в минуту на кабинет (приложение D).
+#
+# IDLE_SECONDS — сколько спать, когда ни один кабинет не подошёл по сроку.
+# Холостой такт не делает в WB НИ ОДНОГО вызова: он только спрашивает Postgres,
+# кому пора. Бюджету лимита он не стоит ничего, а вот задержку «WB →
+# доступность» (критерий раздела 10, меньше 2 с) добавляет целиком.
+#
+# Когда они были одним числом, кабинетов 24 и восемь за такт, полный круг
+# складывался из трёх тактов плюс холостая пауза — и упирался в те самые 2 с,
+# из-за чего шаг 4 полного прогона краснел через раз.
+IDLE_SECONDS = float(os.getenv("WB_SYNC_IDLE_SECONDS", "0.2"))
 LEASE_SECONDS = int(os.getenv("WB_SYNC_LEASE_SECONDS", "120"))
 
 
@@ -188,7 +204,7 @@ class WbSyncWorker:
 def main() -> None:
     configure_logging()
     worker = WbSyncWorker(shared_pool())
-    Worker("wb_sync", idle_seconds=SYNC_INTERVAL).run(worker.tick)
+    Worker("wb_sync", idle_seconds=IDLE_SECONDS).run(worker.tick)
 
 
 if __name__ == "__main__":
