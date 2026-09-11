@@ -24,7 +24,8 @@ import sys
 import threading
 import time
 from collections import Counter
-from datetime import timedelta
+from datetime import date, timedelta
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -46,12 +47,19 @@ OUTBOX_INTERVAL = float(os.getenv("BILLING_OUTBOX_INTERVAL_SECONDS", "5"))
 OUTBOX_BATCH = int(os.getenv("BILLING_OUTBOX_BATCH", "100"))
 
 
-def box_places(seller_external_id: str) -> int:
-    """Сколько коробко-мест занимает клиент — по данным склада.
+def box_places(seller_external_id: str, day: date) -> dict[str, Any]:
+    """Сколько коробо-мест занимал клиент НА КОНЕЦ ЭТИХ СУТОК — по данным склада.
 
-    Вызов в `wms` идёт снаружи транзакции (инвариант 2). Коробка — фактическая
-    единица адресации склада (раздел 2.9), поэтому считаем коробки, а не штуки:
-    место занимает коробка, а не то, сколько в неё положили.
+    Вызов в `wms` идёт снаружи транзакции (инвариант 2).
+
+    День здесь не для красоты. Хранение начисляется за прошедшие сутки и
+    досчитывается за пропущенные дни (`STORAGE_BACKFILL_DAYS`). Раньше склад
+    спрашивали без дня — и досчёт за три дня брал СЕГОДНЯШНИЙ остаток трижды,
+    то есть начислял хранение за дни, когда товара ещё не было.
+
+    Считает склад, а не мы: «сколько места занимает товар» — складской факт.
+    Возвращается и число мест, и сколько товара посчитать не удалось за
+    отсутствием нормы: придумывать количество и ставить его в счёт нельзя.
     """
     base = os.getenv("WMS_BASE_URL", "http://wms:8080").rstrip("/")
     path = os.getenv("WMS_API_PATH", "/api/mmx/wms/v1")
@@ -63,13 +71,18 @@ def box_places(seller_external_id: str) -> int:
     token = (os.getenv("SERVICE_TOKEN") or "").strip()
     if token:
         headers["authorization"] = f"Bearer {token}"
-    response = httpx.post(f"{base}{path}/storage/lookup", timeout=15.0,
+    response = httpx.post(f"{base}{path}/storage/places", timeout=15.0,
                           headers=headers, json={
         "jsonrpc": "2.0", "method": "call", "id": 1,
-        "params": {"seller_external_id": seller_external_id}})
+        "params": {"seller_external_id": seller_external_id, "day": day.isoformat()}})
     response.raise_for_status()
-    placements = (response.json().get("result") or {}).get("placements") or []
-    return len({str(row.get("box_barcode")) for row in placements if row.get("box_barcode")})
+    body = response.json()
+    if body.get("error"):
+        raise RuntimeError(f"склад отказал: {body['error'].get('message')}")
+    result = body.get("result") or {}
+    return {"places": Decimal(str(result.get("places") or 0)),
+            "skus_without_norm": int(result.get("skus_without_norm") or 0),
+            "units_without_norm": int(result.get("units_without_norm") or 0)}
 
 
 class StorageLoop:

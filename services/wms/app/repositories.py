@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import date
 from typing import Any
 from collections.abc import Iterable, Sequence
 
@@ -2057,3 +2058,96 @@ def save_divergence_report(cursor: Cursor, lines: Sequence[dict[str, Any]]) -> i
           "state": line["state"], "wb_status": line.get("wb_status"),
           "tasks": int(line["tasks"]), "oldest": line.get("oldest")} for line in lines])
     return len(lines)
+
+
+# ---------------------------------------------------- хранение: норма и объём
+#
+# Хранение считается от объёма товара, а не от числа занятых коробов (решение
+# владельца 12.09.2026, раздел 13). Обоснование и оговорки — в миграции
+# 010_units_per_box.sql.
+
+
+def observe_units_per_box(cursor: Cursor, owner_id: uuid.UUID,
+                          sku_ids: set[uuid.UUID]) -> None:
+    """Поднять норму «сколько входит в короб» по тому, как товар реально лёг.
+
+    Зовётся после приёмки. Норма — ВЕРХНЯЯ планка наблюдённого, а не последнее
+    значение: короб, принятый наполовину, не должен опускать норму, снятую с
+    полного. Опустить её может только человек через админку.
+
+    Считается по `stock_balance`, а не по строке приёмки: в один короб могут
+    лечь несколько строк одной приёмки и несколько приёмок подряд. Норма — это
+    сколько в коробе лежит, а не сколько за раз положили.
+    """
+    if not sku_ids:
+        return
+    cursor.execute(
+        "UPDATE sku SET units_per_box = GREATEST(COALESCE(sku.units_per_box, 0), fullest.qty) "
+        "  FROM (SELECT b.sku_id, max(b.qty) AS qty "
+        "          FROM stock_balance b "
+        "         WHERE b.owner_id = %(owner)s AND b.sku_id = ANY(%(skus)s) "
+        "           AND b.box_id IS NOT NULL AND b.qty > 0 "
+        "         GROUP BY b.sku_id) AS fullest "
+        " WHERE sku.id = fullest.sku_id AND sku.owner_id = %(owner)s "
+        "   AND fullest.qty > COALESCE(sku.units_per_box, 0)",
+        {"owner": owner_id, "skus": list(sku_ids)})
+
+
+def set_units_per_box(cursor: Cursor, owner_id: uuid.UUID, barcode: str,
+                      units: int | None) -> dict[str, Any] | None:
+    """Поправить норму руками. `None` — снять норму (товар перестанет считаться).
+
+    Нужна потому, что снятая с приёмки норма не лучше самого полного короба,
+    который приезжал: товар, приходящий пробными партиями по десять штук,
+    получит норму 10, и клиент заплатит целое место за десять футболок.
+    """
+    if units is not None and units <= 0:
+        raise ValueError("норма должна быть больше нуля")
+    cursor.execute(
+        "UPDATE sku SET units_per_box = %s WHERE owner_id = %s AND barcode = %s "
+        "RETURNING id, barcode, units_per_box", (units, owner_id, barcode))
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def storage_places(cursor: Cursor, owner_id: uuid.UUID, as_of: date) -> dict[str, Any]:
+    """Сколько коробо-мест занимал товар клиента на конец суток `as_of`.
+
+        коробо-места = Σ по штрихкодам ( остаток_единиц / норма_единиц_в_коробе )
+
+    Остаток берётся ИЗ ЖУРНАЛА на конец дня, а не из проекции. Проекция знает
+    только «сейчас», а хранение начисляется за прошедшие сутки и досчитывается
+    за пропущенные дни: считая по проекции, воркер начислял позавчерашнее
+    хранение по сегодняшнему остатку — то есть за дни, когда товара ещё не
+    было.
+
+    Считаются ВСЕ состояния. Брак, карантин и заблокированное занимают полку
+    ровно так же, как годный товар; не считать их — значит держать чужой
+    неликвид бесплатно (допущение интегратора 12.09.2026, раздел 13).
+
+    Товар без нормы НЕ ВХОДИТ в число и возвращается отдельно. Придумать
+    количество и поставить его в счёт хуже, чем сказать, что оно неизвестно:
+    биллинг заведёт строку «не дошло до счёта», человек поправит норму, и
+    начисление переиграется (находка 4.3).
+    """
+    cursor.execute(
+        "WITH on_hand AS ( "
+        "    SELECT m.sku_id, "
+        "           sum(CASE WHEN m.state_to   IS NOT NULL THEN m.qty ELSE 0 END) "
+        "         - sum(CASE WHEN m.state_from IS NOT NULL THEN m.qty ELSE 0 END) AS qty "
+        "      FROM stock_move m "
+        "     WHERE m.owner_id = %(owner)s AND m.ts < (%(as_of)s::date + 1) "
+        "     GROUP BY m.sku_id) "
+        # Сотая коробо-места — это литр из девяноста шести. Точность ниже
+        # любой измеримой: округление здесь делает счёт читаемым, а не кривым.
+        "SELECT COALESCE(round(sum(CASE WHEN s.units_per_box IS NOT NULL "
+        "                         THEN h.qty::numeric / s.units_per_box END), 2), 0) AS places, "
+        "       count(*) FILTER (WHERE s.units_per_box IS NULL) AS without_norm, "
+        "       COALESCE(sum(h.qty) FILTER (WHERE s.units_per_box IS NULL), 0) AS units_without_norm "
+        "  FROM on_hand h JOIN sku s ON s.id = h.sku_id "
+        " WHERE h.qty > 0",
+        {"owner": owner_id, "as_of": as_of})
+    row = cursor.fetchone()
+    return {"places": float(row["places"]),
+            "skus_without_norm": int(row["without_norm"]),
+            "units_without_norm": int(row["units_without_norm"])}

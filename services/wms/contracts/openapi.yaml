@@ -17,7 +17,7 @@ openapi: 3.1.0
 
 info:
   title: MM-Express WMS — контракт сервиса wms
-  version: 1.3.0
+  version: 1.4.0
   summary: JSON-RPC контракт склада для рабочего места, каталога и возвратов.
   description: |
     Складской сервис `wms` фулфилмент-оператора MM-Express (FBS Wildberries).
@@ -344,6 +344,94 @@ paths:
                   - properties:
                       result:
                         $ref: '#/components/schemas/WbCardsResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /storage/places:
+    post:
+      operationId: storagePlaces
+      tags: [storage, new]
+      summary: Сколько коробо-мест занимал товар клиента на конец суток.
+      description: |
+        Количество для тарифа «хранение» (раздел 3.4). Единица прежняя —
+        коробо-место × сутки, — но считается она от ОБЪЁМА товара, а не от
+        числа занятых коробов (решение владельца 12.09.2026, раздел 13):
+
+            коробо-места = Σ по штрихкодам ( остаток / units_per_box )
+
+        Правило живёт здесь, а не в биллинге: «сколько места занимает товар» —
+        складской факт. Биллингу нужно одно число, а не список размещений.
+
+        **`day` обязателен.** Хранение начисляется за прошедшие сутки и
+        досчитывается за пропущенные дни; остаток берётся из журнала на конец
+        этих суток, а не из проекции. Отвечать на такой вопрос сегодняшним
+        остатком — значит начислять за дни, когда товара ещё не было.
+
+        Считаются все состояния: брак и карантин занимают полку так же, как
+        годный товар.
+
+        Товар без нормы в `places` НЕ входит и возвращается в
+        `skus_without_norm`: придумать количество и поставить его в счёт хуже,
+        чем сказать, что оно неизвестно.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/StoragePlacesParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/StoragePlacesResult'
+        default:
+          $ref: '#/components/responses/TransportError'
+
+  /catalog/units-per-box:
+    post:
+      operationId: catalogUnitsPerBox
+      tags: [catalog, new]
+      summary: Поправить норму «сколько единиц входит в короб».
+      description: |
+        Норма снимается с приёмки как максимум наблюдённого, но она не лучше
+        самого полного короба, который когда-либо приезжал. Товар, приходящий
+        пробными партиями по десять штук, получит норму 10 — и клиент заплатит
+        целое коробо-место за десять футболок, хотя их влезает сорок четыре.
+
+        Поэтому правка руками — не административная роскошь, а часть модели.
+        `units_per_box: null` снимает норму: товар перестаёт считаться и
+        попадает в `skus_without_norm`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/JsonRpcRequest'
+                - properties:
+                    params:
+                      $ref: '#/components/schemas/UnitsPerBoxParams'
+      responses:
+        '200':
+          description: Ответ JSON-RPC.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JsonRpcResponse'
+                  - properties:
+                      result:
+                        $ref: '#/components/schemas/UnitsPerBoxResult'
         default:
           $ref: '#/components/responses/TransportError'
 
@@ -3250,6 +3338,72 @@ components:
         updated_at:
           type: [string, 'null']
           format: date-time
+
+    StoragePlacesParams:
+      type: object
+      required: [seller_external_id, day]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        day:
+          type: string
+          format: date
+          description: >-
+            Сутки, на конец которых считается остаток. Обязателен: умолчание
+            «сегодня» — это ровно тот молчаливый ответ, из-за которого досчёт
+            за прошлые сутки считался по сегодняшнему остатку.
+
+    StoragePlacesResult:
+      type: object
+      required: [seller_external_id, day, places, skus_without_norm, units_without_norm]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        day:
+          type: string
+          format: date
+        places:
+          type: number
+          minimum: 0
+          description: >-
+            Коробо-места с точностью до сотых. Дробное число — не ошибка:
+            считается объём товара, а не число занятых коробов.
+        skus_without_norm:
+          type: integer
+          minimum: 0
+          description: Сколько товаров не посчитано за отсутствием нормы.
+        units_without_norm:
+          type: integer
+          minimum: 0
+          description: Сколько единиц в них лежит.
+
+    UnitsPerBoxParams:
+      type: object
+      required: [seller_external_id, barcode]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        units_per_box:
+          type: [integer, 'null']
+          minimum: 1
+          description: Ноль запрещён — на норму делят. `null` снимает норму.
+
+    UnitsPerBoxResult:
+      type: object
+      required: [seller_external_id, barcode, units_per_box]
+      additionalProperties: false
+      properties:
+        seller_external_id:
+          $ref: '#/components/schemas/SellerExternalId'
+        barcode:
+          $ref: '#/components/schemas/Barcode'
+        units_per_box:
+          type: [integer, 'null']
 
     ReceiptsScreenParams:
       type: object

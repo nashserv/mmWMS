@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, UTC
+from datetime import date, datetime, timedelta, UTC
 from typing import Any
 from collections.abc import Callable
 
@@ -56,6 +56,7 @@ class ReceivingOperations:
 
         actor = _uuid_or_none(params.get("actor_id"))
         touched: set[uuid.UUID] = set()
+        boxed: set[uuid.UUID] = set()
         owner_id: uuid.UUID | None = None
 
         with self._pool.connection() as connection:
@@ -138,6 +139,12 @@ class ReceivingOperations:
                             doc_ref=reference, actor_id=actor,
                             idem_key=f"receipt:{owner['id']}:{reference}:{barcode}:{cell['address']}")
                         touched.add(sku["id"])
+                        if box is not None:
+                            # Товар лёг в короб — значит, есть чем измерить
+                            # норму «сколько входит». Считается она не отсюда,
+                            # а после цикла по `stock_balance`: в один короб
+                            # могут лечь несколько строк и несколько приёмок.
+                            boxed.add(sku["id"])
                         accepted_qty += actual
                     accepted += 1
 
@@ -161,6 +168,12 @@ class ReceivingOperations:
                     cursor, receipt["id"])
                 state = "accepted" if counted_all else "counting"
                 repo.set_receipt_state(cursor, receipt["id"], state)
+
+                # Норма «сколько входит в короб» снимается здесь и больше
+                # нигде: приёмка — единственный момент, когда склад своими
+                # руками выясняет, сколько этой вещи помещается. По этой норме
+                # считается хранение (решение владельца 12.09.2026).
+                repo.observe_units_per_box(cursor, owner["id"], boxed)
 
                 # Событие приёмки — той же транзакцией, что и движения
                 # (инвариант 13, приложение E: sequence инкрементируется вместе
@@ -530,6 +543,59 @@ class ReceivingOperations:
                                 if key not in ("seller_external_id", "owner_external_id")}
                                for row in rows]}
 
+    def places(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Сколько коробо-мест занимал товар клиента на конец суток.
+
+        Считает склад, а не биллинг: «сколько места занимает этот товар» —
+        складской факт, и правило его подсчёта обязано жить там же, где данные.
+        Биллингу нужно одно число, а не список размещений.
+
+        День обязателен. Хранение начисляется за ПРОШЕДШИЕ сутки и
+        досчитывается за пропущенные дни; отвечать на такой вопрос сегодняшним
+        остатком — значит начислять за дни, когда товара ещё не было.
+        """
+        seller = _text(params.get("seller_external_id"))
+        if not seller:
+            raise ValueError("seller_external_id обязателен")
+        day = _date_or_none(params.get("day"))
+        if day is None:
+            raise ValueError("day обязателен: остаток берётся на конец этих суток")
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                owner = repo.find_owner(cursor, seller)
+                if owner is None:
+                    # Клиента нет — это ноль мест, а не отказ: биллинг спрашивает
+                    # про кабинеты, которых у склада может и не быть.
+                    return {"seller_external_id": seller, "day": day.isoformat(),
+                            "places": 0.0, "skus_without_norm": 0,
+                            "units_without_norm": 0}
+                counted = repo.storage_places(cursor, owner["id"], day)
+        return {"seller_external_id": seller, "day": day.isoformat(), **counted}
+
+    def set_units_per_box(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Поправить норму «сколько единиц входит в короб».
+
+        Норма, снятая с приёмки, не лучше самого полного короба, который
+        приезжал: товар, приходящий пробными партиями, будет считаться дороже
+        правды. Правка руками — единственный способ это исправить, поэтому
+        маршрут есть и он не административная роскошь.
+        """
+        seller = _text(params.get("seller_external_id"))
+        barcode = _text(params.get("barcode"))
+        if not seller or not barcode:
+            raise ValueError("seller_external_id и barcode обязательны")
+        units = _int_or_none(params.get("units_per_box"))
+        with self._pool.connection() as connection:
+            with single(connection) as cursor:
+                owner = repo.find_owner(cursor, seller)
+                if owner is None:
+                    raise ValueError(f"клиент {seller!r} не найден")
+                row = repo.set_units_per_box(cursor, owner["id"], barcode, units)
+                if row is None:
+                    raise ValueError(f"товара {barcode!r} у клиента {seller!r} нет")
+        return {"seller_external_id": seller, "barcode": barcode,
+                "units_per_box": row["units_per_box"]}
+
     def count_cell(self, params: dict[str, Any]) -> dict[str, Any]:
         """Пересчёт одной ячейки — частный случай инвентаризации.
 
@@ -582,6 +648,18 @@ def _int_or_none(value: Any) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def _date_or_none(value: Any) -> date | None:
+    """`YYYY-MM-DD` → дата. Мусор — это отказ, а не сегодняшнее число: хранение
+    за «сегодня вместо позавчера» молча начислит не то."""
+    text = _text(value)
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        raise ValueError(f"день {text!r} не разбирается как YYYY-MM-DD") from None
 
 
 def _uuid_or_none(value: Any) -> uuid.UUID | None:

@@ -366,6 +366,12 @@ def create_router(pool: ConnectionPool) -> APIRouter:
     post("/boxes/list", receiving.list_boxes)
     post("/boxes/remove", receiving.remove_box)
     post("/storage/lookup", receiving.lookup)
+    # Сколько коробо-мест занимал товар клиента на конец суток. Правило
+    # подсчёта живёт здесь, а не в биллинге: это складской факт.
+    post("/storage/places", receiving.places)
+    # Правка нормы «сколько входит в короб»: снятая с приёмки не лучше самого
+    # полного короба, который приезжал.
+    post("/catalog/units-per-box", receiving.set_units_per_box)
     # Чтение итога по состояниям (StorageCountResult), а не пересчёт:
     # пересчёт ячейки — это /inventory/count со scope=partial.
     post("/storage/count", stock.count_by_state)

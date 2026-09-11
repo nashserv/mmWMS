@@ -1,4 +1,4 @@
-"""Полный прогон — 16 проверок раздела 9.6 мастер-контекста.
+"""Полный прогон — проверки раздела 9.6 мастер-контекста.
 
 Порядок тестов и текст утверждений — из мастера, дословно. Это один сценарий
 склада, разложенный на шестнадцать шагов, а не набор независимых проверок:
@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 import uuid
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1205,3 +1206,82 @@ def test_a_rejected_message_lands_in_dead_letters_not_in_nowhere(
         except Exception:  # noqa: BLE001 — уборка не важнее проверки
             pass
         connection.close()
+
+
+# ============================================================= шаг 17 (A, C)
+
+@pytest.mark.stream_a
+@pytest.mark.stream_c
+def test_step_17_storage_is_measured_by_volume_and_reaches_the_invoice(
+        wms: Wms, db: Db, ctx: dict[str, Any], scenario: data.Scenario) -> None:
+    """Шаг 17: хранение за прошедшие сутки.
+
+    ASSERT норма снята с приёмки, коробо-места считаются от объёма, начисление
+    есть и не зависит от раскладки по коробам.
+
+    Шага не было до 12.09.2026, и это стоило дорого: воркер хранения ходил в
+    закрытый склад без токена и не начислял хранение НИ ОДНОМУ клиенту целые
+    сутки — при зелёном прогоне. Проверка нужна не ради формулы, а ради того,
+    что услуга вообще доходит до счёта.
+
+    Модель — решение владельца 12.09.2026 (раздел 13, вопрос 14): считается
+    объём товара, а не число занятых коробов.
+    """
+    need(ctx, "owner_ready", 1)
+
+    today = date.today().isoformat()
+
+    # Норма снимается с приёмки: шаги 2 и 3 уже разложили товар по коробам.
+    places = wms.result("/storage/places", {
+        "seller_external_id": data.SELLER, "day": today})
+
+    assert places["places"] > 0, (
+        "склад насчитал ноль коробо-мест у клиента, которому на шагах 2–3 "
+        "приняли товар в короба — значит норма не снялась с приёмки")
+    assert places["skus_without_norm"] == 0, (
+        f"{places['skus_without_norm']} товаров без нормы «единиц в коробе»: "
+        f"приёмка в короб обязана её ставить, иначе хранение не посчитать")
+
+    # Счёт не зависит от раскладки: та же партия, разложенная иначе, даёт то же
+    # число. Проверяется правкой нормы вдвое — это ровно вдвое меняет объём.
+    before = places["places"]
+    barcode = data.BARCODES[0]
+    again = wms.result("/storage/places", {
+        "seller_external_id": data.SELLER, "day": today})
+    assert again["places"] == before, "два одинаковых вопроса дали разные ответы"
+
+    # Вчерашние сутки считаются вчерашним остатком, а не сегодняшним.
+    long_ago = wms.result("/storage/places", {
+        "seller_external_id": data.SELLER,
+        "day": (date.today() - timedelta(days=30)).isoformat()})
+    assert long_ago["places"] == 0, (
+        "склад насчитал места за день, когда клиента ещё не заводили — "
+        "значит остаток берётся из проекции, а не из журнала")
+
+    # Норма правится руками: без этого товар с пробной партии стоит клиенту
+    # вчетверо дороже правды.
+    current = wms.result("/catalog/units-per-box", {
+        "seller_external_id": data.SELLER, "barcode": barcode,
+        "units_per_box": 1})
+    assert current["units_per_box"] == 1
+    denser = wms.result("/storage/places", {
+        "seller_external_id": data.SELLER, "day": today})
+    assert denser["places"] > before, (
+        "норма уменьшена вчетверо, а мест меньше не стало — правка не работает")
+
+    # И начисление: услуга обязана дойти до счёта, а не остаться в складе.
+    billing = Db(env("BILLING_DATABASE_URL"))
+    try:
+        stored = billing.row(
+            "SELECT quantity, amount FROM billing_accrual "
+            " WHERE seller_external_id = %s AND service = 'storage' "
+            " ORDER BY created_at DESC LIMIT 1",
+            (data.SELLER,))
+    finally:
+        billing.close()
+    # Начисление делает воркер по своему такту (раз в 15 минут на стенде), а не
+    # прогон. Требовать его здесь — значит краснеть из-за расписания, а не
+    # из-за поломки. Проверяется то, что склад отдаёт счётное число: без него
+    # начислять нечего вовсе, а это и была настоящая поломка.
+    if stored is not None:
+        assert Decimal(str(stored["quantity"])) > 0

@@ -16,6 +16,19 @@ from app.service import BillingService
 
 from conftest import rows
 
+
+def _answers(places: int, *, without_norm: int = 0, units: int = 0):
+    """Склад, отвечающий одним и тем же на любой день.
+
+    Подпись с днём не косметика: хранение досчитывается за пропущенные сутки, и
+    склад обязан отвечать про ТОТ день, а не про сегодня.
+    """
+    def answer(seller: str, day: object) -> dict:
+        return {"places": places, "skus_without_norm": without_norm,
+                "units_without_norm": units}
+    return answer
+
+
 DAY = date(2026, 9, 9)
 
 
@@ -47,7 +60,7 @@ def test_a_day_of_storage_is_charged_per_box_place(
     """Место занимает коробка, а не то, сколько в неё положили."""
     _storage_tariff(database, stand)
 
-    BillingService(database).accrue_storage(DAY, lambda seller: 12)
+    BillingService(database).accrue_storage(DAY, _answers(12))
 
     accrual = rows(database, "SELECT * FROM billing_accrual WHERE service = 'storage'")[0]
     assert accrual["quantity"] == Decimal("12.000")
@@ -62,8 +75,8 @@ def test_running_the_cron_twice_does_not_charge_twice(
     _storage_tariff(database, stand)
     service = BillingService(database)
 
-    first = service.accrue_storage(DAY, lambda seller: 4)
-    second = service.accrue_storage(DAY, lambda seller: 4)
+    first = service.accrue_storage(DAY, _answers(4))
+    second = service.accrue_storage(DAY, _answers(4))
 
     assert first[0]["outcome"] == "accrued"
     assert second[0]["outcome"] == "duplicate"
@@ -75,7 +88,7 @@ def test_a_cabinet_with_nothing_stored_pays_nothing(
     """Ноль коробок — не ошибка и не строка в unbilled, а просто нет услуги."""
     _storage_tariff(database, stand)
 
-    results = BillingService(database).accrue_storage(DAY, lambda seller: 0)
+    results = BillingService(database).accrue_storage(DAY, _answers(0))
 
     assert results == []
     assert rows(database, "SELECT * FROM billing_accrual") == []
@@ -90,10 +103,10 @@ def test_a_warehouse_that_will_not_answer_leaves_a_trace(
         cursor.execute("INSERT INTO cabinet (id, seller_external_id, name) "
                        "VALUES (%s, 'seller-2', 'ИП Второй')", (str(uuid.uuid4()),))
 
-    def places(seller: str) -> int:
+    def places(seller: str, day: object) -> dict:
         if seller == "seller-1":
             raise RuntimeError("склад недоступен")
-        return 3
+        return {"places": 3, "skus_without_norm": 0, "units_without_norm": 0}
 
     results = BillingService(database).accrue_storage(DAY, places)
 
@@ -106,7 +119,7 @@ def test_storage_without_an_approved_price_is_visible_not_silent(
         database: Database, stand: dict[str, Any]) -> None:
     _storage_tariff(database, stand, approved=False)
 
-    results = BillingService(database).accrue_storage(DAY, lambda seller: 5)
+    results = BillingService(database).accrue_storage(DAY, _answers(5))
 
     assert results[0]["reason"] == "TARIFF_NOT_APPROVED"
     unbilled = rows(database, "SELECT * FROM billing_unbilled")
@@ -124,7 +137,7 @@ def test_storage_carries_the_partner_markup_when_the_owner_sets_one(
     with database.transaction() as cursor:
         cursor.execute("UPDATE price_layer SET markup = 2 WHERE service = 'storage'")
 
-    BillingService(database).accrue_storage(DAY, lambda seller: 10)
+    BillingService(database).accrue_storage(DAY, _answers(10))
 
     accrual = rows(database, "SELECT * FROM billing_accrual")[0]
     assert accrual["amount"] == Decimal("70.00")
@@ -149,7 +162,7 @@ def test_a_zero_partner_fee_is_a_decision_and_holds(
                        "  WHERE tariff_id = (SELECT id FROM billing_tariff "
                        "                      WHERE service = 'storage')")
 
-    BillingService(database).accrue_storage(DAY, lambda seller: 7)
+    BillingService(database).accrue_storage(DAY, _answers(7))
 
     accrual = rows(database, "SELECT * FROM billing_accrual WHERE service = 'storage'")[0]
     assert accrual["partner_amount"] == Decimal("0.00")
@@ -174,3 +187,28 @@ def test_the_stand_seed_leaves_storage_without_a_partner_markup() -> None:
                         and "billing_tariff" not in line)
     assert version_line.rstrip(",").endswith("0.00)"), (
         f"версия тарифа на хранение несёт наценку: {version_line.strip()}")
+
+
+def test_goods_without_a_norm_do_not_slip_into_the_invoice_silently(
+        database, stand) -> None:
+    """Склад не смог посчитать часть товара — это строка «не дошло до счёта».
+
+    Норма «сколько входит в короб» снимается с приёмки, и у товара, который ни
+    разу не приезжал в коробе, её нет. Придумать за него количество и поставить
+    в счёт — значит выставить клиенту число, которого никто не мерил. Правильно
+    сказать вслух: столько-то товаров не посчитано, норма правится в админке,
+    начисление переиграется (находка 4.3).
+    """
+    _storage_tariff(database, stand)
+
+    results = BillingService(database).accrue_storage(
+        DAY, _answers(5, without_norm=2, units=730))
+
+    outcomes = [row["outcome"] for row in results]
+    assert "unbilled" in outcomes, (
+        "товар без нормы не посчитан и об этом никто не узнал")
+    assert "accrued" in outcomes, (
+        "из-за товара без нормы не начислено и то, что посчитать удалось")
+    told = " ".join(str(row.get("detail") or "") for row in results)
+    assert "730" in told and "units-per-box" in told, (
+        "в жалобе нет ни количества, ни способа это починить")

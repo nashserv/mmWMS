@@ -359,7 +359,8 @@ class BillingService:
 
     STORAGE_SERVICE = Service.STORAGE.value
 
-    def accrue_storage(self, day: date, places: Callable[[str], int],
+    def accrue_storage(self, day: date,
+                       places: Callable[[str, date], dict[str, Any]],
                        *, tenant: str | None = None) -> list[dict[str, Any]]:
         """Начисляет хранение за сутки по всем кабинетам.
 
@@ -368,8 +369,15 @@ class BillingService:
         сутки (файл 04), поэтому количество берётся у склада: сколько коробок
         клиента стояло в этот день.
 
-        `places` — функция «кабинет → коробко-мест». Вызов в склад делает
-        воркер, снаружи транзакции (инвариант 2); сюда приходит уже число.
+        `places` — функция «кабинет и день → сколько коробо-мест». День в ней
+        обязателен: хранение досчитывается за пропущенные сутки, и склад обязан
+        отвечать про ТОТ день. Вызов в склад делает воркер, снаружи транзакции
+        (инвариант 2); сюда приходит уже посчитанное.
+
+        Считается объём товара, а не число занятых коробов (решение владельца
+        12.09.2026): недобранные короба и пустоты создаёт склад, складу ими и
+        платить. Товар, для которого склад не смог посчитать объём, приходит
+        отдельным числом и идёт в «не дошло до счёта», а не в счёт.
 
         Идемпотентность — по вычислимому `event_id`: uuid5 от кабинета и даты.
         Повторный прогон за те же сутки не начисляет второй раз, а значит,
@@ -382,7 +390,9 @@ class BillingService:
 
         for cabinet in cabinets:
             try:
-                quantity = Decimal(places(str(cabinet["seller_external_id"])))
+                counted = places(str(cabinet["seller_external_id"]), day)
+                quantity = Decimal(str(counted["places"]))
+                unknown = int(counted.get("skus_without_norm") or 0)
             except Exception as failure:  # noqa: BLE001 — один кабинет не валит остальные
                 # Склад не ответил — это НЕ «нет количества». Разница не
                 # косметическая: по первой причине дежурный идёт смотреть
@@ -394,6 +404,19 @@ class BillingService:
                                 "seller": cabinet["seller_external_id"], "detail": str(failure)})
                 UNBILLED.labels(reason=reason.value).inc()
                 continue
+            if unknown:
+                # Товар без нормы «сколько входит в короб» не посчитан, и
+                # придумывать за него количество нельзя: счёт уйдёт клиенту.
+                # Строка «не дошло до счёта» — это ровно тот механизм, который
+                # делает пробел видимым и переигрываемым (находка 4.3): человек
+                # ставит норму в админке, начисление переигрывается.
+                reason = UnbilledReason.NO_QUANTITY
+                results.append({"outcome": "unbilled", "reason": reason.value,
+                                "seller": cabinet["seller_external_id"],
+                                "detail": f"у {unknown} товаров нет нормы «единиц в коробе»: "
+                                          f"{counted.get('units_without_norm')} единиц не "
+                                          f"посчитаны. Норма правится /catalog/units-per-box"})
+                UNBILLED.labels(reason=reason.value).inc()
             if quantity <= 0:
                 # Клиент, у которого в этот день не стояло ни одной коробки,
                 # за хранение не платит. Это не ошибка и в unbilled не идёт.

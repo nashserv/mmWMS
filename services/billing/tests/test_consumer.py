@@ -210,17 +210,26 @@ def test_the_storage_worker_introduces_itself_to_the_warehouse(monkeypatch) -> N
             return None
 
         def json(self) -> dict[str, object]:
-            return {"result": {"placements": [{"box_barcode": "BOX-1"}]}}
+            return {"result": {"places": 1.0, "skus_without_norm": 0,
+                               "units_without_norm": 0}}
 
     def fake_post(url: str, **kwargs: object) -> Answer:
         seen["url"] = url
         seen["headers"] = kwargs.get("headers")
+        seen["json"] = kwargs.get("json")
         return Answer()
 
     monkeypatch.setattr(worker.httpx, "post", fake_post)
     monkeypatch.setenv("SERVICE_TOKEN", "stand-fake-secret-1")
 
-    assert worker.box_places("кто-то") == 1
+    from datetime import date
+
+    counted = worker.box_places("кто-то", date(2026, 9, 11))
+    assert float(counted["places"]) == 1.0
+    # День уходит складу: хранение досчитывается за прошлые сутки, и ответ
+    # «сколько сегодня» на вопрос «сколько позавчера» — это счёт за дни, когда
+    # товара ещё не было.
+    assert "2026-09-11" in str(seen.get("json"))
     headers = seen["headers"] or {}
     assert headers.get("authorization") == "Bearer stand-fake-secret-1", (
         "воркер хранения пошёл в склад без токена — склад ответит 401, и "
