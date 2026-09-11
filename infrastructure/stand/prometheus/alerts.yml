@@ -95,3 +95,105 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "Сервис {{ $labels.service }} не готов"
+
+  # ------------------------------------------------------------ добавлено этапом 5
+  #
+  # Все четыре правила закрывают одно и то же: работа встала, а выглядит это
+  # как тишина. Именно так боевой контур терял выручку месяцами.
+
+  - name: wms-outbox-and-limits
+    rules:
+      # Инвариант 13: событие обязано доехать до шины. Нарастающая очередь
+      # публикации значит, что оно не доезжает — а потребители не знают.
+      - alert: OutboxBacklog
+        expr: mmx_wms_outbox_unpublished > 500
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "В outbox {{ $value }} неопубликованных событий"
+          description: >-
+            На проде integration_outbox дорос до 136 210 записей без чистки
+            (раздел 3.6), и никто этого не заметил. Событие, не доехавшее до
+            шины, — это несчитанная услуга и невыставленный счёт.
+
+      # Приложение D: лимит 300 запросов в минуту на кабинет. Кабинет,
+      # упёршийся в него надолго, перестаёт получать задания вовсе.
+      - alert: WbRateLimited
+        expr: mmx_wms_wb_rate_limited > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Кабинетов под ограничением Wildberries: {{ $value }}"
+          description: >-
+            Опрос заданий, стикеры и публикация остатка делят один бюджет.
+            Кабинет под паузой не получает новые заказы, и склад не знает,
+            что их не получает.
+
+      # Инвариант 7: остаток публикуется сразу после движения. Непрошедшая
+      # публикация означает, что Wildberries продаёт то, чего нет.
+      - alert: StockPushFailing
+        expr: |
+          sum(increase(mmx_wms_stock_push_total{outcome!="ok"}[15m])) > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Публикация остатка не проходит ({{ $value }} за 15 минут)"
+          description: >-
+            Остаток в кабинете расходится с нашим до следующего движения по
+            тому же товару — у редкого товара это недели. Wildberries
+            продолжает продавать то, чего на складе нет.
+
+      # Задание, о котором Wildberries молчит: подменили токен, смотрим не
+      # тот кабинет, заказ удалён.
+      - alert: WbOrdersMissing
+        expr: sum(mmx_wms_wb_orders_missing) > 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Wildberries не знает {{ $value }} наших заданий"
+          description: >-
+            Сверка спрашивает статусы поимённо. Молчание WB про наше задание
+            значит, что заказа в кабинете нет — и собирать его незачем.
+
+  - name: billing
+    rules:
+      # Раздел 3.4: 6374 задания против 145 начислений. Неоплаченная работа
+      # копится молча.
+      - alert: UnbilledGrowing
+        expr: sum(increase(mmx_billing_unbilled_total[1h])) > 10
+        for: 1h
+        labels: {severity: critical}
+        annotations:
+          summary: "За час не дошло до счёта событий: {{ $value }}"
+          description: >-
+            Работа сделана, счёт не выставлен. Разбирается по
+            /api/billing/v1/reports/unbilled; переигрывается
+            POST /unbilled/{event_id}/replay после устранения причины.
+
+      # Мёртвые письма. На проде dead_letters пуст при регулярных потерях
+      # заданий (раздел 3.5) — потому что очереди не существовало вовсе.
+      - alert: DeadLettersGrowing
+        expr: rabbitmq_queue_messages{queue="stand.dead-letters"} > 0
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "В мёртвых письмах {{ $value }} сообщений"
+          description: >-
+            Событие не обработано и ждёт человека. Пустая очередь мёртвых
+            писем при потерях означала бы, что терялось в никуда.
+
+  - name: stock-truth
+    rules:
+      # Инвариант 1: stock_balance — проекция журнала, а не самостоятельная
+      # запись. Расхождение с последним пересчётом означает, что где-то
+      # пишут мимо журнала — ровно то, чем болен боевой контур.
+      - alert: BalanceDivergesFromCount
+        expr: mmx_wms_inventory_divergence > 0
+        for: 30m
+        labels: {severity: critical}
+        annotations:
+          summary: "Остаток расходится с последним пересчётом: {{ $value }} позиций"
+          description: >-
+            Либо кто-то пишет в stock_balance мимо журнала, либо пересчёт не
+            применился. В боевом контуре это выглядело как 3528 единиц в
+            кабинете при 92 на складе.

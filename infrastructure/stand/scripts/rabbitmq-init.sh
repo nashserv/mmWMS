@@ -48,4 +48,17 @@ declare_it PUT "queues/${VHOST}/stand.dead-letters" '{"durable":true,"auto_delet
 declare_it POST "bindings/${VHOST}/e/mmx.events/q/stand.wms.events" '{"routing_key":"#"}' \
     "binding mmx.events -> stand.wms.events"
 
+# Мёртвые письма для ВСЕХ очередей стенда, а не только для тех, чей
+# потребитель не забыл задать аргумент при объявлении.
+#
+# Аргумент `x-dead-letter-exchange` задаётся при создании очереди и меняется
+# только пересозданием: потребитель, объявивший очередь без него, теряет
+# отвергнутые сообщения молча — и «dead_letters пуст» значит не «потерь нет»,
+# а «терялось в никуда» (раздел 3.5). Политика действует на очередь снаружи и
+# не зависит от того, кто её объявил.
+declare_it PUT "policies/${VHOST}/dead-letters" \
+    '{"pattern":"^stand\\.(?!dead-letters$).*","apply-to":"queues","priority":10,
+      "definition":{"dead-letter-exchange":"","dead-letter-routing-key":"stand.dead-letters"}}' \
+    "policy dead-letters на stand.*"
+
 echo "топология шины готова"

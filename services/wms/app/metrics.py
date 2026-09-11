@@ -123,6 +123,26 @@ WB_CALLS = Counter(
     "Calls to Wildberries by operation and outcome.",
     ("operation", "outcome"),
 )
+# Инвариант 13: событие обязано доехать до шины. На проде
+# integration_outbox дорос до 136 210 записей без чистки (раздел 3.6), и
+# заметить это было нечем.
+OUTBOX_UNPUBLISHED = Gauge(
+    "mmx_wms_outbox_unpublished",
+    "Events waiting in the outbox to be published.",
+)
+# Кабинеты под паузой Wildberries. Кабинет, упёршийся в лимит надолго,
+# перестаёт получать задания вовсе — и склад не знает, что не получает.
+WB_RATE_LIMITED = Gauge(
+    "mmx_wms_wb_rate_limited",
+    "Cabinets currently paused by the Wildberries rate limit.",
+)
+# Инвариант 1: `stock_balance` — проекция журнала. Расхождение с последним
+# пересчётом значит, что где-то пишут мимо журнала.
+INVENTORY_DIVERGENCE = Gauge(
+    "mmx_wms_inventory_divergence",
+    "Positions where the balance disagrees with the latest inventory count.",
+)
+
 # Наши незакрытые задания, о которых Wildberries промолчал при сверке.
 # Ненулевое значение — не «тихо», а «мы сверяем задания, которых у WB нет»:
 # подменённый токен, чужой кабинет, удалённый заказ.

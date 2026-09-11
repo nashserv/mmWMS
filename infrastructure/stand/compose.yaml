@@ -120,12 +120,16 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set outside Git}
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+      # Плагин метрик включается файлом: очередь, доросшая до диска, и
+      # непустые мёртвые письма выглядят снаружи как «склад тормозит», а на
+      # деле это ровно те потери, ради которых написан раздел 3.5.
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 10s
       timeout: 10s
       retries: 10
-    ports: ["127.0.0.1:5672:5672", "127.0.0.1:15672:15672"]
+    ports: ["127.0.0.1:5672:5672", "127.0.0.1:15672:15672", "127.0.0.1:15692:15692"]
 
   # Топология шины заводится шагом, а не файлом определений: определения
   # загружаются раньше создания пользователя и падают с {no_such_user},
@@ -285,6 +289,10 @@ services:
       # бюджет работе.
       WB_SYNC_INTERVAL_SECONDS: ${WB_SYNC_INTERVAL_SECONDS:-1.0}
       WMS_ROLE: wb-sync
+      # Порт метрик. Без него Prometheus не забирает у воркера НИЧЕГО, и
+      # «воркер молчит» остаётся незамеченным ровно так же, как в боевом
+      # контуре: четыре воркера стояли Up с зелёной пробой (инвариант 14).
+      WMS_METRICS_PORT: "9101"
     command: ["python", "-m", "app.workers.wb_sync"]
     healthcheck:
       # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
@@ -302,6 +310,7 @@ services:
     environment:
       <<: *wms-worker-env
       WMS_ROLE: wb-labels
+      WMS_METRICS_PORT: "9102"
     command: ["python", "-m", "app.workers.wb_labels"]
     healthcheck:
       # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
@@ -320,6 +329,7 @@ services:
     environment:
       <<: *wms-worker-env
       WMS_ROLE: wb-reconcile
+      WMS_METRICS_PORT: "9103"
     command: ["python", "-m", "app.workers.wb_reconcile"]
     healthcheck:
       # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
@@ -338,6 +348,7 @@ services:
     environment:
       <<: *wms-worker-env
       WMS_ROLE: outbox
+      WMS_METRICS_PORT: "9104"
     command: ["python", "-m", "app.workers.outbox_publisher"]
     healthcheck:
       # Проба спрашивает «работа идёт?», а не «процесс запущен?». В бою четыре
@@ -384,8 +395,43 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # Правила рабочего места живут в observability/ — их владелец поток B
+      # (правило 9.5.1). Монтируются, а не копируются: копия расходится с
+      # оригиналом молча.
+      - ../../observability/prometheus/workstation-alerts.yml:/etc/prometheus/workstation-alerts.yml:ro
       - prometheus-data:/prometheus
     ports: ["127.0.0.1:9090:9090"]
+
+  # Куда уходят сработавшие алерты.
+  #
+  # Без него Prometheus считает правила молча: алерт горит в его собственном
+  # интерфейсе, куда никто не смотрит. Это то же молчание, ради которого
+  # написан весь раздел 3.5, только с графиком.
+  #
+  # Адрес приёмника — снаружи Git (ALERTMANAGER_WEBHOOK). На стенде это может
+  # быть что угодно, принимающее POST; в бою — Telegram-бот дежурного.
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    <<: [*restart, *logging]
+    depends_on:
+      token-guard: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9093/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      ALERTMANAGER_WEBHOOK: ${ALERTMANAGER_WEBHOOK:-http://wb-simulator:8090/__stand__/alerts}
+    volumes:
+      - ./prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      # Адрес приёмника подставляется из окружения: в нём токен, и в Git его
+      # быть не должно (инвариант 15).
+      - "--config.expand-env=true"
+    ports: ["127.0.0.1:9093:9093"]
 
   grafana:
     image: grafana/grafana:11.6.1
@@ -817,5 +863,6 @@ services:
 volumes:
   postgres-data: {}
   rabbitmq-data: {}
+  alertmanager-data: {}
   prometheus-data: {}
   grafana-data: {}

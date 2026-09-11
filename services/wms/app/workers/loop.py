@@ -60,6 +60,7 @@ class Worker:
         """
         for received in (signal.SIGTERM, signal.SIGINT):
             signal.signal(received, self.request_stop)
+        serve_metrics(self.name)
         log.info("воркер %s запущен", self.name)
 
         backoff = self._idle
@@ -85,6 +86,38 @@ class Worker:
             else:
                 self.sleep(max(self._idle, self._min_interval - elapsed))
         log.info("воркер %s остановлен", self.name)
+
+
+def serve_metrics(worker: str) -> int | None:
+    """Поднимает /metrics воркера. `None` — порт не задан.
+
+    Без него метрики воркера не видит НИКТО: процесс их считает, Prometheus
+    их не забирает, и «воркер молчит» остаётся незамеченным ровно так же, как
+    в боевом контуре — четыре воркера стояли Up с зелёным healthcheck и нулём
+    строк лога (инвариант 14).
+
+    Порт задаётся переменной `WMS_METRICS_PORT`; в compose он свой у каждого
+    воркера.
+    """
+    raw = (os.getenv("WMS_METRICS_PORT") or "").strip()
+    if not raw:
+        log.warning("воркер %s: WMS_METRICS_PORT не задан — метрики никто не заберёт, "
+                    "и молчание воркера останется незамеченным", worker)
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        log.error("воркер %s: WMS_METRICS_PORT=%r не число", worker, raw)
+        return None
+    try:
+        from prometheus_client import start_http_server
+
+        start_http_server(port)
+    except Exception:  # noqa: BLE001 — без метрик воркер работает, но громко жалуется
+        log.exception("воркер %s: не удалось поднять /metrics на порту %d", worker, port)
+        return None
+    log.info("воркер %s: метрики на :%d", worker, port)
+    return port
 
 
 def configure_logging() -> None:

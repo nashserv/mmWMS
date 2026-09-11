@@ -36,7 +36,8 @@ CANCELLABLE_ON_WB_CANCEL = frozenset({
     TaskState.PICKING.value,
     TaskState.PICKED.value,
 })
-from ..metrics import TASKS_DIVERGED, WB_CALLS, WB_ORDERS_MISSING
+from ..metrics import (INVENTORY_DIVERGENCE, TASKS_DIVERGED, WB_CALLS,
+                       WB_ORDERS_MISSING, WB_RATE_LIMITED)
 from ..postgres import ConnectionPool, pool as shared_pool, single, transaction
 from ..secrets import SecretUnavailable
 from ..wb import WbClient, WbError
@@ -285,8 +286,32 @@ class WbReconcileWorker:
         with self._pool.connection() as connection:
             with single(connection) as cursor:
                 cursor.execute("SELECT count(*) AS n FROM wms_task WHERE state = 'diverged'")
-                row = cursor.fetchone()
-        TASKS_DIVERGED.set(int(row["n"]) if row else 0)
+                diverged = cursor.fetchone()
+                # Кабинеты под паузой Wildberries: такой кабинет не получает
+                # новые заказы вовсе, и склад не знает, что не получает.
+                cursor.execute(
+                    "SELECT count(*) AS n FROM wb_account WHERE blocked_until > now()")
+                paused = cursor.fetchone()
+                # Инвариант 1: `stock_balance` — проекция журнала. Расхождение
+                # с последним пересчётом значит, что где-то пишут мимо него.
+                cursor.execute(
+                    "SELECT count(*) AS n FROM ("
+                    "  SELECT l.sku_id, l.cell_id, l.box_id, l.fact_qty, "
+                    "         COALESCE(b.qty, 0) AS balance, "
+                    "         row_number() OVER (PARTITION BY l.sku_id, l.cell_id, l.box_id "
+                    "                            ORDER BY c.applied_at DESC) AS recency "
+                    "    FROM inventory_count_line l "
+                    "    JOIN inventory_count c ON c.id = l.count_id AND c.state = 'applied' "
+                    "    LEFT JOIN stock_balance b "
+                    "           ON b.sku_id = l.sku_id AND b.cell_id = l.cell_id "
+                    "          AND b.box_id IS NOT DISTINCT FROM l.box_id "
+                    "          AND b.state = 'good' "
+                    "   WHERE c.applied_at > now() - interval '1 day') fresh "
+                    " WHERE recency = 1 AND fact_qty IS DISTINCT FROM balance")
+                divergence = cursor.fetchone()
+        TASKS_DIVERGED.set(int(diverged["n"]) if diverged else 0)
+        WB_RATE_LIMITED.set(int(paused["n"]) if paused else 0)
+        INVENTORY_DIVERGENCE.set(int(divergence["n"]) if divergence else 0)
 
 
 def _default_tasks(pool: ConnectionPool) -> Any:

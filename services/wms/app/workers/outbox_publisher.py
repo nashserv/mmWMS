@@ -20,6 +20,7 @@ from typing import Any
 from .. import repositories as repo
 from ..domain import EventEnvelope
 from ..events import EventPublisher
+from ..metrics import OUTBOX_UNPUBLISHED
 from ..postgres import ConnectionPool, pool as shared_pool, single, transaction
 from .loop import Worker, configure_logging
 
@@ -87,7 +88,25 @@ class OutboxPublisher:
         if failed:
             log.warning("не ушло в шину: %d событий, первое — %s",
                         len(failed), failed[0][2][:120])
+        self._refresh_backlog()
         return len(published)
+
+    def _refresh_backlog(self) -> None:
+        """Сколько событий ждёт публикации.
+
+        Нарастающая очередь значит, что событие до шины не доезжает, а
+        потребители об этом не знают: на проде очередь дошла до 136 210
+        записей, и заметить это было нечем (раздел 3.6).
+        """
+        try:
+            with self._pool.connection() as connection:
+                with single(connection) as cursor:
+                    cursor.execute(
+                        "SELECT count(*) AS n FROM outbox WHERE published_at IS NULL")
+                    row = cursor.fetchone()
+            OUTBOX_UNPUBLISHED.set(int(row["n"]) if row else 0)
+        except Exception:  # noqa: BLE001 — метрика не важнее публикации
+            log.debug("глубину outbox посчитать не удалось", exc_info=True)
 
     def _claim(self) -> list[dict[str, Any]]:
         """Короткая транзакция: прочитать пачку и сразу отпустить блокировки.
