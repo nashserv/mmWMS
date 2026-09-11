@@ -215,16 +215,21 @@ class Store:
         added = 0
         for task in tasks:
             placement = task.placements[0] if task.placements else None
-            await self.execute(
+            # `RETURNING` обязателен: без него счёт вёлся по числу попыток, а
+            # не по числу вставленных строк. «Добавлено 12» при двенадцати
+            # конфликтах читалось как «лист обновился», хотя не изменилось
+            # ничего, и обновление листа выглядело успешным всегда.
+            row = await self.execute(
                 "INSERT INTO workstation_pick_line (id, session_id, task_id, "
                 "owner_external_id, barcode, name, quantity, cell_address, box_barcode, "
                 "route_order) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (session_id, task_id) DO NOTHING",
+                "ON CONFLICT (session_id, task_id) DO NOTHING RETURNING id",
                 (uid(), session_id, task.task_id, task.owner_external_id, task.barcode,
                  task.name, max(1, task.quantity), task.cell_address, task.box_barcode,
                  placement.route_order if placement else None),
-                operation="add_lines")
-            added += 1
+                fetch="one", operation="add_lines")
+            if row is not None:
+                added += 1
         return added
 
     async def session_lines(self, session_id: str) -> list[dict[str, Any]]:
