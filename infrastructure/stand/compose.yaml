@@ -52,7 +52,10 @@ services:
 
   # ------------------------------------------------------------------ ворота
   token-guard:
-    image: debian:bookworm-slim
+    # Дайджест, а не тег. Ворота — первое, что поднимается, и подменить
+    # `debian:bookworm-slim` в реестре значит подменить проверку, которая
+    # ищет живые токены: она отрапортует «чисто» о чём угодно.
+    image: debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
     restart: "no"
     volumes:
       - ./scripts/check-no-live-tokens.sh:/check.sh:ro

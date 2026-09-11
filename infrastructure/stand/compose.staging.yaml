@@ -1,0 +1,87 @@
+# Наложение `staging`: тот же стенд с `APP_ENV=staging`.
+#
+# Зачем оно нужно. Половина запретов в коде смотрит на `APP_ENV`: запись в
+# Wildberries в режиме `shadow`, подстановка `TRUSTED_HOSTS`, разрешение на
+# генерацию ключа подписи, необязательность сервисного токена. Все они
+# написаны так, что в `development` ослаблены, а в `staging` и `prod`
+# абсолютны — и НИ ОДИН из них не проверяется на стенде, потому что стенд
+# всегда поднимается в `development`.
+#
+# Это значит, что «в бою будет строже» проверяется в бою. Наложение позволяет
+# поднять тот же стенд со строгими настройками и увидеть, что именно упадёт,
+# — до того, как это увидит клиент.
+#
+# Поднимается так:
+#   docker compose -f compose.yaml -f compose.staging.yaml config   # проверить
+#   docker compose -f compose.yaml -f compose.staging.yaml up -d
+#
+# Секреты обязаны быть заданы: в `staging` сервисы не подставляют умолчаний
+# и падают на старте, а не на первом запросе. Это и есть проверяемое свойство.
+
+services:
+
+  wms:
+    environment:
+      APP_ENV: staging
+      # В staging адрес обязателен явно: пустой означал бы «рядом симулятор»,
+      # и запрет записи в кабинет обошёлся бы сам собой.
+      WB_SIMULATOR_URL: http://wb-simulator:8090
+      WB_API_URL: http://wb-simulator:8090
+      # Запись только в симулятор. Единственная дорога к боевому кабинету —
+      # явное `production`, и её здесь нет.
+      WB_WRITES_TARGET: simulator
+
+  wms-wb-sync:
+    environment:
+      APP_ENV: staging
+      WB_WRITES_TARGET: simulator
+  wms-wb-labels:
+    environment:
+      APP_ENV: staging
+      WB_WRITES_TARGET: simulator
+  wms-wb-reconcile:
+    environment:
+      APP_ENV: staging
+      WB_WRITES_TARGET: simulator
+  wms-outbox:
+    environment:
+      APP_ENV: staging
+
+  workstation:
+    environment:
+      APP_ENV: staging
+      # Вне локальных окружений список хостов обязателен явно.
+      TRUSTED_HOSTS: workstation,127.0.0.1,localhost
+  workstation-agent:
+    environment:
+      APP_ENV: staging
+
+  billing:
+    environment:
+      APP_ENV: staging
+      TRUSTED_HOSTS: billing,127.0.0.1,localhost
+  billing-worker:
+    environment:
+      APP_ENV: staging
+  billing-inbox-consumer:
+    environment:
+      APP_ENV: staging
+
+  identity:
+    environment:
+      APP_ENV: staging
+      TRUSTED_HOSTS: identity,127.0.0.1,localhost
+      # Ключ подписи в staging не генерируется на лету: он обязан быть задан.
+      # Сгенерированный при старте ключ означает, что после перезапуска все
+      # выданные токены недействительны — и никто не понимает, почему.
+      IDENTITY_SIGNING_KEY_PEM: ${IDENTITY_SIGNING_KEY_PEM:?в staging ключ подписи задаётся явно}
+
+  portal:
+    environment:
+      APP_ENV: staging
+      TRUSTED_HOSTS: portal,127.0.0.1,localhost
+
+  internal-admin:
+    environment:
+      APP_ENV: staging
+      TRUSTED_HOSTS: internal-admin,127.0.0.1,localhost

@@ -4,7 +4,13 @@ FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5
 ENV APP_ENV=production PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt requirements-bus.txt ./
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* \
+# `apt-get upgrade` убран: он делал образ НЕВОСПРОИЗВОДИМЫМ.
+# Базовый образ прибит дайджестом ровно затем, чтобы сборка сегодня и
+# через месяц давала одно и то же; `upgrade` подтягивал свежие пакеты
+# из репозитория Debian и это свойство отменял — два образа с одним
+# дайджестом базы могли отличаться. Свежесть базы — это смена
+# дайджеста в FROM, видимая в diff, а не скрытая в слое.
+RUN rm -rf /var/lib/apt/lists/* \
  && pip install --no-cache-dir -r requirements-bus.txt
 COPY --chown=65532:65532 app ./app
 # Агент печати ездит в том же образе. На складе он запускается на самом ПК

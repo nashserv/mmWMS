@@ -77,6 +77,45 @@ jobs:
       - run: pip install --no-cache-dir pip-audit
       - run: pip-audit -r ${{ matrix.requirements }}
 
+  compose:
+    name: Конфигурация стенда собирается
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Стенд
+        working-directory: infrastructure/stand
+        env:
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+          RABBITMQ_PASSWORD: ci-only-not-a-secret
+          SERVICE_TOKEN: ci-only-not-a-secret
+          WORKSTATION_AGENT_TOKEN: ci-only-not-a-secret
+          IDENTITY_SIGNING_KEY_PEM: ci-only-not-a-secret
+        run: docker compose -f compose.yaml config --quiet
+
+      - name: Тот же стенд в staging
+        # Половина запретов в коде смотрит на APP_ENV и в development
+        # ослаблена. Без этой проверки «в бою будет строже» проверяется в бою.
+        working-directory: infrastructure/stand
+        env:
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+          RABBITMQ_PASSWORD: ci-only-not-a-secret
+          SERVICE_TOKEN: ci-only-not-a-secret
+          WORKSTATION_AGENT_TOKEN: ci-only-not-a-secret
+          IDENTITY_SIGNING_KEY_PEM: ci-only-not-a-secret
+        run: docker compose -f compose.yaml -f compose.staging.yaml config --quiet
+
+      - name: Контур shadow
+        working-directory: infrastructure/shadow
+        env:
+          SHADOW_POSTGRES_PASSWORD: ci-only-not-a-secret
+          WB_API_URL: https://marketplace-api.wildberries.ru
+          SHADOW_WB_ACCOUNT: ci-cabinet
+          SHADOW_POLL_INTERVAL_SECONDS: "2.0"
+          WB_SECRET_HOST_DIR: /tmp/ci-secrets
+        run: docker compose -f compose.shadow.yaml config --quiet
+
   simulator:
     name: Симулятор Wildberries
     runs-on: ubuntu-latest
