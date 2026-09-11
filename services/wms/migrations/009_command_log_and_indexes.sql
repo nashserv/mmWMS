@@ -8,7 +8,7 @@
 -- До него ключ только проверялся на непустоту: повтор `deliver` заводил
 -- вторую поставку и второе тарифицируемое событие `wb.supply.shipped.v1` —
 -- то есть второй счёт клиенту за ту же машину.
-CREATE TABLE command_log (
+CREATE TABLE IF NOT EXISTS command_log (
     idempotency_key text PRIMARY KEY,
     command         text NOT NULL,
     aggregate_id    uuid,
@@ -17,8 +17,8 @@ CREATE TABLE command_log (
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX command_log_created_idx ON command_log (created_at);
-CREATE INDEX command_log_aggregate_idx ON command_log (command, aggregate_id);
+CREATE INDEX IF NOT EXISTS command_log_created_idx ON command_log (created_at);
+CREATE INDEX IF NOT EXISTS command_log_aggregate_idx ON command_log (command, aggregate_id);
 
 -- 2. Возврат на полку — законный исход скана.
 --
@@ -36,12 +36,12 @@ ALTER TABLE pick_line ADD CONSTRAINT pick_line_scan_result_check
 -- отдавалась клиенту B как его собственная — вместе с чужими строками.
 -- Изоляция владельца доходит до номера документа (инвариант 6).
 ALTER TABLE receipt DROP CONSTRAINT IF EXISTS receipt_reference_key;
-ALTER TABLE receipt ADD CONSTRAINT receipt_owner_reference_key
-    UNIQUE (owner_id, reference);
+CREATE UNIQUE INDEX IF NOT EXISTS receipt_owner_reference_idx
+    ON receipt (owner_id, reference);
 
 ALTER TABLE inventory_count DROP CONSTRAINT IF EXISTS inventory_count_reference_key;
-ALTER TABLE inventory_count ADD CONSTRAINT inventory_count_owner_reference_key
-    UNIQUE (owner_id, reference);
+CREATE UNIQUE INDEX IF NOT EXISTS inventory_count_owner_reference_idx
+    ON inventory_count (owner_id, reference);
 
 -- 4. Поставка Wildberries — одна отгрузка, а не сколько получилось.
 --
@@ -73,3 +73,11 @@ CREATE INDEX IF NOT EXISTS discrepancy_receipt_idx
     ON discrepancy (receipt_id) WHERE receipt_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS discrepancy_task_idx
     ON discrepancy (task_id) WHERE task_id IS NOT NULL;
+
+-- 6. Когда стикер напечатали впервые.
+--
+-- `wms.label.attached.v1` уходило при КАЖДОЙ печати: пять перепечаток из-за
+-- зажёванной ленты давали пять событий «этикетка наклеена», и потребитель
+-- события считал по ним наклейки. Наклейка одна, печатей сколько угодно.
+ALTER TABLE wb_label ADD COLUMN IF NOT EXISTS printed_at timestamptz;
+ALTER TABLE wb_label ADD COLUMN IF NOT EXISTS prints integer NOT NULL DEFAULT 0;

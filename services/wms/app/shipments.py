@@ -44,9 +44,38 @@ class ShipmentOperations:
         seller = str(params.get("seller_external_id") or "").strip()
         if not seller:
             raise ValueError("seller_external_id обязателен")
-        if not _text(params.get("idempotency_key")):
+        key = _text(params.get("idempotency_key"))
+        if not key:
             raise ValueError("idempotency_key обязателен: это ключ идемпотентности")
-        return getattr(self, f"_{action}")(seller, params)
+
+        # Ключ занимается ДО работы. Раньше он только проверялся на непустоту:
+        # повтор `deliver` находил те же задания собранными, отгружал их
+        # второй раз и публиковал второе `wb.supply.shipped.v1` — то есть
+        # второй счёт клиенту за ту же машину (инвариант 5).
+        scope = f"shipment:{action}:{seller}:{key}"
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                seen = repo.claim_command(cursor, idempotency_key=scope,
+                                          command=f"shipment.{action}")
+        if seen is not None:
+            return _repeat_of(seen, action)
+
+        try:
+            result = getattr(self, f"_{action}")(seller, params)
+        except Exception:
+            # Ключ освобождается: отказ — не выполненная команда, и повторить
+            # её тем же ключом обязано быть можно.
+            with self._pool.connection() as connection:
+                with transaction(connection) as cursor:
+                    repo.forget_command(cursor, idempotency_key=scope)
+            raise
+        with self._pool.connection() as connection:
+            with transaction(connection) as cursor:
+                repo.save_command_result(
+                    cursor, idempotency_key=scope,
+                    aggregate_id=_uuid_or_none(result.get("shipment_id")),
+                    result=result)
+        return result
 
     # ----------------------------------------------------------- открытие
 
@@ -413,7 +442,9 @@ class ShipmentOperations:
             "owner_external_id": seller,
             "wb_supply_id": supply.get("wb_supply_id"),
             "state": shipment["state"],
-            "handed_by": shipment.get("handed_by"),
+            # Строкой, а не uuid: схема ответа описывает поле строкой, и
+            # json.dumps об uuid не знает.
+            "handed_by": _str_or_none(shipment.get("handed_by")),
             "handed_at": _isoformat(shipment.get("handed_at")),
             "orders": orders,
             "closed_at": _isoformat(shipment.get("closed_at")),
@@ -444,3 +475,31 @@ def _isoformat(value: Any) -> str | None:
     if value is None:
         return None
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _uuid_or_none(value: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _repeat_of(seen: dict[str, Any], action: str) -> dict[str, Any]:
+    """Ответ на повтор команды: тот же самый, с пометкой `duplicate`.
+
+    Ответа может не быть: первая попытка идёт прямо сейчас, в соседней
+    транзакции. Отвечать «сделано» нечем и делать работу второй раз нельзя —
+    это отказ, который клиент повторит позже тем же ключом.
+    """
+    stored = seen.get("result")
+    if not stored:
+        raise ValueError(
+            f"команда {action} с этим idempotency_key уже выполняется: "
+            f"повторите запрос позже тем же ключом")
+    result = dict(stored)
+    result["duplicate"] = True
+    return result
+
+
+def _str_or_none(value: Any) -> str | None:
+    return None if value is None else str(value)

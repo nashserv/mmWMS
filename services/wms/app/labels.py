@@ -20,6 +20,7 @@ import uuid
 from typing import Any
 
 from . import repositories as repo
+from .domain import PRINT_ADVANCES_FROM, check_transition
 from .metrics import LABEL_PRINT_DURATION
 from .postgres import ConnectionPool, single, transaction
 from .service import WmsService
@@ -101,17 +102,27 @@ class LabelOperations:
                             "действующего стикера нет: он тянется заранее, "
                             "а у отменённого задания помечается недействительным")
                     station = repo.station(cursor, station_id)
-                    if task["state"] in ("reserved", "picking", "picked", "packed"):
+                    check_transition("print", task["state"])
+                    # Печать из состояний подбора законна — стикер лежит
+                    # локально с момента резерва (инвариант 9), — но состояние
+                    # не меняет: печать не подбор.
+                    if task["state"] in PRINT_ADVANCES_FROM:
                         repo.set_task_state(cursor, task["id"], "labeled")
-                    self._service.emit_for_aggregate(
-                        cursor, aggregate_id=task["id"],
-                        event_type="wms.label.attached.v1",
-                        payload={"task_id": str(task["id"]),
-                                 "owner_id": str(task["owner_id"]),
-                                 "label_id": str(label["id"]),
-                                 "format": label["format"],
-                                 "version": int(label["version"])},
-                        correlation_id=str(params["idempotency_key"]))
+                    first_print = repo.record_print(cursor, label["id"])
+                    if first_print:
+                        # Событие «этикетка наклеена» уходит один раз. Раньше
+                        # оно уходило при каждой печати: пять перепечаток из-за
+                        # зажёванной ленты давали пять наклеек в отчёте
+                        # потребителя. Наклейка одна, печатей сколько угодно.
+                        self._service.emit_for_aggregate(
+                            cursor, aggregate_id=task["id"],
+                            event_type="wms.label.attached.v1",
+                            payload={"task_id": str(task["id"]),
+                                     "owner_id": str(task["owner_id"]),
+                                     "label_id": str(label["id"]),
+                                     "format": label["format"],
+                                     "version": int(label["version"])},
+                            correlation_id=str(params["idempotency_key"]))
 
         payload = bytes(label["payload"])
         return {
@@ -125,7 +136,7 @@ class LabelOperations:
             "station_id": str(station_id),
             "printer_transport": (station or {}).get("transport", "agent"),
             "reprint": reprint,
-            "duplicate": False,
+            "duplicate": not first_print,
         }
 
 

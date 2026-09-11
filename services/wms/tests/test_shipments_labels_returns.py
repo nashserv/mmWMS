@@ -354,7 +354,10 @@ def test_printing_hands_ready_bytes_to_the_station(
     assert base64.b64decode(result["payload"]).startswith(b"^XA")
     assert result["format"] == "zplv"
     state = rows(pool, "SELECT state FROM wms_task WHERE id = %s", (task_id,))[0]
-    assert state["state"] == "labeled"
+    assert state["state"] == "reserved", (
+        f"состояние стало {state['state']}: печать — не подбор. Стикер лежит "
+        f"локально с момента резерва (инвариант 9), и печатать его можно "
+        f"когда угодно; собранным задание делает скан и упаковка")
 
     # Половина пути, за которую отвечает поток A: достать локальный ZPL.
     # Раздел 6.6 отводит на неё 1–3 мс из общего бюджета в 300 мс; шаг 10
@@ -369,6 +372,69 @@ def test_printing_hands_ready_bytes_to_the_station(
         worst = max(worst, (time.perf_counter() - started) * 1000)
     assert worst < 25.0, (
         f"стикер отдаётся за {worst:.1f} мс — на агента и принтер не остаётся ничего")
+
+
+def test_printing_a_packed_task_is_what_makes_it_labeled(
+        pool: ConnectionPool, client: dict) -> None:
+    """`labeled` ставит печать, и только у собранного задания.
+
+    Парная проверка к предыдущей: «печать не меняет состояние» легко написать
+    так, что она не меняет его никогда, и `labeled` исчезнет из автомата.
+    """
+    task_id = reserve(pool, client, 1)[0]
+    give_label(pool, task_id)
+    pack(pool, client, task_id)
+    station_id = uuid.uuid4()
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "INSERT INTO station (id, name, transport) VALUES (%s, %s, 'agent')",
+                (station_id, unique("station")))
+
+    LabelOperations(pool, WmsService(pool)).print(
+        task_id, {"station_id": str(station_id), "idempotency_key": unique("print")})
+
+    state = rows(pool, "SELECT state FROM wms_task WHERE id = %s", (task_id,))[0]
+    assert state["state"] == "labeled"
+
+
+def test_the_attached_event_is_emitted_once_however_many_times_it_is_printed(
+        pool: ConnectionPool, client: dict) -> None:
+    """Наклейка одна, печатей сколько угодно.
+
+    `wms.label.attached.v1` уходило при КАЖДОЙ печати: пять перепечаток из-за
+    зажёванной ленты давали пять наклеек в отчёте потребителя события.
+    """
+    task_id = reserve(pool, client, 1)[0]
+    give_label(pool, task_id)
+    station_id = uuid.uuid4()
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "INSERT INTO station (id, name, transport) VALUES (%s, %s, 'agent')",
+                (station_id, unique("station")))
+
+    labels = LabelOperations(pool, WmsService(pool))
+    first = labels.print(task_id, {"station_id": str(station_id),
+                                   "idempotency_key": unique("print")})
+    assert not first["duplicate"]
+    for _ in range(4):
+        again = labels.print(task_id, {"station_id": str(station_id),
+                                       "idempotency_key": unique("print"),
+                                       "reprint": True, "reason": "лента зажевало"})
+        assert again["duplicate"], "перепечатка выдаёт себя за первую печать"
+
+    events = rows(pool, "SELECT count(*) AS n FROM outbox "
+                        " WHERE aggregate_id = %s AND type = %s",
+                  (uuid.UUID(task_id), "wms.label.attached.v1"))
+    assert int(events[0]["n"]) == 1, (
+        f"событий «этикетка наклеена» {events[0]['n']} на пять печатей: "
+        f"потребитель посчитает по ним пять наклеек вместо одной")
+
+    label = rows(pool, "SELECT prints, printed_at FROM wb_label WHERE task_id = %s",
+                 (task_id,))[0]
+    assert int(label["prints"]) == 5, "счётчик печатей не ведётся — нечем мерить перепечатки"
+    assert label["printed_at"], "не записано, когда стикер напечатали впервые"
 
 
 def test_a_reprint_must_say_why(pool: ConnectionPool, client: dict) -> None:

@@ -712,7 +712,11 @@ class StockOperations:
                         cell_to=cell["id"], box_to=box["id"] if box else None,
                         state_to=str(line.get("state") or "good"),
                         reason=doc_type, doc_type=doc_type, doc_ref=reference,
-                        idem_key=f"{doc_type}:{reference}:{index}")
+                        # Владелец — часть ключа. Без него «ОТК-1» клиента A и
+                        # «ОТК-1» клиента B — один и тот же ключ, и документ
+                        # второго молча не применялся: строки считались
+                        # повтором чужих (инвариант 6).
+                        idem_key=f"{doc_type}:{owner['id']}:{reference}:{index}")
                     if move is not None:
                         written += 1
                         touched.add(sku["id"])

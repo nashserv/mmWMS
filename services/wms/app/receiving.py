@@ -59,16 +59,24 @@ class ReceivingOperations:
 
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
-                existing = repo.receipt_by_reference(cursor, reference)
-                if existing is not None:
-                    # Повтор приёмки ничего не добавляет: тот же ответ, а не
-                    # второй приход товара (инвариант 5).
-                    return self._existing_receipt(cursor, existing, seller)
-
                 owner, owner_created = repo.upsert_owner(
                     cursor, seller, name=_text(params.get("seller_name")),
                     inn=_text(params.get("seller_inn")))
                 owner_id = owner["id"]
+                # Номер документа ищется В ПРЕДЕЛАХ владельца. «ТН-1» есть у
+                # каждого второго клиента: поиск по всей таблице отдавал
+                # клиенту A приёмку клиента B вместе с чужими строками
+                # (инвариант 6).
+                existing = repo.receipt_by_reference(cursor, reference, owner["id"])
+                if existing is not None:
+                    # Повтор приёмки ничего не добавляет: тот же ответ, а не
+                    # второй приход товара (инвариант 5).
+                    return self._existing_receipt(cursor, existing, seller)
+                foreign = repo.receipt_by_reference(cursor, reference)
+                if foreign is not None:
+                    raise ValueError(
+                        f"reference {reference!r} занят другим владельцем: "
+                        f"номер документа уникален в пределах клиента")
                 warehouse = repo.ensure_warehouse(cursor, warehouse_code)
                 receipt = repo.insert_receipt(
                     cursor, owner_id=owner["id"], reference=reference,
@@ -114,7 +122,7 @@ class ReceivingOperations:
                             cell_to=cell["id"], box_to=box["id"] if box else None,
                             state_to="good", reason="receipt", doc_type="receipt",
                             doc_ref=reference, actor_id=actor,
-                            idem_key=f"receipt:{reference}:{index}")
+                            idem_key=f"receipt:{owner['id']}:{reference}:{index}")
                         touched.add(sku["id"])
                         accepted_qty += actual
                     accepted += 1
@@ -300,16 +308,20 @@ class ReceivingOperations:
         owner_id: uuid.UUID | None = None
         with self._pool.connection() as connection:
             with transaction(connection) as cursor:
-                existing = repo.inventory_by_reference(cursor, reference)
-                if existing is not None:
-                    return {"count_id": str(existing["id"]), "reference": reference,
-                            "owner_external_id": seller, "state": existing["state"],
-                            "moves": 0, "discrepancies": [], "duplicate": True}
-
                 owner = repo.find_owner(cursor, seller)
                 if owner is None:
                     raise ValueError(f"продавец {seller!r} не заведён")
                 owner_id = owner["id"]
+                existing = repo.inventory_by_reference(cursor, reference, owner["id"])
+                if existing is not None:
+                    return {"count_id": str(existing["id"]), "reference": reference,
+                            "owner_external_id": seller, "state": existing["state"],
+                            "moves": 0, "discrepancies": [], "duplicate": True}
+                foreign = repo.inventory_by_reference(cursor, reference)
+                if foreign is not None:
+                    raise ValueError(
+                        f"reference {reference!r} занят другим владельцем: "
+                        f"номер документа уникален в пределах клиента")
                 count = repo.insert_inventory_count(
                     cursor, owner_id=owner["id"], reference=reference, scope=scope,
                     actor_id=actor)
@@ -366,7 +378,7 @@ class ReceivingOperations:
                         box_from=box["id"] if (box and delta < 0) else None,
                         state_from="good" if delta < 0 else None,
                         reason="inventory", doc_type="inventory", doc_ref=reference,
-                        actor_id=actor, idem_key=f"inventory:{reference}:{index}")
+                        actor_id=actor, idem_key=f"inventory:{owner['id']}:{reference}:{index}")
                     touched.add(sku["id"])
                     adjustments.append({
                         "barcode": barcode, "cell_address": cell["address"],

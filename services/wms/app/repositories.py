@@ -867,10 +867,19 @@ def accounts_of_owner(cursor: Cursor, owner_id: uuid.UUID) -> list[dict[str, Any
 
 # ---------------------------------------------------------------- приёмка
 
-def receipt_by_reference(cursor: Cursor, reference: str) -> dict[str, Any] | None:
+def receipt_by_reference(cursor: Cursor, reference: str,
+                         owner_id: uuid.UUID | None = None) -> dict[str, Any] | None:
+    """Приёмка по номеру. Без владельца — по всей таблице, и это находка.
+
+    Номер документа уникален у владельца, а не глобально: «ТН-1» есть у
+    каждого второго клиента. Поиск по всей таблице отдавал клиенту A приёмку
+    клиента B вместе с чужими строками — изоляция владельца (инвариант 6)
+    кончалась на номере накладной.
+    """
     cursor.execute(
         "SELECT id, owner_id, reference, warehouse_id, state, created_at "
-        "  FROM receipt WHERE reference = %s", (reference,))
+        "  FROM receipt WHERE reference = %s "
+        "   AND (%s::uuid IS NULL OR owner_id = %s)", (reference, owner_id, owner_id))
     return cursor.fetchone()
 
 
@@ -1094,9 +1103,12 @@ def balance_at(cursor: Cursor, *, owner_id: uuid.UUID, sku_id: uuid.UUID,
     return int(row["qty"]) if row else 0
 
 
-def inventory_by_reference(cursor: Cursor, reference: str) -> dict[str, Any] | None:
-    cursor.execute("SELECT id, state, scope FROM inventory_count WHERE reference = %s",
-                   (reference,))
+def inventory_by_reference(cursor: Cursor, reference: str,
+                           owner_id: uuid.UUID | None = None) -> dict[str, Any] | None:
+    """Инвентаризация по номеру — в пределах владельца (инвариант 6)."""
+    cursor.execute("SELECT id, owner_id, state, scope FROM inventory_count "
+                   " WHERE reference = %s AND (%s::uuid IS NULL OR owner_id = %s)",
+                   (reference, owner_id, owner_id))
     return cursor.fetchone()
 
 
@@ -1609,9 +1621,79 @@ def mark_account_verified(cursor: Cursor, account_id: uuid.UUID, *, verified: bo
         "  WHERE id = %(id)s", {"id": account_id, "ok": verified})
 
 
+# -------------------------------------------------------- журнал команд
+
+def claim_command(cursor: Cursor, *, idempotency_key: str, command: str,
+                  aggregate_id: uuid.UUID | None = None) -> dict[str, Any] | None:
+    """Занять ключ идемпотентности. `None` — команда уже выполнялась.
+
+    Инвариант 5: повтор команды возвращает тот же ответ, а не делает работу
+    второй раз. До журнала ключ только проверялся на непустоту — повтор
+    `deliver` заводил вторую отгрузку и второе тарифицируемое событие
+    `wb.supply.shipped.v1`, то есть второй счёт клиенту за ту же машину.
+
+    Возвращает запись первой попытки при конфликте — с её сохранённым
+    ответом. Ответ может быть ещё пуст: первая попытка идёт прямо сейчас, в
+    соседней транзакции. Это тоже повтор, и работа не делается.
+    """
+    cursor.execute(
+        "INSERT INTO command_log (idempotency_key, command, aggregate_id) "
+        "VALUES (%s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING "
+        "RETURNING idempotency_key",
+        (idempotency_key, command, aggregate_id))
+    if cursor.fetchone() is not None:
+        return None
+    cursor.execute(
+        "SELECT idempotency_key, command, aggregate_id, result, created_at "
+        "  FROM command_log WHERE idempotency_key = %s", (idempotency_key,))
+    return cursor.fetchone()
+
+
+def save_command_result(cursor: Cursor, *, idempotency_key: str,
+                        aggregate_id: uuid.UUID | None,
+                        result: dict[str, Any]) -> None:
+    """Запомнить ответ команды, чтобы повтор вернул именно его."""
+    cursor.execute(
+        "UPDATE command_log SET result = %s, "
+        "       aggregate_id = COALESCE(%s, aggregate_id) "
+        "  WHERE idempotency_key = %s",
+        (json.dumps(result, ensure_ascii=False), aggregate_id, idempotency_key))
+
+
+def record_print(cursor: Cursor, label_id: uuid.UUID) -> bool:
+    """Отмечает печать стикера. `True` — печатали впервые.
+
+    Счётчик печатей — метрика качества этикетки и принтера: доля перепечаток
+    показывает, где рвётся лента и где стикер не читается. Событие «этикетка
+    наклеена» при этом уходит один раз, по первой печати.
+    """
+    cursor.execute(
+        "UPDATE wb_label SET prints = prints + 1, "
+        "       printed_at = COALESCE(printed_at, now()) "
+        " WHERE id = %s RETURNING prints", (label_id,))
+    row = cursor.fetchone()
+    return bool(row) and int(row["prints"]) == 1
+
+
+def forget_command(cursor: Cursor, *, idempotency_key: str) -> None:
+    """Освободить ключ: команда отказала и не выполнена.
+
+    Без этого один отказ — испорченная накладная, не заведённый кабинет —
+    навсегда занимал бы ключ, и повторить исправленную команду тем же ключом
+    стало бы нельзя. Строка снимается только если ответа в ней нет: успешная
+    команда остаётся в журнале навсегда.
+    """
+    cursor.execute(
+        "DELETE FROM command_log WHERE idempotency_key = %s AND result IS NULL",
+        (idempotency_key,))
+
+
 # Что считать собранным. `picked` сюда не входит: вещь снята с полки, но не
 # упакована, и в коробе её нет.
-ASSEMBLED_STATES = ("packed", "labeled", "shipped")
+# `shipped` сюда НЕ входит: уехавшее задание уже не «готово уехать». Пока
+# входило, повтор `deliver` находил те же задания собранными и отгружал их
+# второй раз — вместе со вторым счётом клиенту.
+ASSEMBLED_STATES = ("packed", "labeled")
 
 
 def assembled_tasks_of_supply(cursor: Cursor, supply_id: uuid.UUID) -> list[dict[str, Any]]:
