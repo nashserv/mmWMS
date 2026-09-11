@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import datetime, UTC
+from typing import Any
+from collections.abc import Callable
 
 from . import repositories as repo
 from .postgres import ConnectionPool, single, transaction
@@ -183,7 +184,7 @@ def _owner_external_id(row: dict[str, Any]) -> str:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _isoformat(value: Any) -> str | None:

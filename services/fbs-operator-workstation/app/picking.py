@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from . import metrics
@@ -38,7 +38,7 @@ class PickingRefused(RuntimeError):
 
 def _picklist_barcode() -> str:
     """Штрихкод листа. Дата — чтобы найденный лист было видно, за какую смену."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    stamp = datetime.now(UTC).strftime("%Y%m%d")
     return f"PL-{stamp}-{uid()[:8].upper()}"
 
 
@@ -422,8 +422,8 @@ def _lease_expired(task: Task | None) -> bool:
     except ValueError:
         return False
     if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    return expires < datetime.now(timezone.utc)
+        expires = expires.replace(tzinfo=UTC)
+    return expires < datetime.now(UTC)
 
 
 def _scan_message(result: ScanResult, accepted: bool) -> str:

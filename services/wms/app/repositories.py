@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Iterable, Sequence
+from typing import Any
+from collections.abc import Iterable, Sequence
 
 from psycopg import Cursor
 
@@ -911,7 +912,7 @@ ALIVE_FOR_LABEL = ("reserved", "picking", "picked")
 # В поставку кладут и собранное: `add_orders` собирает машину из упакованного.
 # Не кладут отменённое, уехавшее и остановленное сверкой — им в машине нечего
 # делать, а WB будет ждать их там.
-ATTACHABLE_STATES = ALIVE_FOR_LABEL + ("packed", "labeled")
+ATTACHABLE_STATES = (*ALIVE_FOR_LABEL, "packed", "labeled")
 
 
 def attach_tasks_to_supply(cursor: Cursor, task_ids: Sequence[uuid.UUID],

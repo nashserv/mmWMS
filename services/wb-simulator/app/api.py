@@ -36,7 +36,21 @@ class Simulator:
         self.reset()
 
     def reset(self) -> None:
+        """Сброс данных. Счётчики идентификаторов НЕ откатываются.
+
+        У Wildberries номера сквозные и не повторяются никогда. Сброс,
+        возвращающий их к началу, выдаёт номера, которые уже лежат в Postgres
+        от прошлых прогонов: поставка падает уникальным ключом
+        `(wb_account_id, wb_supply_id)`, а заказ отсеивается опросчиком как
+        уже известный — задания не заводятся, и шаг 4 полного прогона краснеет
+        причиной, никак с ним не связанной.
+
+        Посева временем мало: два сброса в одну секунду дают один и тот же
+        номер. Счётчики переживают сброс.
+        """
         with self._lock:
+            carried_order = getattr(self, "_next_order_id", None)
+            carried_supply = getattr(self, "_next_supply", None)
             self._orders: list[dict[str, Any]] = []
             self._supplies: dict[str, dict[str, Any]] = {}
             self._stocks: dict[str, dict[str, int]] = {}
@@ -52,13 +66,15 @@ class Simulator:
             # свежие заказы как уже известные (`known_orders`): задания не
             # заводятся, остаток не двигается, а шаг 4 краснеет «good не упал».
             # У настоящего Wildberries номера сквозные, поэтому берём время.
-            self._next_order_id = 900_000_000 + int(time.time()) % 90_000_000
+            self._next_order_id = (carried_order if carried_order is not None
+                                   else 900_000_000 + int(time.time()) % 90_000_000)
             # Номер поставки, как и номер заказа, не должен повторяться между
             # сбросами симулятора: у Wildberries они сквозные. Счётчик с
             # единицы выдавал WB-GI-00000001 заново, а у нас на кабинете уже
             # лежала поставка с таким номером — `wb_supply` роняла вставку
             # уникальным ключом (wb_account_id, wb_supply_id).
-            self._next_supply = int(time.time()) % 90_000_000
+            self._next_supply = (carried_supply if carried_supply is not None
+                                 else int(time.time()) % 90_000_000)
 
     # Лимит считается по кабинету, а не глобально: у WB он именно такой.
     def take_slot(self, account: str) -> bool:

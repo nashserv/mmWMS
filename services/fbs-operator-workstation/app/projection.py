@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import time
 import threading
-from datetime import datetime, timezone
-from typing import Any, Iterable
+from datetime import datetime, UTC
+from typing import Any
+from collections.abc import Iterable
 
 from . import metrics
 from .domain import PICKABLE_STATES, ScreenStatus, Task, TaskState
@@ -47,7 +48,7 @@ def _parse_ts(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class Projection:
@@ -85,7 +86,7 @@ class Projection:
         переписано. Поэтому пропавшие сначала перепроверяются поимённо
         (`forget_if_gone` в опросчике), и только потом уходят.
         """
-        seen_now = datetime.now(timezone.utc).timestamp()
+        seen_now = datetime.now(UTC).timestamp()
         fresh: list[Task] = []
         with self._lock:
             arrived: set[str] = set()
@@ -118,7 +119,7 @@ class Projection:
         Берём тех, кто не приходит дольше `grace_seconds`, и не чаще
         `recheck_seconds` на задание.
         """
-        now_ts = datetime.now(timezone.utc).timestamp()
+        now_ts = datetime.now(UTC).timestamp()
         with self._lock:
             candidates = [
                 (missing_at, task_id)
@@ -131,7 +132,7 @@ class Projection:
 
     def mark_verified(self, task_id: str) -> None:
         with self._lock:
-            self._verified_at[task_id] = datetime.now(timezone.utc).timestamp()
+            self._verified_at[task_id] = datetime.now(UTC).timestamp()
 
     def note_failure(self, error: str) -> None:
         """Опрос не удался.
@@ -142,7 +143,7 @@ class Projection:
         with self._lock:
             self.last_poll_ok = False
             self.last_error = error
-            self.last_poll_at = datetime.now(timezone.utc).timestamp()
+            self.last_poll_at = datetime.now(UTC).timestamp()
 
     def upsert(self, task: Task) -> None:
         """Точечное обновление после команды по конкретному заданию.

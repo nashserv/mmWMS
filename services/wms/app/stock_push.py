@@ -103,7 +103,7 @@ class StockPublisher:
     def _drain_account(self, account_id: uuid.UUID) -> None:
         """Выгребает накопленное по владельцу, пока оно не кончится."""
         try:
-            current = account_id
+            current: uuid.UUID = account_id
             while True:
                 with self._lock:
                     skus = self._pending.pop(current, set())
@@ -115,9 +115,10 @@ class StockPublisher:
                         # чей поток уже завершился, лежит до следующего
                         # движения по нему: остаток в Wildberries отстаёт
                         # неизвестно насколько (инвариант 7).
-                        current = self._orphaned()
-                        if current is None:
+                        orphan = self._orphaned()
+                        if orphan is None:
                             return
+                        current = orphan
                         continue
                 self._push(current, skus, marked)
         except Exception:

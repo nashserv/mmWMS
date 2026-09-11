@@ -26,7 +26,8 @@ import hashlib
 import hmac
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import httpx
 
@@ -262,9 +263,12 @@ class WmsClient:
             metrics.WMS_CALLS.labels(route=label, outcome="bad_json").inc()
             raise WmsUnavailable(f"{label}: конверт JSON-RPC не объект")
         if envelope.get("error"):
-            error = envelope["error"] if isinstance(envelope["error"], dict) else {}
-            message = str(error.get("message") or envelope["error"])
-            code = error.get("code")
+            # Имя не `error`: оно занято переменной `except ... as error` выше,
+            # и Python удаляет её на выходе из обработчика — присваивание сюда
+            # ломает разбор ответа в редком, но настоящем случае.
+            refusal = envelope["error"] if isinstance(envelope["error"], dict) else {}
+            message = str(refusal.get("message") or envelope["error"])
+            code = refusal.get("code")
             # `-32602` — «неверные параметры»: это отказ ПО СУЩЕСТВУ, а не
             # сбой сервиса. Раньше он превращался в `WmsUnavailable`, экран
             # показывал «wms недоступен», а сборщик ждал починки сервиса,

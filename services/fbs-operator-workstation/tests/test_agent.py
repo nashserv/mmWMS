@@ -177,8 +177,6 @@ def test_a_timeout_in_the_middle_of_a_frame_does_not_desynchronise_the_stream():
     сборщика это выглядит как оборвавшийся принтер посреди смены.
     """
     import json
-    import socket
-    import struct
 
     from agent.ws import WebSocket
 
@@ -198,7 +196,7 @@ def test_a_timeout_in_the_middle_of_a_frame_does_not_desynchronise_the_stream():
                 # Таймаут ровно после первого байта заголовка.
                 self.timeouts += 1
                 if self.timeouts == 1:
-                    raise socket.timeout()
+                    raise TimeoutError()
             chunk = self.data[self.position:self.position + 1]
             self.position += len(chunk)
             return chunk
@@ -231,7 +229,6 @@ def test_a_timeout_in_the_middle_of_a_frame_does_not_desynchronise_the_stream():
 def test_a_fragmented_message_survives_a_timeout_between_frames():
     """Недособранное сообщение живёт между вызовами, а не теряется."""
     import json
-    import socket
 
     from agent.ws import WebSocket
 
@@ -251,7 +248,7 @@ def test_a_fragmented_message_survives_a_timeout_between_frames():
         def recv(self, size: int) -> bytes:
             if self.position >= self.stop_at and not self.stopped:
                 self.stopped = True
-                raise socket.timeout()
+                raise TimeoutError()
             # Отдаём не больше, чем до точки остановки: иначе один `recv`
             # приносит оба кадра сразу, и таймаута посреди сообщения не
             # случается вовсе.

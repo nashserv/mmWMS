@@ -14,7 +14,6 @@ import json
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 SNAPSHOT = Path(__file__).resolve().parents[1] / "contracts" / "workstation-openapi.json"
 

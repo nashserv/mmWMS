@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 from enum import Enum
@@ -66,13 +66,13 @@ WAREHOUSE_ZONE = ZoneInfo(os.getenv("BILLING_TIMEZONE", "Europe/Moscow"))
 
 
 def now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def local_date(moment: datetime) -> date:
     """Дата события в зоне склада."""
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.replace(tzinfo=UTC)
     return moment.astimezone(WAREHOUSE_ZONE).date()
 
 
@@ -108,7 +108,7 @@ class Envelope:
         return local_date(self.occurred_at)
 
     @staticmethod
-    def parse(body: Any) -> "Envelope":
+    def parse(body: Any) -> Envelope:
         """Разбирает конверт шины, отказывая внятно.
 
         Отказ — не исключение в лог, а причина BAD_ENVELOPE в billing_unbilled:
@@ -139,14 +139,14 @@ class Envelope:
 def parse_moment(value: Any) -> datetime:
     """Момент события. Без него нельзя определить ни период, ни версию тарифа."""
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, str) and value.strip():
         text = value.strip().replace("Z", "+00:00")
         try:
             parsed = datetime.fromisoformat(text)
         except ValueError as error:
             raise EnvelopeError(f"occurred_at неразбираем: {value!r}") from error
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     # Момента нет — конверт неразбираем, и это отказ.
     #
     # Подстановка «сегодня» выглядела спасением выручки, а была тихой ложью:

@@ -20,10 +20,20 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from .. import rate_limit, repositories as repo
 from ..domain import agrees_with_wb, TaskState
+
+from ..metrics import (INVENTORY_DIVERGENCE, TASKS_DIVERGED, WB_CALLS,
+                       WB_ORDERS_MISSING, WB_RATE_LIMITED)
+from ..postgres import ConnectionPool, pool as shared_pool, single, transaction
+from ..secrets import SecretUnavailable
+from ..wb import WbClient, WbError
+from .loop import Worker, configure_logging
+
+log = logging.getLogger("wms.wb_reconcile")
 
 # Состояния, из которых отмена у WB означает «везти больше нечего».
 # `shipped`/`handed`/`accepted` сюда не входят: товар уже уехал, и это разбор
@@ -36,14 +46,7 @@ CANCELLABLE_ON_WB_CANCEL = frozenset({
     TaskState.PICKING.value,
     TaskState.PICKED.value,
 })
-from ..metrics import (INVENTORY_DIVERGENCE, TASKS_DIVERGED, WB_CALLS,
-                       WB_ORDERS_MISSING, WB_RATE_LIMITED)
-from ..postgres import ConnectionPool, pool as shared_pool, single, transaction
-from ..secrets import SecretUnavailable
-from ..wb import WbClient, WbError
-from .loop import Worker, configure_logging
 
-log = logging.getLogger("wms.wb_reconcile")
 
 # Сверка не гонится: она смотрит на то, что уже случилось. Раз в минуту на
 # кабинет — это 60 вызовов в час из 18 000 доступных по лимиту.

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from typing import Any, Iterator
+from collections.abc import Iterator
 
 import psycopg
 from psycopg.rows import dict_row

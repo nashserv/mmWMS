@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 import pytest
 from starlette.testclient import TestClient

@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from . import metrics
 from .domain import now, uid
@@ -201,11 +202,11 @@ class ReceivingService:
                 row[key] = str(value)
         expected = line.get("expected_qty")
         actual = line.get("actual_qty")
-        row["expected_qty"] = int(expected) if expected not in (None, "") else 0
+        row["expected_qty"] = int(str(expected)) if expected not in (None, "") else 0
         if actual not in (None, ""):
             # Факт отправляется, даже если он равен нулю: ноль по факту это
             # «ничего не приехало», а не «строку не заполнили».
-            row["actual_qty"] = int(actual)
+            row["actual_qty"] = int(str(actual))
         return row
 
     # ------------------------------------------------------------ размещение
@@ -369,7 +370,7 @@ class ReceivingService:
             fact = line.get("fact_qty")
             if not barcode or fact in (None, ""):
                 continue
-            row: dict[str, Any] = {"barcode": barcode, "fact_qty": int(fact)}
+            row: dict[str, Any] = {"barcode": barcode, "fact_qty": int(str(fact))}
             for key in ("cell_address", "box_barcode"):
                 if line.get(key):
                     row[key] = str(line[key])

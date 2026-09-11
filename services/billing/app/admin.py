@@ -13,7 +13,8 @@ from __future__ import annotations
 import re
 from datetime import date
 from decimal import Decimal
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from . import repositories as repo
 from .db import Database

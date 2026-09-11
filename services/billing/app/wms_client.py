@@ -20,7 +20,8 @@ class WmsUnavailable(RuntimeError):
 
 class WmsClient:
     def __init__(self, base_url: str | None = None, *, timeout: float = 15.0) -> None:
-        self.base_url = (base_url or os.getenv("WMS_BASE_URL", "http://wms:8080")).rstrip("/")
+        configured = base_url or os.getenv("WMS_BASE_URL") or "http://wms:8080"
+        self.base_url = configured.rstrip("/")
         self.path = os.getenv("WMS_API_PATH", "/api/mmx/wms/v1")
         self._timeout = timeout
 

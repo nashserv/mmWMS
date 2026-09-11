@@ -9,7 +9,6 @@ Wildberries, снять резерв или отгрузить чужой тов
 """
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest

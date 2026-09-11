@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -918,7 +919,8 @@ def create_app() -> FastAPI:
 
     if mocked:
         app.include_router(router)
-        readiness: Any = lambda: True
+        def readiness():
+            return True
         metrics_source: Any = state
     else:
         # Импорт здесь, а не наверху: заглушке база не нужна вовсе, и требовать

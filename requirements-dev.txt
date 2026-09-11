@@ -12,3 +12,6 @@ pytest-asyncio==0.25.0
 jsonschema==4.23.0
 referencing==0.35.1
 PyYAML==6.0.2
+# `starlette.testclient` требует httpx; у сервисов, которые не ходят наружу
+# сами (симулятор), его в рантайме нет — и не должно быть.
+httpx==0.28.1

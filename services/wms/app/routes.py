@@ -12,10 +12,10 @@ JSON-RPC (приложение B). Разница только в том, что
 from __future__ import annotations
 
 import logging
-import os
 import time
 import uuid
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse

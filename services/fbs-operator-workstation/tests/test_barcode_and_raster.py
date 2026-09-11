@@ -106,7 +106,7 @@ def test_zpl_and_tspl_invert_bits_relative_to_each_other():
 
 def test_a_non_png_payload_is_refused():
     with pytest.raises(RasterError):
-        decode_png("^XA^FDне картинка^FS^XZ".encode("utf-8"))
+        decode_png("^XA^FDне картинка^FS^XZ".encode())
 
 
 def test_interlaced_png_is_refused_loudly():

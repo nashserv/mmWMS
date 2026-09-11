@@ -41,7 +41,7 @@ BILLABLE = [
 def main() -> int:
     events = [{
         "event_id": str(uuid.uuid4()), "tenant_id": "mm-express", "type": event_type,
-        "occurred_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "payload": payload, "correlation_id": "проверка шага 12",
     } for event_type, payload in BILLABLE]
 

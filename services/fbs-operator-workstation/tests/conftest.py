@@ -11,8 +11,9 @@ import hashlib
 import json
 import os
 import uuid as uuidlib
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import datetime, UTC
+from typing import Any
+from collections.abc import Callable
 
 import httpx
 import pytest
@@ -99,7 +100,7 @@ class FakeStore:
         self.sessions[session_id] = {"id": uuidlib.UUID(session_id), "actor_id": actor_id,
                                      "station_id": station_id, "state": "picking",
                                      "picklist_barcode": picklist_barcode,
-                                     "started_at": datetime(2026, 9, 10, 10, tzinfo=timezone.utc),
+                                     "started_at": datetime(2026, 9, 10, 10, tzinfo=UTC),
                                      "finished_at": None}
         self.lines[session_id] = []
         return session_id
@@ -144,7 +145,7 @@ class FakeStore:
         self.scans.append({"task_id": task_id, "stage": stage, "barcode": barcode,
                            "scan_result": scan_result, "accepted": accepted,
                            "actor_id": actor_id, "session_id": session_id,
-                           "scanned_at": datetime(2026, 9, 10, 11, tzinfo=timezone.utc)})
+                           "scanned_at": datetime(2026, 9, 10, 11, tzinfo=UTC)})
         for row in self.lines.get(str(session_id) if session_id else "", []):
             if row["task_id"] == task_id:
                 row["scan_result"] = scan_result
@@ -203,7 +204,7 @@ class FakeStore:
                            note: str | None = None) -> None:
         row = self.printers_by_id.setdefault(station_id, {"station_id": station_id})
         row.update({"confirmed_format": confirmed_format,
-                    "probed_at": datetime(2026, 9, 10, tzinfo=timezone.utc),
+                    "probed_at": datetime(2026, 9, 10, tzinfo=UTC),
                     "probe_note": note})
 
     async def printers(self) -> list[dict[str, Any]]:

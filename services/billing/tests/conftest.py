@@ -13,11 +13,11 @@ import pathlib
 import uuid
 from datetime import date
 from decimal import Decimal
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 import psycopg
 import pytest
-from psycopg.rows import dict_row
 
 from app.db import Database
 

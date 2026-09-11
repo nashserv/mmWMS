@@ -13,7 +13,6 @@ import uuid
 import httpx
 import pytest
 
-from app import repositories as repo
 from app.domain import agrees_with_wb
 from app.postgres import ConnectionPool, single
 from app.service import CatalogOperations, StockOperations, WmsService
@@ -420,7 +419,6 @@ def test_acceptance_is_confirmed_only_by_what_wildberries_actually_says(
     есть подтверждал приёмку сам себе. Так в боевом контуре 6072 задания
     оказались в терминальном успехе, ничего не доказав.
     """
-    from app.service import WmsService
     from app.shipments import ShipmentOperations
     from app.tasks import TaskOperations
 
@@ -464,7 +462,6 @@ def test_a_cancellation_while_the_sticker_is_being_fetched_does_not_revive_the_t
     ВОСКРЕШАЛ его: `invalidated_at` сбрасывался в NULL, и отменённое задание
     снова выглядело готовым к отгрузке — со стикером и в поставке.
     """
-    from app.service import WmsService
     from app.tasks import TaskOperations
     from app.workers import wb_labels
 

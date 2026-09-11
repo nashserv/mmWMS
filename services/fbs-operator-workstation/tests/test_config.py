@@ -1,7 +1,6 @@
 """Конфигурация. Умолчание у секрета — это работающий стенд с чужим ключом."""
 from __future__ import annotations
 
-import os
 
 import pytest
 

@@ -15,7 +15,8 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 import httpx
 from urllib.parse import urlsplit
@@ -83,7 +84,7 @@ class WbOrder:
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     @classmethod
-    def from_wb(cls, row: dict[str, Any]) -> "WbOrder":
+    def from_wb(cls, row: dict[str, Any]) -> WbOrder:
         skus = row.get("skus") or []
         return cls(
             wb_order_id=int(row["id"]),
@@ -129,7 +130,7 @@ class WbClient:
         if self._owns_client:
             self._client.close()
 
-    def __enter__(self) -> "WbClient":
+    def __enter__(self) -> WbClient:
         return self
 
     def __exit__(self, *_: Any) -> None:

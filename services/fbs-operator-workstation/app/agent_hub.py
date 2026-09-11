@@ -218,7 +218,7 @@ class AgentHub:
             return {"ok": True, "ack": False}
         try:
             return await asyncio.wait_for(future, timeout=ACK_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError as error:
+        except TimeoutError as error:
             raise AgentAckTimeout(
                 f"агент станции {station_id} не подтвердил запись за "
                 f"{ACK_TIMEOUT_SECONDS:.0f} с") from error

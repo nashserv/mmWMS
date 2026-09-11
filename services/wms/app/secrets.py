@@ -85,7 +85,7 @@ class SecretProvider:
         Значение детерминировано по ссылке — чтобы в логах стенда один кабинет
         выглядел одинаково от запуска к запуску.
         """
-        digest = hashlib.sha256(f"stand:{ref}".encode("utf-8")).hexdigest()[:32]
+        digest = hashlib.sha256(f"stand:{ref}".encode()).hexdigest()[:32]
         return f"stand-not-a-token-{digest}"
 
 

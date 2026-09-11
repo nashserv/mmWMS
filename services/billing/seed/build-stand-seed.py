@@ -299,7 +299,7 @@ def write_identity_seed(root: tuple[str, str, None],
     add("INSERT INTO identity_role_grant (id, user_id, role_code, scope_kind, scope_id, granted_by) VALUES")
 
     rows = []
-    for name, partner_id, role in [(root[0], root[1], "senior_manager")] + [
+    for _name, partner_id, role in [(root[0], root[1], "senior_manager")] + [
             (name, pid, "account_manager") for name, pid, _ in managers]:
         rows.append(
             f"    ({quote(stable('grant', partner_id))}, {quote(user_of(partner_id))}, "

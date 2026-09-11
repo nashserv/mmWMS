@@ -23,9 +23,10 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import psycopg
 
@@ -160,7 +161,7 @@ class WmsService:
     def reserve(self, params: dict[str, Any]) -> ReservationOutcome:
         """Транзакция раздела 6.2 с повтором при конкуренции за остаток."""
         last_error: psycopg.Error | None = None
-        for attempt in range(RESERVE_ATTEMPTS):
+        for _attempt in range(RESERVE_ATTEMPTS):
             try:
                 with self._pool.connection() as connection:
                     with transaction(connection) as cursor:
@@ -209,13 +210,26 @@ class WmsService:
             # заказу (инвариант 6). Названный и не найденный — всегда отказ.
             owner = repo.owner_by_id(cursor, account_hint["owner_id"])
             seller = owner["seller_external_id"] if owner else seller
+        inactive_account = (account_hint if owner is None
+                            else (account_hint or repo.sole_account_of_owner(cursor, owner["id"])))
+        if owner is not None and not owner["active"] and inactive_account is None:
+            # Клиент отключён, и кабинета у него нет: заводить задание не на
+            # что — `wms_task.wb_account_id` в схеме NOT NULL. Это отказ, а не
+            # падение по `NoneType`.
+            return self._reject(cursor, ErrorCode.OWNER_INACTIVE,
+                                wb_order_id=wb_order_id, barcode=barcode or sku_field,
+                                quantity=quantity, correlation_id=correlation_id,
+                                aggregate=order_aggregate, seller=seller,
+                                owner_id=owner["id"])
         if owner is not None and not owner["active"]:
             # Владелец есть, но отключён. Задание завести МОЖНО — и нужно:
             # заказ существует у Wildberries, срок по нему идёт, и молчаливый
             # отказ раз в две секунды не поможет никому. Разбирает человек.
             return self._manual_review(
                 cursor, code=ErrorCode.OWNER_INACTIVE, owner=owner, seller=seller,
-                account=account_hint or repo.sole_account_of_owner(cursor, owner["id"]),
+                # Кабинет здесь не пуст: случай «клиент отключён, кабинета
+                # нет» разобран выше отказом.
+                account=inactive_account or {},
                 wb_order_id=wb_order_id, wb_order_uid=_text(params.get("order_uid")),
                 barcode=barcode or sku_field, quantity=quantity, deadline=params.get("deadline"),
                 reason=f"клиент {seller} отключён: приём его заказов остановлен",
@@ -783,7 +797,8 @@ class StockOperations:
                         written += 1
                         touched.add(sku["id"])
         # Транзакция закрыта — остаток можно публиковать (инвариант 2).
-        self._announce(owner_id, touched)
+        if owner_id is not None:
+            self._announce(owner_id, touched)
         return {"reference": reference, "owner_external_id": seller,
                 "state": "applied", "moves": written,
                 "duplicate": written == 0}
@@ -920,11 +935,11 @@ class StockOperations:
 
 def _now_iso() -> str:
     """Момент сборки ответа: экран обязан знать, насколько свежее то, что видит."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _days_ago(days: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
 
 def _text_or_none(value: Any) -> str | None:

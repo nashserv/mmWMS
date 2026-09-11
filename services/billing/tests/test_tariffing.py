@@ -301,7 +301,6 @@ def test_a_cabinet_that_arrives_late_still_gets_its_event_billed(
     """
     import os
 
-    from app.admin import Admin
 
     with database.transaction() as cursor:
         cursor.execute("INSERT INTO partner (id, name) VALUES (%s, 'Зардал')",

@@ -24,7 +24,8 @@ import logging
 import os
 import time
 from collections import defaultdict
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from .. import rate_limit, repositories as repo
 from ..metrics import LABELS_FETCHED

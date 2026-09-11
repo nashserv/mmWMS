@@ -51,7 +51,7 @@ def assert_no_secrets(payload: Any, path: str = "payload") -> None:
             if str(key).lower() in _FORBIDDEN_KEYS:
                 raise SecretLeak(f"{path}.{key}: поле с секретом в событии запрещено")
             assert_no_secrets(value, f"{path}.{key}")
-    elif isinstance(payload, (list, tuple)):
+    elif isinstance(payload, list | tuple):
         for index, value in enumerate(payload):
             assert_no_secrets(value, f"{path}[{index}]")
     elif isinstance(payload, str) and _JWT_RE.search(payload):

@@ -14,7 +14,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Iterator
+from collections.abc import Iterator
 
 import psycopg
 from psycopg.rows import dict_row
@@ -105,7 +105,7 @@ class ConnectionPool:
                     break
                 if self._leased < self._max_size:
                     self._leased += 1
-                    connection = None  # type: ignore[assignment]
+                    connection = None
                     break
                 if not self._cond.wait(max(0.0, deadline - time.monotonic())):
                     raise TimeoutError("нет свободных соединений с базой")

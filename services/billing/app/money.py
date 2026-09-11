@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from .domain import Charge, PartnerShare, Tier
 

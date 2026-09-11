@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import importlib
 import json
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 import pytest
 from starlette.testclient import TestClient

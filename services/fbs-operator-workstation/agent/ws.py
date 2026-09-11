@@ -167,7 +167,7 @@ class WebSocket:
         self._sock.settimeout(timeout if timeout is not None else self._timeout)
         try:
             payload = self._receive_message()
-        except (socket.timeout, TimeoutError):
+        except TimeoutError:
             return None
         if payload is None:
             return None

@@ -10,7 +10,6 @@ import uuid
 
 import pytest
 
-from app import repositories as repo
 from app.postgres import ConnectionPool, single
 from app.receiving import ReceivingOperations
 from app.service import CatalogOperations, StockOperations, WmsService

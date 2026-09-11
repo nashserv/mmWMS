@@ -134,7 +134,7 @@ def test_step_01_opening_stock_lands_in_the_ledger_not_only_in_the_balance(
         "comment": "начальный остаток от владельца компании",
         "lines": [{"barcode": barcode, "quantity": data.OPENING_QTY,
                    "cell_address": address, "state": "good"}
-                  for barcode, (address, _) in zip(data.BARCODES, data.CELLS)]})
+                  for barcode, (address, _) in zip(data.BARCODES, data.CELLS, strict=False)]})
     assert result.get("state") == "applied", f"документ начального остатка не применён: {result}"
 
     # Ячейки заведены: сборщику нужен адрес, а не «где-то на складе».
@@ -180,7 +180,7 @@ def test_step_02_receipt_raises_the_balance_by_exactly_what_arrived(
         "lines": [{"barcode": barcode, "expected_qty": data.RECEIPT_QTY,
                    "actual_qty": data.RECEIPT_QTY, "box_barcode": box, "cell_address": cell,
                    "comment": comment}
-                  for barcode, (box, cell, comment) in zip(data.BARCODES, data.BOXES)]})
+                  for barcode, (box, cell, comment) in zip(data.BARCODES, data.BOXES, strict=False)]})
     assert result.get("state") in ("accepted", "counting"), f"приёмка не принята: {result}"
 
     for barcode in data.BARCODES:

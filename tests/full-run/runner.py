@@ -17,7 +17,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, NoReturn
+from typing import Any, NoReturn
+from collections.abc import Callable, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -204,7 +205,7 @@ class Db:
             return None
         return next(iter(row.values()))
 
-    def spawn(self) -> "Db":
+    def spawn(self) -> Db:
         """Отдельное соединение — наблюдателю нужно своё, чужое он заблокирует."""
         return Db(self.url)
 
@@ -306,7 +307,7 @@ class TxnWatch:
         self.samples: list[TxnSample] = []
         self.error: str | None = None
 
-    def __enter__(self) -> "TxnWatch":
+    def __enter__(self) -> TxnWatch:
         self._thread = threading.Thread(target=self._loop, name="txn-watch", daemon=True)
         self._thread.start()
         return self
@@ -389,7 +390,7 @@ class Bus:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def start(self) -> "Bus":
+    def start(self) -> Bus:
         self._thread = threading.Thread(target=self._loop, name="bus-tap", daemon=True)
         self._thread.start()
         # Даём подписке встать до первого действия склада: событие, вылетевшее
@@ -518,7 +519,7 @@ def lock_hold_histogram(metrics_url: str, operation: str) -> dict[float, float]:
     возраст резерву, который к ним отношения не имеет.
     """
     text = httpx.get(metrics_url, timeout=10.0).text
-    prefix = f'mmx_wms_lock_hold_seconds_bucket{{le="'
+    prefix = 'mmx_wms_lock_hold_seconds_bucket{le="'
     buckets: dict[float, float] = {}
     for line in text.splitlines():
         if not line.startswith(prefix) or f'operation="{operation}"' not in line:

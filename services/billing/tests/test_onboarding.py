@@ -58,7 +58,7 @@ def _by_contract(schema_name: str, payload: dict[str, Any]) -> dict[str, Any]:
     schema = ((document.get("components") or {}).get("schemas") or {}).get(schema_name)
     if schema is None:
         return payload
-    jsonschema = pytest.importorskip("jsonschema", reason="нужен jsonschema")
+    pytest.importorskip("jsonschema", reason="нужен jsonschema")
     from jsonschema import Draft202012Validator
     from referencing import Registry, Resource
     from referencing.jsonschema import DRAFT202012

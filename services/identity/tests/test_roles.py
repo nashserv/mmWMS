@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import importlib
 import uuid
-from typing import Iterator
+from collections.abc import Iterator
 
 import pytest
 from starlette.testclient import TestClient

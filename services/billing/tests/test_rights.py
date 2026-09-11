@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import importlib
 import uuid
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 import pytest
 from starlette.testclient import TestClient
@@ -250,7 +251,7 @@ def test_a_blocking_handler_is_not_declared_async() -> None:
                 for item in node.decorator_list)
             if not decorated:
                 continue
-            awaits = any(isinstance(inner, (ast.Await, ast.AsyncWith, ast.AsyncFor))
+            awaits = any(isinstance(inner, ast.Await | ast.AsyncWith | ast.AsyncFor)
                          for inner in ast.walk(node))
             if not awaits:
                 offenders.append(node.name)

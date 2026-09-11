@@ -18,17 +18,9 @@ import os
 import io
 import pathlib
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from zoneinfo import ZoneInfo
 from typing import Any
-
-# Та же зона, что в биллинге: период в ЛК и период в счёте обязаны быть одним
-# и тем же месяцем. По UTC ночная смена первого числа попадала в разные.
-WAREHOUSE_ZONE = ZoneInfo(os.getenv("BILLING_TIMEZONE", "Europe/Moscow"))
-
-
-def today() -> date:
-    return datetime.now(timezone.utc).astimezone(WAREHOUSE_ZONE).date()
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
@@ -40,6 +32,14 @@ from .config import app_environment, database_url, trusted_hosts
 from .db import Database
 from .metrics import EXPORTS, HTTP_DURATION, HTTP_REQUESTS, SERVICE, SERVICE_READY
 from .upstream import BillingClient, IdentityClient, Upstream, WmsClient
+
+# Та же зона, что в биллинге: период в ЛК и период в счёте обязаны быть одним
+# и тем же месяцем. По UTC ночная смена первого числа попадала в разные.
+WAREHOUSE_ZONE = ZoneInfo(os.getenv("BILLING_TIMEZONE", "Europe/Moscow"))
+
+
+def today() -> date:
+    return datetime.now(UTC).astimezone(WAREHOUSE_ZONE).date()
 
 BASE_PATH = "/api/portal/v1"
 STATIC = pathlib.Path(__file__).resolve().parents[1] / "static"
@@ -59,13 +59,13 @@ def plain(value: Any) -> Any:
     import datetime
     import uuid as uuid_module
 
-    if isinstance(value, (datetime.datetime, datetime.date)):
+    if isinstance(value, datetime.datetime | datetime.date):
         return value.isoformat()
     if isinstance(value, uuid_module.UUID):
         return str(value)
     if isinstance(value, dict):
         return {str(key): plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [plain(item) for item in value]
     return value
 

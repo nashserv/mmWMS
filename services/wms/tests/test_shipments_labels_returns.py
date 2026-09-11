@@ -364,7 +364,7 @@ def test_printing_hands_ready_bytes_to_the_station(
     # прогона требует уложить весь путь до устройства в 50 мс, и если здесь
     # уйдёт хотя бы десяток, агенту с принтером не останется ничего.
     worst = 0.0
-    for attempt in range(10):
+    for _attempt in range(10):
         started = time.perf_counter()
         LabelOperations(pool, WmsService(pool)).print(
             task_id, {"station_id": str(station_id), "idempotency_key": unique("print"),

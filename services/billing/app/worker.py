@@ -23,7 +23,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -77,9 +77,13 @@ class StorageLoop:
                 return
 
     def once(self) -> None:
-        today = today()
+        # Имя не `today`: локальная переменная с именем импортированной
+        # функции затеняет её, и следующий такт падает `UnboundLocalError` —
+        # начисление хранения не проходит вовсе, а в логе видно только
+        # «не прошло».
+        current = today()
         for offset in range(1, STORAGE_BACKFILL_DAYS + 1):
-            day = today - timedelta(days=offset)
+            day = current - timedelta(days=offset)
             results = self._service.accrue_storage(day, box_places, tenant=tenant_id())
             accrued = [row for row in results if row["outcome"] == "accrued"]
             if accrued:

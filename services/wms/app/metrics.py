@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 

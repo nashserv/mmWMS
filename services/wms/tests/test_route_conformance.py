@@ -29,7 +29,6 @@ import yaml
 from fastapi.testclient import TestClient
 
 import dbfixtures
-from app import fixtures
 from app.api import create_app, publisher, state
 
 jsonschema = pytest.importorskip("jsonschema", reason="нужен jsonschema для проверки контракта")

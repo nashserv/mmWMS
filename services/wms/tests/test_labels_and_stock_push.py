@@ -16,8 +16,8 @@ import httpx
 import pytest
 
 from app import repositories as repo
-from app.postgres import ConnectionPool, single, transaction
-from app.service import CatalogOperations, StockOperations, WmsService
+from app.postgres import ConnectionPool, single
+from app.service import CatalogOperations, StockOperations
 from app.stock_push import StockPublisher
 from app.workers.wb_labels import WbLabelWorker
 from app.workers.wb_sync import WbSyncWorker

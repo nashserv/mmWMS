@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from . import repositories as repo
 from .domain import TaskState, check_transition, now
 from .postgres import ConnectionPool, single, transaction
-from .service import Emitted, WmsService
+from .service import WmsService
 from .metrics import track_lock
 
 log = logging.getLogger("wms.tasks")

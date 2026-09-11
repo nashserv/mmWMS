@@ -21,7 +21,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from .. import rate_limit, repositories as repo
 from ..metrics import WB_SYNC_LAST_SUCCESS, WB_SYNC_LAG

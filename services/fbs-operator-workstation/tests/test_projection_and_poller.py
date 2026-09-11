@@ -20,6 +20,7 @@ from app.wms_client import PullBatch
 from app.wms_client import WmsUnavailable
 
 import time
+from datetime import UTC
 
 def _task(task_id: str, **overrides):
     """Задание в форме контракта — для проверок проекции и опроса."""
@@ -28,7 +29,7 @@ def _task(task_id: str, **overrides):
 
 def _iso(moment: float) -> str:
     import datetime as dt
-    return dt.datetime.fromtimestamp(moment, dt.timezone.utc).isoformat()
+    return dt.datetime.fromtimestamp(moment, dt.UTC).isoformat()
 
 
 
@@ -242,11 +243,11 @@ def test_visible_delay_is_not_measured_against_an_invented_timestamp():
 
 
 def test_visible_delay_is_measured_when_the_service_reports_creation_time():
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from app import metrics
     before = metrics.TASK_VISIBLE_DELAY._sum.get()
-    born = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+    born = (datetime.now(UTC) - timedelta(seconds=2)).isoformat()
     projection = Projection()
     projection.apply([make("timed", created_at=born)])
     assert metrics.TASK_VISIBLE_DELAY._sum.get() > before

@@ -52,13 +52,13 @@ def plain(value: Any) -> Any:
     """Приводит ответ к JSON без потери копеек."""
     if isinstance(value, Decimal):
         return str(value)
-    if isinstance(value, (datetime, date)):
+    if isinstance(value, datetime | date):
         return value.isoformat()
     if isinstance(value, uuid.UUID):
         return str(value)
     if isinstance(value, dict):
         return {str(key): plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [plain(item) for item in value]
     return value
 
@@ -212,7 +212,7 @@ async def onboard(request: Request) -> JSONResponse:
         conflict = _conflict_or_raise(error)
         if conflict is not None:
             return conflict
-        if isinstance(error, (OnboardingError, ValueError)):
+        if isinstance(error, OnboardingError | ValueError):
             return ok({"error": str(error)}, 400)
         raise
     return ok(result, 201 if result["state"] == "ok" else 202)
@@ -545,8 +545,7 @@ def _conflict_or_raise(error: Exception) -> JSONResponse | None:
     """
     import psycopg
 
-    if isinstance(error, (psycopg.errors.ExclusionViolation,
-                          psycopg.errors.UniqueViolation)):
+    if isinstance(error, psycopg.errors.ExclusionViolation | psycopg.errors.UniqueViolation):
         return ok({"error": _conflict_text(error)}, 409)
     return None
 

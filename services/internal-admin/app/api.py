@@ -72,13 +72,13 @@ def plain(value: Any) -> Any:
     import datetime
     import uuid as uuid_module
 
-    if isinstance(value, (datetime.datetime, datetime.date)):
+    if isinstance(value, datetime.datetime | datetime.date):
         return value.isoformat()
     if isinstance(value, uuid_module.UUID):
         return str(value)
     if isinstance(value, dict):
         return {str(key): plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [plain(item) for item in value]
     return value
 

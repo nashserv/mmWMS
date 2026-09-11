@@ -10,11 +10,12 @@ import json
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from psycopg import Cursor
 
-from .domain import PartnerShare, Service, Tier
+from .domain import PartnerShare, Tier
 
 
 def new_id() -> str:

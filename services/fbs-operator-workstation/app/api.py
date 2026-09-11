@@ -23,7 +23,8 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, Protocol
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
@@ -41,11 +42,26 @@ from .puller import Poller
 from .receiving import ReceivingRefused, ReceivingService
 from .store import Store
 from .supervisor import SupervisorService
-from .wms_client import WmsClient, WmsRejected, WmsUnavailable
+from .wms_client import WmsClient, WmsUnavailable
 
 logger = logging.getLogger("workstation")
 
 API = "/api/workstation/v1"
+
+
+class Consumer(Protocol):
+    """Что рабочее место требует от шины.
+
+    Шина — не зависимость склада (пункт 14 прогона): настоящий консьюмер и
+    заглушка обязаны уметь одно и то же, иначе «работает без RabbitMQ»
+    проверяется только на словах.
+    """
+
+    def start(self, *args: Any, **kwargs: Any) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def status(self) -> dict[str, Any]: ...
 
 
 class AppState:
@@ -57,12 +73,56 @@ class AppState:
         self.projection = Projection()
         self.hub = AgentHub()
         self.poller: Poller | None = None
-        self.inbox: Any = NullConsumer()
+        # Шина: настоящий консьюмер либо заглушка. Рабочее место обязано
+        # работать при выключенном RabbitMQ (пункт 14 прогона), и оба варианта
+        # умеют одно и то же — `start` и `stop`.
+        self.inbox: Consumer = NullConsumer()
         self.picking: PickingService | None = None
         self.printing: PrintService | None = None
         self.receiving: ReceivingService | None = None
         self.supervisor: SupervisorService | None = None
         self.started_at = time.time()
+
+    # Доступ к службам через свойства, а не напрямую.
+    #
+    # До старта `lifespan` их нет, и обращение к ним даёт `AttributeError:
+    # 'NoneType' object has no attribute ...` — сообщение, по которому не
+    # понять ни что произошло, ни почему. Здесь отказ называет себя: сервис
+    # ещё не поднялся, и это состояние, а не поломка.
+    def _started(self, name: str, value: Any) -> Any:
+        if value is None:
+            raise RuntimeError(
+                f"{name} недоступен: рабочее место ещё не поднялось "
+                f"(lifespan не отработал)")
+        return value
+
+    @property
+    def wms(self) -> WmsClient:
+        return self._started("клиент wms", self.client)
+
+    @property
+    def database(self) -> Store:
+        return self._started("база рабочего места", self.store)
+
+    @property
+    def queue(self) -> Poller:
+        return self._started("опросчик заданий", self.poller)
+
+    @property
+    def picks(self) -> PickingService:
+        return self._started("подбор", self.picking)
+
+    @property
+    def labels(self) -> PrintService:
+        return self._started("печать", self.printing)
+
+    @property
+    def inbound(self) -> ReceivingService:
+        return self._started("приёмка", self.receiving)
+
+    @property
+    def shift(self) -> SupervisorService:
+        return self._started("экран начальника смены", self.supervisor)
 
     def ready(self) -> bool:
         """Готовность — это «работа делается», а не «порт открыт».
@@ -246,24 +306,24 @@ async def tasks(query: TasksQuery) -> dict[str, Any]:
     return {
         "tasks": [task.as_dict() for task in rows],
         "pickable": len(state.projection.pickable()),
-        "full_path": state.supervisor.full_path() if state.supervisor else {},
+        "full_path": state.shift.full_path() if state.supervisor else {},
     }
 
 
 @router.post("/status")
 async def status() -> dict[str, Any]:
     """Состояние самого рабочего места — для экрана и для человека."""
-    store_available = bool(state.store and state.store.available)
+    store_available = bool(state.store and state.database.available)
     return {
         "ready": state.ready(),
         "uptime_seconds": round(time.time() - state.started_at, 1),
-        "poller": state.poller.status() if state.poller else {},
+        "poller": state.queue.status() if state.poller else {},
         "bus": state.inbox.status(),
         "projection": state.projection.snapshot(),
         "agents": state.hub.connected(),
         "store": {"available": store_available,
-                  "last_error": state.store.last_error if state.store else None},
-        "wms_base_url": state.client.base_url if state.client else None,
+                  "last_error": state.database.last_error if state.store else None},
+        "wms_base_url": state.wms.base_url if state.client else None,
     }
 
 
@@ -273,7 +333,7 @@ async def poll_now() -> dict[str, Any]:
     if state.poller is None:
         return {"ok": False, "error": "опросчик не запущен"}
     try:
-        batch = await state.poller.poll_once()
+        batch = await state.queue.poll_once()
     except WmsUnavailable as error:
         return {"ok": False, "error": str(error)}
     return {"ok": True, "tasks": len(batch.tasks), "available_total": batch.available_total}
@@ -284,7 +344,7 @@ async def poll_now() -> dict[str, Any]:
 @router.post("/sessions")
 async def session_start(command: SessionStart) -> JSONResponse:
     try:
-        result = await state.picking.start_session(
+        result = await state.picks.start_session(
             actor_id=command.actor_id, station_id=_station(command.station_id),
             limit=command.limit, lease_seconds=config.lease_seconds(),
             owner_external_ids=command.owner_external_ids)
@@ -296,7 +356,7 @@ async def session_start(command: SessionStart) -> JSONResponse:
 @router.post("/sessions/by-barcode")
 async def session_by_barcode(lookup: BarcodeLookup) -> JSONResponse:
     try:
-        return _ok(await state.picking.session_by_barcode(lookup.picklist_barcode))
+        return _ok(await state.picks.session_by_barcode(lookup.picklist_barcode))
     except PickingRefused as error:
         return _refused(error, status_code=404)
 
@@ -306,22 +366,23 @@ async def session_by_barcode(lookup: BarcodeLookup) -> JSONResponse:
 @router.post("/sessions/{session_id}")
 async def session_view(session_id: str) -> JSONResponse:
     try:
-        return _ok(await state.picking.session_view(session_id))
+        return _ok(await state.picks.session_view(session_id))
     except PickingRefused as error:
         return _refused(error, status_code=404)
 
 
 @router.post("/sessions/{session_id}/finish")
 async def session_finish(session_id: str) -> JSONResponse:
-    return _ok(await state.picking.finish_session(session_id))
+    return _ok(await state.picks.finish_session(session_id))
 
 
 @router.post("/scan")
 async def scan(command: ScanCommand) -> JSONResponse:
     try:
-        result = await state.picking.scan_at_rack(
+        result = await state.picks.scan_at_rack(
             task_id=command.task_id, barcode=command.barcode, actor_id=command.actor_id,
-            session_id=command.session_id, station_id=_station(command.station_id))
+            session_id=command.session_id,
+            station_id=_station_or_none(command.station_id))
     except PickingRefused as error:
         return _refused(error)
     return _ok(result)
@@ -335,7 +396,7 @@ async def pack(command: PackCommand) -> JSONResponse:
     красное и остановиться, а не «показать результат».
     """
     try:
-        result = await state.picking.pack(
+        result = await state.picks.pack(
             task_id=command.task_id, control_barcode=command.control_barcode,
             actor_id=command.actor_id, station_id=_station(command.station_id),
             box_barcode=command.box_barcode, session_id=command.session_id)
@@ -347,7 +408,7 @@ async def pack(command: PackCommand) -> JSONResponse:
 @router.post("/cancel")
 async def cancel(command: CancelCommand) -> JSONResponse:
     try:
-        result = await state.picking.cancel(
+        result = await state.picks.cancel(
             task_id=command.task_id, reason_code=command.reason_code,
             comment=command.comment, actor_id=command.actor_id,
             handed_over=command.handed_over)
@@ -359,7 +420,7 @@ async def cancel(command: CancelCommand) -> JSONResponse:
 @router.post("/return-to-shelf")
 async def return_to_shelf(command: ShelfCommand) -> JSONResponse:
     try:
-        result = await state.picking.return_to_shelf(
+        result = await state.picks.return_to_shelf(
             task_id=command.task_id, cell_address=command.cell_address,
             actor_id=command.actor_id, box_barcode=command.box_barcode,
             reason=command.reason)
@@ -373,7 +434,7 @@ async def return_to_shelf(command: ShelfCommand) -> JSONResponse:
 @router.post("/print")
 async def print_label(command: PrintCommand) -> JSONResponse:
     try:
-        result = await state.printing.print_label(
+        result = await state.labels.print_label(
             task_id=command.task_id, station_id=_station(command.station_id),
             actor_id=command.actor_id, reprint=command.reprint,
             reason=command.reason, copies=command.copies,
@@ -396,7 +457,7 @@ async def print_probe(command: ProbeCommand) -> JSONResponse:
     умолчанию в конфиге.
     """
     try:
-        return _ok(await state.printing.probe_printer(_station(command.station_id)))
+        return _ok(await state.labels.probe_printer(_station(command.station_id)))
     except AgentBusy as error:
         return _refused(error)
 
@@ -411,7 +472,7 @@ async def print_probe_confirm(command: ProbeConfirm) -> JSONResponse:
     """
     if state.store is None:
         return _refused(RuntimeError("база рабочего места недоступна"), status_code=503)
-    await state.store.record_probe(
+    await state.database.record_probe(
         station_id=_station(command.station_id), confirmed_format=command.confirmed_format,
         note=command.note or "подтверждено человеком у принтера")
     agent = state.hub.get(_station(command.station_id))
@@ -430,7 +491,7 @@ async def print_probe_confirm(command: ProbeConfirm) -> JSONResponse:
 
 @router.post("/printers")
 async def printers() -> dict[str, Any]:
-    rows = await state.store.printers() if state.store else []
+    rows = await state.database.printers() if state.store else []
     connected = {agent["station_id"]: agent for agent in state.hub.connected()}
     for row in rows:
         row["station_id"] = str(row.get("station_id"))
@@ -443,7 +504,7 @@ async def printers() -> dict[str, Any]:
 @router.post("/receiving/screen")
 async def receiving_screen(query: ScreenQuery) -> JSONResponse:
     try:
-        return _ok(await state.receiving.receipts_screen(
+        return _ok(await state.inbound.receipts_screen(
             owner_external_id=query.owner_external_id, reference=query.reference,
             limit=query.limit))
     except ReceivingRefused as error:
@@ -453,7 +514,7 @@ async def receiving_screen(query: ScreenQuery) -> JSONResponse:
 @router.post("/receiving/submit")
 async def receiving_submit(command: ReceiptSubmit) -> JSONResponse:
     try:
-        return _ok(await state.receiving.submit_receipt(
+        return _ok(await state.inbound.submit_receipt(
             seller_external_id=command.seller_external_id, reference=command.reference,
             lines=command.lines, warehouse_code=command.warehouse_code,
             seller_name=command.seller_name, seller_inn=command.seller_inn,
@@ -465,7 +526,7 @@ async def receiving_submit(command: ReceiptSubmit) -> JSONResponse:
 @router.post("/putaway/screen")
 async def putaway_screen(query: ScreenQuery) -> JSONResponse:
     try:
-        return _ok(await state.receiving.putaway_screen(
+        return _ok(await state.inbound.putaway_screen(
             owner_external_id=query.owner_external_id, reference=query.reference,
             limit=query.limit))
     except ReceivingRefused as error:
@@ -475,7 +536,7 @@ async def putaway_screen(query: ScreenQuery) -> JSONResponse:
 @router.post("/putaway/box")
 async def putaway_box(command: BoxSubmit) -> JSONResponse:
     try:
-        return _ok(await state.receiving.place_in_box(
+        return _ok(await state.inbound.place_in_box(
             barcode=command.barcode, seller_external_id=command.seller_external_id,
             comment=command.comment, product_barcode=command.product_barcode,
             cell_address=command.cell_address, quantity=command.quantity,
@@ -488,7 +549,7 @@ async def putaway_box(command: BoxSubmit) -> JSONResponse:
 @router.post("/inventory/sheet")
 async def inventory_sheet(query: SheetQuery) -> JSONResponse:
     try:
-        return _ok(await state.receiving.inventory_sheet(
+        return _ok(await state.inbound.inventory_sheet(
             seller_external_id=query.seller_external_id, scope=query.scope,
             cell_addresses=query.cell_addresses, barcodes=query.barcodes))
     except ReceivingRefused as error:
@@ -498,7 +559,7 @@ async def inventory_sheet(query: SheetQuery) -> JSONResponse:
 @router.post("/inventory/count")
 async def inventory_count(command: CountSubmit) -> JSONResponse:
     try:
-        return _ok(await state.receiving.submit_count(
+        return _ok(await state.inbound.submit_count(
             seller_external_id=command.seller_external_id, reference=command.reference,
             scope=command.scope, lines=command.lines,
             warehouse_code=command.warehouse_code, actor_id=command.actor_id))
@@ -511,7 +572,7 @@ async def inventory_count(command: CountSubmit) -> JSONResponse:
 @router.post("/shipping/picked")
 async def shipping_picked(query: ScreenQuery) -> JSONResponse:
     try:
-        rows = await state.receiving.picked_tasks(
+        rows = await state.inbound.picked_tasks(
             seller_external_id=query.owner_external_id, limit=query.limit)
     except ReceivingRefused as error:
         return _refused(error, status_code=503)
@@ -522,7 +583,7 @@ async def shipping_picked(query: ScreenQuery) -> JSONResponse:
 async def shipping_action(command: ShipmentCommand) -> JSONResponse:
     """Действия над поставкой, включая подтверждение передачи человеком."""
     try:
-        result = await state.receiving.shipment(
+        result = await state.inbound.shipment(
             seller_external_id=command.seller_external_id, action=command.action,
             wb_supply_id=command.wb_supply_id, task_ids=command.task_ids,
             handed_over_by=command.handed_over_by,
@@ -536,7 +597,7 @@ async def shipping_action(command: ShipmentCommand) -> JSONResponse:
 
 @router.post("/supervisor/screen")
 async def supervisor_screen() -> dict[str, Any]:
-    result = await state.supervisor.screen()
+    result = await state.shift.screen()
     result["printing"]["last_write"] = state.hub.last_write or None
     return result
 
@@ -554,7 +615,7 @@ async def agent_socket(websocket: WebSocket) -> None:
     station_id = ""
     try:
         hello = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
-    except (asyncio.TimeoutError, WebSocketDisconnect, ValueError):
+    except (TimeoutError, WebSocketDisconnect, ValueError):
         await websocket.close(code=1002)
         return
 
@@ -593,11 +654,11 @@ async def agent_socket(websocket: WebSocket) -> None:
         confirmed_format=_text(hello.get("confirmed_format")))
     await state.hub.register(session)
     if state.store is not None:
-        await state.store.upsert_printer(
+        await state.database.upsert_printer(
             station_id=station_id, station_name=station_name,
             printer_name=session.printer_name, transport=session.transport)
         if session.confirmed_format:
-            await state.store.record_probe(
+            await state.database.record_probe(
                 station_id=station_id, confirmed_format=session.confirmed_format,
                 note="сообщено агентом при подключении")
 
@@ -625,8 +686,8 @@ async def _handle_agent_message(session: AgentSession, message: dict[str, Any]) 
             # Не молчим: подтверждение от не той станции — это либо ошибка
             # настройки агента, либо чужой агент в сети. И то и другое надо
             # видеть, а не списывать на «печать не подтвердилась».
-            log.warning("станция %s подтвердила чужое задание печати %s",
-                        session.station_id, job_id)
+            logger.warning("станция %s подтвердила чужое задание печати %s",
+                           session.station_id, job_id)
             metrics.PRINTS.labels(outcome="foreign_ack", label_format="unknown").inc()
             return
         if ok and write_ms is not None:
@@ -640,7 +701,7 @@ async def _handle_agent_message(session: AgentSession, message: dict[str, Any]) 
         confirmed = _text(message.get("confirmed_format"))
         session.confirmed_format = confirmed
         if state.store is not None and confirmed:
-            await state.store.record_probe(
+            await state.database.record_probe(
                 station_id=session.station_id, confirmed_format=confirmed,
                 note=_text(message.get("note")))
         logger.info("станция %s: принтер понял %s", session.station_name, confirmed)
@@ -666,7 +727,7 @@ def _refused(error: Exception, status_code: int = 409) -> JSONResponse:
     return JSONResponse({"ok": False, "error": str(error)}, status_code=status_code)
 
 
-def _station(value: Any) -> str | None:
+def _station_or_none(value: Any) -> str | None:
     """Станция наружу — uuid, внутрь — строка.
 
     Модели приняли `uuid.UUID`, чтобы опечатка в имени станции не уезжала
@@ -674,6 +735,11 @@ def _station(value: Any) -> str | None:
     в одном месте, а не в каждом сервисе.
     """
     return None if value is None else str(value)
+
+
+def _station(value: Any) -> str:
+    """Станция там, где она обязательна по модели: строка, и только строка."""
+    return str(value)
 
 
 def _text(value: Any) -> str | None:
@@ -699,12 +765,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.supervisor = SupervisorService(state.projection, state.store, state.receiving,
                                          wms=state.client)
 
-    await state.store.ping()
+    await state.database.ping()
     # Задания открытых сессий возвращаются на экран ДО первого опроса.
     # Рабочее место перезапустили посреди смены: у пяти сборщиков на руках по
     # обходу, а экран показывал бы им «работы нет».
-    await state.poller.restore_open_sessions()
-    state.poller.start()
+    await state.queue.restore_open_sessions()
+    state.queue.start()
     # Уборка молчащих агентов: оборванный сокет не всегда закрывается, а
     # печать в мёртвую сессию ждёт подтверждения до таймаута.
     reaper = asyncio.create_task(state.hub.reaper(), name="workstation-agent-reaper")
@@ -712,25 +778,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     bus_url = config.rabbitmq_url()
     if bus_url:
         state.inbox = InboxConsumer(bus_url, config.events_exchange(),
-                                    on_event=state.poller.nudge)
+                                    on_event=state.queue.nudge)
         state.inbox.start(asyncio.get_running_loop())
     else:
         state.inbox = NullConsumer()
         state.inbox.start()
 
     logger.info("рабочее место поднято: wms=%s, опрос каждые %.1f с",
-                state.client.base_url, config.poll_interval_seconds())
+                state.wms.base_url, config.poll_interval_seconds())
     try:
         yield
     finally:
         reaper.cancel()
         state.inbox.stop()
         if state.poller is not None:
-            await state.poller.stop()
+            await state.queue.stop()
         if state.client is not None:
-            await state.client.aclose()
+            await state.wms.aclose()
         if state.store is not None:
-            await state.store.close()
+            await state.database.close()
 
 
 def create_app() -> FastAPI:
@@ -779,7 +845,7 @@ def create_app() -> FastAPI:
         body = {
             "status": "ready" if ready else "degraded",
             "polling": state.projection.snapshot(),
-            "store_available": bool(state.store and state.store.available),
+            "store_available": bool(state.store and state.database.available),
             "bus_connected": bool(getattr(state.inbox, "connected", False)),
             # Шина не влияет на готовность: склад от неё не зависит (6.1).
             "note": "готовность определяется опросом, а не шиной",
@@ -839,7 +905,7 @@ def create_app() -> FastAPI:
         найденный через час на складе, возвращается к своей сессии сканером.
         """
         try:
-            view = await state.picking.session_view(session_id)
+            view = await state.picks.session_view(session_id)
         except PickingRefused as error:
             return HTMLResponse(screens.error_page(str(error)), status_code=404)
         return HTMLResponse(screens.picklist_page(view))

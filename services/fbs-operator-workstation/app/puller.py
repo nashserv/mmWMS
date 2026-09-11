@@ -18,7 +18,7 @@ import logging
 import time
 from typing import Any
 
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 from . import metrics
 from .domain import TERMINAL_STATES, assignee_id
@@ -159,7 +159,7 @@ class Poller:
                 logger.warning("опрос заданий не удался: %s", error)
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self._interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             finally:
                 self._wake.clear()
@@ -447,4 +447,4 @@ class Poller:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

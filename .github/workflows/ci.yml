@@ -10,15 +10,94 @@ name: ci
 
 on:
   push:
-    branches: [main, stream-0, stream-a, stream-b, stream-c]
+    # Любая ветка. Ветка, на которой CI не гоняется, — это ветка, о состоянии
+    # которой узнают при мерже: правило 9.5.5 требует зелёный прогон ДО него,
+    # а не после.
+    branches: ['**']
   pull_request:
     branches: [main]
 
+# Новый пуш в ту же ветку отменяет предыдущий прогон: очередь из десяти
+# прогонов одной ветки никому не нужна, а последний всё равно единственный,
+# по которому принимают решение.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+
+  lint:
+    name: Линтер и типы
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install --no-cache-dir ruff==0.8.6 mypy==1.14.1
+
+      - name: ruff
+        run: ruff check services tests infrastructure
+
+      - name: mypy
+        # По сервису: у всех девяти пакет называется `app`, и одним вызовом
+        # mypy отказывается их различать.
+        run: |
+          failed=0
+          for service in wms billing identity portal internal-admin \
+                         fbs-operator-workstation; do
+            echo "--- $service"
+            ( cd "services/$service" && mypy --config-file ../../pyproject.toml app ) || failed=1
+          done
+          exit $failed
+
+  audit:
+    name: Зависимости без известных дыр
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Одна дыра в одном сервисе не должна прятать остальные восемь.
+      fail-fast: false
+      matrix:
+        requirements:
+          - services/wms/requirements.txt
+          - services/wms/requirements-mock.txt
+          - services/billing/requirements.txt
+          - services/identity/requirements.txt
+          - services/portal/requirements.txt
+          - services/internal-admin/requirements.txt
+          - services/fbs-operator-workstation/requirements.txt
+          - services/fbs-operator-workstation/requirements-bus.txt
+          - services/wb-simulator/requirements.txt
+          - requirements-dev.txt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install --no-cache-dir pip-audit
+      - run: pip-audit -r ${{ matrix.requirements }}
+
+  simulator:
+    name: Симулятор Wildberries
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: |
+          pip install --no-cache-dir -r services/wb-simulator/requirements.txt
+          pip install --no-cache-dir -r requirements-dev.txt
+
+      - name: pytest
+        working-directory: services/wb-simulator
+        env: {APP_ENV: test}
+        run: python -m pytest -q
 
   migrations:
     name: Миграции на чистой базе
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16.10-bookworm
@@ -68,6 +147,7 @@ jobs:
   contracts:
     name: Контракты
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -85,6 +165,7 @@ jobs:
   tests:
     name: Тесты сервиса wms
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16.10-bookworm
@@ -139,19 +220,47 @@ jobs:
   workstation:
     name: Тесты рабочего места
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # Postgres обязателен: набор `@pytest.mark.stand` исполняет КАЖДЫЙ
+      # запрос `Store` на настоящем SQL. Без базы он пропускается, а именно
+      # он ловит то, чего не видит подставной store: опечатку в имени
+      # колонки, забытый RETURNING, значение вне CHECK.
+      postgres:
+        image: postgres:16.10-bookworm
+        env:
+          POSTGRES_DB: workstation_test
+          POSTGRES_USER: workstation
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+        options: >-
+          --health-cmd "pg_isready -U workstation -d workstation_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+        ports: ["5432:5432"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.13"}
-      - run: pip install --no-cache-dir -r services/fbs-operator-workstation/requirements-bus.txt pytest
+      - run: |
+          pip install --no-cache-dir -r services/fbs-operator-workstation/requirements-bus.txt
+          pip install --no-cache-dir -r requirements-dev.txt
+
+      - name: Накатить схему рабочего места
+        env:
+          DATABASE_URL: postgresql://workstation:ci-only-not-a-secret@127.0.0.1:5432/workstation_test
+          MIGRATIONS_DIR: services/fbs-operator-workstation/migrations
+        run: bash infrastructure/stand/scripts/migrate.sh
+
       - name: pytest
         working-directory: services/fbs-operator-workstation
-        env: {APP_ENV: test}
+        env:
+          APP_ENV: test
+          WORKSTATION_TEST_DATABASE_URL: postgresql://workstation:ci-only-not-a-secret@127.0.0.1:5432/workstation_test
         run: python -m pytest -q
 
   secrets:
     name: Живых токенов WB нет
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # Те же ворота, что и у стенда. Репозиторий проверяется целиком:
@@ -167,6 +276,7 @@ jobs:
   billing:
     name: Биллинг — миграции и тесты
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16.10-bookworm
@@ -241,6 +351,7 @@ jobs:
   identity:
     name: Identity — роли
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16.10-bookworm
@@ -282,6 +393,7 @@ jobs:
   screens:
     name: Админка и ЛК клиента
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16.10-bookworm

@@ -9,8 +9,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import threading
-from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from datetime import datetime, timedelta, UTC
+from typing import Any
+from collections.abc import Sequence
 
 from . import fixtures
 from .domain import TaskState, now, uid
@@ -393,7 +394,7 @@ class MockState:
         wanted = list(states) if states else [TaskState.RESERVED.value]
         owners = set(owner_external_ids or ())
         with self._lock:
-            deadline_at = datetime.now(timezone.utc) + CLAIM_TTL
+            deadline_at = datetime.now(UTC) + CLAIM_TTL
             taken: list[dict[str, Any]] = []
             candidates = [
                 task for task in self._tasks.values()

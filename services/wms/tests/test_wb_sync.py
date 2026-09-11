@@ -16,7 +16,7 @@ import pytest
 
 from app import repositories as repo
 from app.postgres import ConnectionPool, transaction
-from app.service import CatalogOperations, StockOperations, WmsService
+from app.service import CatalogOperations, StockOperations
 from app.workers.wb_sync import WbSyncWorker
 
 from dbfixtures import require_database, unique

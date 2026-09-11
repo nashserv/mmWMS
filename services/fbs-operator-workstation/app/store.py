@@ -15,7 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any
+from collections.abc import Iterable, Sequence
 
 from prometheus_client import Counter
 
@@ -45,8 +46,7 @@ def _is_connection_broken(error: Exception) -> bool:
         import psycopg
     except ImportError:
         return True
-    if isinstance(error, (psycopg.DataError, psycopg.IntegrityError,
-                          psycopg.ProgrammingError)):
+    if isinstance(error, psycopg.DataError | psycopg.IntegrityError | psycopg.ProgrammingError):
         return False
     return True
 

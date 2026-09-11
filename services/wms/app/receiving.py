@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from datetime import datetime, timedelta, UTC
+from typing import Any
+from collections.abc import Callable
 
 from . import repositories as repo
 from .postgres import ConnectionPool, single, transaction
@@ -96,7 +97,7 @@ class ReceivingOperations:
                         warehouse_id=warehouse["id"], actor_id=actor)
 
                 accepted, accepted_qty, counted_all, discrepancies = 0, 0, True, []
-                for index, line in enumerate(lines):
+                for _index, line in enumerate(lines):
                     barcode = str(line.get("barcode") or "").strip()
                     if not barcode:
                         continue
@@ -563,11 +564,11 @@ class ReceivingOperations:
 
 def _now_iso() -> str:
     """Момент сборки ответа. Экран обязан знать, насколько свежее то, что видит."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _hours_ago(hours: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
 
 
 def _text(value: Any) -> str | None:

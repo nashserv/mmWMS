@@ -11,7 +11,8 @@ import os
 import uuid
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from psycopg import Cursor
 

@@ -10,10 +10,11 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 import logging
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from . import repositories as repo
 from .postgres import ConnectionPool, single
@@ -102,4 +103,4 @@ def verify_account(pool: ConnectionPool, account_id: str) -> dict[str, Any]:
             "owner_external_id": account.get("seller_external_id"),
             "status": "ACTIVE" if verified else account["status"],
             "scopes": account.get("scopes") or [], "checks": checks,
-            "verified_at": datetime.now(timezone.utc).isoformat()}
+            "verified_at": datetime.now(UTC).isoformat()}
