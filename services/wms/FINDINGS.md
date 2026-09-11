@@ -637,8 +637,8 @@ ODOO_WMS_URL: http://wms:8080/api/mmx/wms/v1
 Обе команды — `docker compose build` с `GIT_SHA=$(git rev-parse HEAD)` и
 `git push origin main` по deploy-ключу — заблокированы правами окружения, в
 котором шла работа, а не репозиторием и не ключом. Ключ на месте,
-`core.sshCommand` настроен, `git push --dry-run` проходит и показывает
-`9da335c..bcd5380`. Сорок один коммит лежит в локальном `main` и ждёт
+`core.sshCommand` настроен, `git push --dry-run` проходит — проверено, вывод
+`9da335c..bcd5380`. Все коммиты аудита лежат в локальном `main` и ждут
 разрешения владельца на отправку.
 
 ## Стоп-линия
