@@ -164,3 +164,112 @@ def test_sink_backend_really_writes(tmp_path):
     assert elapsed >= 0
     written = list(tmp_path.iterdir())
     assert len(written) == 1 and written[0].read_bytes() == b"^XA^XZ"
+
+
+# ------------------------------------------- кадр, пришедший по частям
+
+def test_a_timeout_in_the_middle_of_a_frame_does_not_desynchronise_the_stream():
+    """Таймаут посреди кадра не должен ломать поток.
+
+    Заголовок вычитывался сразу, и таймаут между заголовком и полезной
+    нагрузкой оставлял поток рассинхронизированным: следующий вызов читал
+    байты этикетки как заголовок кадра, и агент видел мусорные опкоды. Для
+    сборщика это выглядит как оборвавшийся принтер посреди смены.
+    """
+    import json
+    import socket
+    import struct
+
+    from agent.ws import WebSocket
+
+    body = json.dumps({"type": "print", "job_id": "j-1"}).encode("utf-8")
+    frame = bytes([0x81, len(body)]) + body
+
+    class Trickle:
+        """Сокет, отдающий кадр по кусочку и с таймаутом посередине."""
+
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+            self.position = 0
+            self.timeouts = 0
+
+        def recv(self, size: int) -> bytes:
+            if self.position == 1:
+                # Таймаут ровно после первого байта заголовка.
+                self.timeouts += 1
+                if self.timeouts == 1:
+                    raise socket.timeout()
+            chunk = self.data[self.position:self.position + 1]
+            self.position += len(chunk)
+            return chunk
+
+        def settimeout(self, value) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    client = WebSocket.__new__(WebSocket)
+    client._sock = Trickle(frame)
+    client._buffer = b""
+    client._chunks = []
+    client._timeout = 0.01
+    client._recv = lambda size: client._sock.recv(size)
+
+    assert client.receive_json(timeout=0.01) is None, "таймаут обязан вернуть None"
+    # Второй вызов дочитывает тот же кадр, а не начинает разбор с середины.
+    message = None
+    for _ in range(len(frame) + 5):
+        message = client.receive_json(timeout=0.01)
+        if message is not None:
+            break
+    assert message == {"type": "print", "job_id": "j-1"}, (
+        f"сообщение собрано неверно: {message}. Поток рассинхронизирован — "
+        f"агент читает байты этикетки как заголовок кадра")
+
+
+def test_a_fragmented_message_survives_a_timeout_between_frames():
+    """Недособранное сообщение живёт между вызовами, а не теряется."""
+    import json
+    import socket
+
+    from agent.ws import WebSocket
+
+    body = json.dumps({"type": "print", "job_id": "j-2"}).encode("utf-8")
+    half = len(body) // 2
+    # Два кадра: первый без FIN, второй — продолжение с FIN.
+    frames = (bytes([0x01, half]) + body[:half]
+              + bytes([0x80, len(body) - half]) + body[half:])
+
+    class Halting:
+        def __init__(self, data: bytes, stop_at: int) -> None:
+            self.data = data
+            self.position = 0
+            self.stop_at = stop_at
+            self.stopped = False
+
+        def recv(self, size: int) -> bytes:
+            if self.position >= self.stop_at and not self.stopped:
+                self.stopped = True
+                raise socket.timeout()
+            # Отдаём не больше, чем до точки остановки: иначе один `recv`
+            # приносит оба кадра сразу, и таймаута посреди сообщения не
+            # случается вовсе.
+            limit = self.stop_at if not self.stopped else len(self.data)
+            chunk = self.data[self.position:min(self.position + size, limit)]
+            self.position += len(chunk)
+            return chunk
+
+        def settimeout(self, value) -> None:
+            return None
+
+    client = WebSocket.__new__(WebSocket)
+    client._sock = Halting(frames, stop_at=2 + half)
+    client._buffer = b""
+    client._chunks = []
+    client._timeout = 0.01
+    client._recv = lambda size: client._sock.recv(size)
+
+    assert client.receive_json(timeout=0.01) is None
+    assert client._chunks, "первая половина сообщения потеряна на таймауте"
+    assert client.receive_json(timeout=0.01) == {"type": "print", "job_id": "j-2"}

@@ -213,6 +213,10 @@ class ShipmentCommand(BaseModel):
     wb_supply_id: str | None = None
     task_ids: list[str] | None = None
     handed_over_by: str | None = None
+    # Ключ идемпотентности приходит с экрана: он видел оба клика, а сервер —
+    # два разных запроса. Повтор `deliver` — это второе тарифицируемое
+    # событие, то есть второй счёт клиенту за ту же машину.
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ProbeCommand(BaseModel):
@@ -521,7 +525,8 @@ async def shipping_action(command: ShipmentCommand) -> JSONResponse:
         result = await state.receiving.shipment(
             seller_external_id=command.seller_external_id, action=command.action,
             wb_supply_id=command.wb_supply_id, task_ids=command.task_ids,
-            handed_over_by=command.handed_over_by)
+            handed_over_by=command.handed_over_by,
+            idempotency_key=command.idempotency_key)
     except ReceivingRefused as error:
         return _refused(error)
     return _ok(result)

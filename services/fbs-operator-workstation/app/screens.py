@@ -109,6 +109,7 @@ const clearFlash = (target) => { const box = el(target); if (box) box.classList.
 // это секунды на каждом задании и повод вводить чужое имя.
 const remember = (key, value) => { try { localStorage.setItem(key, value); } catch (e) {} };
 const recall = (key, fallback) => { try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; } };
+const forget = (key) => { try { localStorage.removeItem(key); } catch (e) {} };
 const stopScreen = (message, detail) => {
   el('stop-title').textContent = message;
   el('stop-detail').textContent = detail || '';
@@ -178,6 +179,13 @@ PICKING_BODY = """
   </div>
   <div id="session-flash" class="flash hidden"></div>
   <p class="note" id="queue-note"></p>
+  <div class="row" style="margin-top:12px">
+    <div style="flex:1"><label>Вернуться к своему листу</label>
+      <input id="sheet-scan" class="scan" autocomplete="off"
+             placeholder="сканируйте штрихкод листа"></div>
+  </div>
+  <p class="note">Браузер закрыли, ПК перезагрузили, подошли к другому столу —
+     лист остаётся вашим. Отсканируйте его штрихкод, и сессия вернётся.</p>
 </div>
 
 <div class="panel" id="session-panel" style="display:none">
@@ -324,6 +332,7 @@ el('take').onclick = async () => {
   if (!data.session_id) { flash('session-flash', 'warn', data.note || 'свободных заданий нет'); return; }
   session = data.session_id;
   el('picklist-code').textContent = data.picklist_barcode;
+  remember('session', session);
   el('print-sheet').href = '/picklist/' + session;
   el('session-panel').style.display = '';
   el('scan-panel').style.display = '';
@@ -347,9 +356,51 @@ el('finish').onclick = async () => {
   if (!session) return;
   await api('/api/workstation/v1/sessions/' + session + '/finish');
   flash('session-flash', 'ok', 'сессия закрыта');
-  session = null; lines = []; renderLines();
+  session = null; lines = []; forget('session'); renderLines();
   el('session-panel').style.display = 'none';
 };
+
+const openSession = async (id) => {
+  const {ok, data} = await api('/api/workstation/v1/sessions/' + id);
+  if (!ok) return false;
+  session = id;
+  remember('session', id);
+  lines = data.lines || [];
+  el('picklist-code').textContent = data.picklist_barcode || '';
+  el('print-sheet').href = '/picklist/' + id;
+  el('session-panel').style.display = '';
+  el('scan-panel').style.display = '';
+  el('pack-panel').style.display = '';
+  renderLines();
+  return true;
+};
+
+// Штрихкод листа возвращает сессию: сборщик отошёл, вернулся к другому ПК —
+// его работа не должна начинаться заново.
+el('sheet-scan').addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter') return;
+  const barcode = event.target.value.trim();
+  event.target.value = '';
+  if (!barcode) return;
+  const {ok, data} = await api('/api/workstation/v1/sessions/by-barcode',
+                               {picklist_barcode: barcode});
+  if (!ok || !data.session_id) {
+    flash('session-flash', 'err', (data && data.error) || 'лист с таким штрихкодом не найден');
+    return;
+  }
+  await openSession(data.session_id);
+  flash('session-flash', 'ok', 'вернулись к листу ' + text(barcode));
+  el('rack-scan').focus();
+});
+
+// При загрузке страницы — своя же незакрытая сессия из памяти браузера.
+(async () => {
+  const remembered = recall('session', '');
+  if (remembered) {
+    const restored = await openSession(remembered);
+    if (!restored) forget('session');
+  }
+})();
 
 // Сканер печатает штрихкод и жмёт Enter — обрабатываем именно это.
 el('rack-scan').addEventListener('keydown', async (event) => {
@@ -357,9 +408,18 @@ el('rack-scan').addEventListener('keydown', async (event) => {
   const barcode = event.target.value.trim();
   event.target.value = '';
   if (!barcode || !session) return;
-  const line = lines.find((row) => row.barcode === barcode && row.scan_result !== 'ok')
-            || lines.find((row) => row.scan_result !== 'ok');
-  if (!line) { flash('scan-flash', 'warn', 'все строки листа уже сняты'); return; }
+  // Строка ищется ТОЛЬКО по штрихкоду. Раньше при промахе брали первую
+  // неснятую строку: сборщик сканировал чужую вещь, экран отмечал снятой
+  // совсем другую, и ошибка всплывала уже на контрольном скане при упаковке
+  // — а к тому времени в коробе лежало не то.
+  const line = lines.find((row) => row.barcode === barcode && row.scan_result !== 'ok');
+  if (!line) {
+    const known = lines.some((row) => row.barcode === barcode);
+    flash('scan-flash', known ? 'warn' : 'err',
+          known ? 'эта строка уже снята: ' + barcode
+                : 'штрихкод не из этого листа: ' + barcode);
+    return;
+  }
   const {ok, data} = await api('/api/workstation/v1/scan', {
     task_id: line.task_id, barcode, actor_id: el('actor').value.trim(),
     session_id: session, station_id: el('station').value.trim() || null});
@@ -732,19 +792,28 @@ const render = () => {
     + '<td class="mono">' + text(line.barcode) + '</td>'
     + '<td>' + text(line.name) + '</td>'
     + '<td>' + (reveal ? text(line.expected_qty) : '<span class="note">скрыто</span>') + '</td>'
-    + '<td><input type="number" min="0" data-index="' + index + '" class="fact"></td>'
-    + '<td class="diff" data-index="' + index + '">—</td></tr>').join('');
+    + '<td><input type="number" min="0" data-index="' + index + '" class="fact" value="'
+    + (line.fact === null || line.fact === undefined ? '' : esc(line.fact)) + '"></td>'
+    + '<td class="diff" data-index="' + index + '">' + diffCell(line) + '</td></tr>').join('');
+  // Факт живёт в МОДЕЛИ, а не в DOM. Раньше он лежал только в поле ввода, и
+  // «показать учёт» перерисовывало таблицу, стирая всё, что посчитали: час
+  // работы на полке исчезал от одного щелчка по галочке.
   document.querySelectorAll('.fact').forEach((input) => {
     input.oninput = () => {
       const index = Number(input.dataset.index);
-      const expected = Number(sheet[index].expected_qty || 0);
+      sheet[index].fact = input.value === '' ? null : Number(input.value);
       const cellNode = document.querySelector('.diff[data-index="' + index + '"]');
-      if (input.value === '') { cellNode.textContent = '—'; return; }
-      const diff = Number(input.value) - expected;
-      cellNode.innerHTML = diff === 0 ? '<span class="pill ok">сходится</span>'
-        : '<span class="pill ' + (diff < 0 ? 'stop' : 'warn') + '">' + (diff > 0 ? '+' : '') + diff + '</span>';
+      cellNode.innerHTML = diffCell(sheet[index]);
     };
   });
+};
+
+const diffCell = (line) => {
+  if (line.fact === null || line.fact === undefined) return '—';
+  const diff = Number(line.fact) - Number(line.expected_qty || 0);
+  return diff === 0 ? '<span class="pill ok">сходится</span>'
+    : '<span class="pill ' + (diff < 0 ? 'stop' : 'warn') + '">'
+      + (diff > 0 ? '+' : '') + diff + '</span>';
 };
 el('reveal').onchange = render;
 
@@ -752,19 +821,19 @@ el('load').onclick = async () => {
   const {ok, data} = await api('/api/workstation/v1/inventory/sheet', {
     seller_external_id: el('seller').value.trim(), scope: el('scope').value});
   if (!ok) { flash('flash', 'err', data.error || 'лист не получен'); return; }
-  sheet = data.lines || [];
+  sheet = (data.lines || []).map((line) => Object.assign({fact: null}, line));
   render();
   flash('flash', 'ok', 'строк в листе: ' + sheet.length);
 };
 
 el('submit').onclick = async () => {
-  const lines = Array.from(document.querySelectorAll('.fact')).map((input) => {
-    if (input.value === '') return null;
-    const line = sheet[Number(input.dataset.index)];
-    return {barcode: line.barcode, cell_address: line.cell_address,
-            box_barcode: line.box_barcode, expected_qty: line.expected_qty,
-            fact_qty: Number(input.value)};
-  }).filter(Boolean);
+  // Отправляется модель, а не содержимое полей: строка, которую перерисовали
+  // после ввода, в DOM уже не та, а посчитанное никуда не делось.
+  const lines = sheet
+    .filter((line) => line.fact !== null && line.fact !== undefined)
+    .map((line) => ({barcode: line.barcode, cell_address: line.cell_address,
+                     box_barcode: line.box_barcode, expected_qty: line.expected_qty,
+                     fact_qty: Number(line.fact)}));
   const {ok, data} = await api('/api/workstation/v1/inventory/count', {
     seller_external_id: el('seller').value.trim(), reference: el('reference').value.trim(),
     scope: el('scope').value, lines});
@@ -834,27 +903,61 @@ el('load').onclick = async () => {
 const selected = () => Array.from(document.querySelectorAll('.pick:checked'))
   .map((input) => tasks[Number(input.dataset.index)].task_id).filter(Boolean);
 
+// Ключ идемпотентности приходит С ЭКРАНА и не меняется до успеха.
+//
+// Раньше ключ придумывался на сервере на каждый вызов: двойной клик по
+// «передать» отправлял поставку дважды, а `deliver` дважды — это второе
+// тарифицируемое событие, то есть второй счёт клиенту за ту же машину.
+// Экран видел оба клика, сервер — два разных запроса.
+const shipKeys = {};
+const shipKeyFor = (action, supply) => {
+  const scope = action + ':' + (supply || 'новая');
+  if (!shipKeys[scope]) {
+    shipKeys[scope] = 'ws-ship-' + scope + '-' + Date.now();
+  }
+  return shipKeys[scope];
+};
+
+const shippingAction = async (action, extra) => {
+  const supply = el('supply').value.trim() || null;
+  const {ok, data} = await api('/api/workstation/v1/shipping/action',
+    Object.assign({
+      seller_external_id: el('seller').value.trim(), action,
+      wb_supply_id: supply,
+      idempotency_key: shipKeyFor(action, supply)}, extra || {}));
+  if (ok) { delete shipKeys[action + ':' + (supply || 'новая')]; }
+  return {ok, data};
+};
+
 document.querySelectorAll('[data-action]').forEach((button) => {
   button.onclick = async () => {
-    const {ok, data} = await api('/api/workstation/v1/shipping/action', {
-      seller_external_id: el('seller').value.trim(), action: button.dataset.action,
-      wb_supply_id: el('supply').value.trim() || null,
-      task_ids: button.dataset.action === 'add_orders' ? selected() : null});
-    if (!ok) { flash('flash', 'err', data.error || 'не вышло'); return; }
-    if (data.wb_supply_id) el('supply').value = data.wb_supply_id;
-    flash('flash', 'ok', 'поставка ' + text(data.wb_supply_id) + ': ' + text(data.state)
-      + ' · заказов ' + text(data.orders));
+    button.disabled = true;
+    try {
+      const action = button.dataset.action;
+      const {ok, data} = await shippingAction(action, {
+        task_ids: action === 'add_orders' ? selected() : null});
+      if (!ok) { flash('flash', 'err', data.error || 'не вышло'); return; }
+      if (data.wb_supply_id) el('supply').value = data.wb_supply_id;
+      flash('flash', 'ok', 'поставка ' + text(data.wb_supply_id) + ': ' + text(data.state)
+        + ' · заказов ' + text(data.orders)
+        + (data.duplicate ? ' (повтор, ничего не добавлено)' : ''));
+    } finally {
+      button.disabled = false;
+    }
   };
 });
 
 el('handover').onclick = async () => {
   const who = el('handed-by').value.trim();
   if (!who) { flash('flash', 'err', 'подпись обязательна: передачу подтверждает человек'); return; }
-  const {ok, data} = await api('/api/workstation/v1/shipping/action', {
-    seller_external_id: el('seller').value.trim(), action: 'hand_over',
-    wb_supply_id: el('supply').value.trim() || null, handed_over_by: who});
-  if (!ok) { flash('flash', 'err', data.error || 'подтверждение не прошло'); return; }
-  flash('flash', 'ok', 'передано: ' + text(data.handed_by) + ' в ' + text(data.handed_at));
+  el('handover').disabled = true;
+  try {
+    const {ok, data} = await shippingAction('hand_over', {handed_over_by: who});
+    if (!ok) { flash('flash', 'err', data.error || 'подтверждение не прошло'); return; }
+    flash('flash', 'ok', 'передано: ' + text(data.handed_by) + ' в ' + text(data.handed_at));
+  } finally {
+    el('handover').disabled = false;
+  }
 };
 el('load').click();
 """

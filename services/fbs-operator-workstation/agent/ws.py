@@ -57,6 +57,10 @@ class WebSocket:
         self._secure = parsed.scheme == "wss"
         self._timeout = timeout
         self._buffer = b""
+        # Недособранное сообщение: кадры фрагментированного сообщения между
+        # вызовами `receive_json`. Таймаут посреди сообщения не должен его
+        # терять — сборщик ждёт этикетку, а не разрыв соединения.
+        self._chunks: list[bytes] = []
         self._sock: socket.socket | None = None
 
     # ------------------------------------------------------------ соединение
@@ -173,24 +177,59 @@ class WebSocket:
             raise WebSocketError("сервер прислал не JSON") from error
         return message if isinstance(message, dict) else {"value": message}
 
+    def _take_frame(self) -> tuple[int, bool, bytes] | None:
+        """Один кадр из буфера. `None` — кадр ещё не пришёл целиком.
+
+        Разбор НЕ потребляет буфер, пока кадра нет целиком. Раньше заголовок
+        вычитывался сразу, и таймаут посреди кадра оставлял поток
+        рассинхронизированным: следующий вызов читал байты полезной нагрузки
+        как заголовок, и агент начинал видеть мусорные опкоды.
+        """
+        buffer = self._buffer
+        if len(buffer) < 2:
+            return None
+        first, second = buffer[0], buffer[1]
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        offset = 2
+        if length == 126:
+            if len(buffer) < offset + 2:
+                return None
+            length = struct.unpack("!H", buffer[offset:offset + 2])[0]
+            offset += 2
+        elif length == 127:
+            if len(buffer) < offset + 8:
+                return None
+            length = struct.unpack("!Q", buffer[offset:offset + 8])[0]
+            offset += 8
+        if length > MAX_FRAME_BYTES:
+            raise WebSocketError(f"кадр {length} байт больше допустимого")
+        if masked:
+            if len(buffer) < offset + 4:
+                return None
+            mask = buffer[offset:offset + 4]
+            offset += 4
+        else:
+            mask = b""
+        if len(buffer) < offset + length:
+            return None
+        payload = buffer[offset:offset + length]
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        # Кадр пришёл целиком — только теперь двигаем буфер.
+        self._buffer = buffer[offset + length:]
+        return first & 0x0F, bool(first & 0x80), payload
+
     def _receive_message(self) -> bytes | None:
-        chunks: list[bytes] = []
         while True:
-            first, second = self._read_exactly(2)
-            final = bool(first & 0x80)
-            opcode = first & 0x0F
-            masked = bool(second & 0x80)
-            length = second & 0x7F
-            if length == 126:
-                length = struct.unpack("!H", self._read_exactly(2))[0]
-            elif length == 127:
-                length = struct.unpack("!Q", self._read_exactly(8))[0]
-            if length > MAX_FRAME_BYTES:
-                raise WebSocketError(f"кадр {length} байт больше допустимого")
-            mask = self._read_exactly(4) if masked else b""
-            payload = self._read_exactly(length) if length else b""
-            if masked:
-                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            frame = self._take_frame()
+            if frame is None:
+                # Данных не хватает. Дочитываем — здесь и срабатывает таймаут,
+                # и срабатывает он на ЦЕЛОМ состоянии: недособранное сообщение
+                # лежит в `self._chunks`, буфер не тронут.
+                self._buffer += self._recv(4096)
+                continue
+            opcode, final, payload = frame
 
             if opcode == OP_CLOSE:
                 raise WebSocketClosed("сервер закрыл соединение")
@@ -202,9 +241,10 @@ class WebSocket:
             if opcode == OP_PONG:
                 continue
             if opcode in (OP_TEXT, OP_BINARY, OP_CONTINUATION):
-                chunks.append(payload)
+                self._chunks.append(payload)
                 if final:
-                    return b"".join(chunks)
+                    message, self._chunks = b"".join(self._chunks), []
+                    return message
                 continue
             raise WebSocketError(f"неизвестный опкод {opcode}")
 
