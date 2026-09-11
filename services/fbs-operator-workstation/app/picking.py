@@ -61,6 +61,17 @@ class PickingService:
         нескольких клиентов (раздел 4 мастера), поэтому фильтра по владельцу
         нет, пока его не попросили явно.
         """
+        # Доступность базы проверяется ДО занятия заданий.
+        #
+        # Раньше задания занимались, а сессия не заводилась: лист подбора
+        # оказывался пустым, сборщик уходил ни с чем, а задания оставались за
+        # ним на срок лизинга — пятнадцать минут очередь была пуста для всех,
+        # включая его самого.
+        if not await self._store.ping():
+            raise PickingRefused(
+                "база рабочего места недоступна: задания не выданы, чтобы не "
+                f"занять их без листа подбора. {self._store.last_error or ''}".strip())
+
         try:
             tasks: list[Task] = await self._poller.claim(
                 assignee=actor_id, limit=limit, lease_seconds=lease_seconds,
@@ -90,6 +101,18 @@ class PickingService:
         session_id = await self._store.open_session(
             actor_id=actor_id, station_id=station_id, picklist_barcode=barcode)
         ordered = sorted(tasks, key=lambda task: task.route_order)
+        if session_id is None:
+            # База отказала между проверкой и записью. Задания уже заняты —
+            # отдаём человеку список, чтобы он собрал по нему: лист на бумаге
+            # лучше, чем пятнадцать минут потерянной очереди.
+            logger.warning("сессия не заведена: база рабочего места отказала. "
+                           "Заданий на руках: %d", len(ordered))
+            return {"session_id": None, "picklist_barcode": None,
+                    "actor_id": actor_id, "station_id": station_id,
+                    "tasks": [task.as_dict() for task in ordered],
+                    "store_degraded": True,
+                    "note": "база рабочего места недоступна: лист не сохранён, "
+                            "собирайте по списку на экране"}
         await self._store.add_lines(session_id, ordered)
         for task in ordered:
             await self._store.note_task(task, session_id=session_id, station_id=station_id,

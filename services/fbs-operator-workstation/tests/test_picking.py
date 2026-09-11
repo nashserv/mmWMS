@@ -193,3 +193,39 @@ def test_return_to_shelf_demands_an_address(wms: FakeWms, store: FakeStore):
     picking, _ = build(wms, store)
     with pytest.raises(PickingRefused):
         run(picking.return_to_shelf(task_id="a", cell_address="", actor_id="Иванов"))
+
+
+# --------------------------------------------------- база рабочего места лежит
+
+class BrokenStore(FakeStore):
+    """База не отвечает. Экран обязан работать и так (пункт 14 прогона)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.available = False
+        self.last_error = "OperationalError: connection refused"
+
+    async def ping(self) -> bool:
+        return False
+
+    async def open_session(self, **_kwargs):
+        return None
+
+
+def test_a_broken_store_does_not_take_tasks_nobody_can_pick(wms: FakeWms):
+    """База лежит — задания НЕ занимаются.
+
+    Раньше они занимались, а сессия не заводилась: лист подбора оказывался
+    пустым, сборщик уходил ни с чем, а задания оставались за ним на срок
+    лизинга — пятнадцать минут очередь была пуста для всех, включая его.
+    """
+    wms.on("/tasks/pull", lambda params: pull_result([task_projection("a")]))
+    picking, _poller = build(wms, BrokenStore())
+
+    with pytest.raises(PickingRefused) as refused:
+        run(picking.start_session(actor_id="picker-1", station_id="st-1",
+                                  limit=10, lease_seconds=900))
+
+    assert "база рабочего места недоступна" in str(refused.value)
+    assert not wms.calls, (
+        "задания заняты при недоступной базе: они пропадут на срок лизинга")

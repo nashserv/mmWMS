@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Iterable, Sequence
 
 from prometheus_client import Counter
@@ -29,6 +30,27 @@ STORE_ERRORS = Counter(
 )
 
 
+class StoreUnavailable(RuntimeError):
+    """База рабочего места недоступна, и пробовать сейчас не надо."""
+
+
+def _is_connection_broken(error: Exception) -> bool:
+    """Сломано соединение или плохи данные.
+
+    `OperationalError` — сеть, сервер, таймаут: соединение выбрасывается.
+    `DataError`, `IntegrityError`, `ProgrammingError` — наш запрос или наши
+    значения: соединение цело и остаётся в пуле.
+    """
+    try:
+        import psycopg
+    except ImportError:
+        return True
+    if isinstance(error, (psycopg.DataError, psycopg.IntegrityError,
+                          psycopg.ProgrammingError)):
+        return False
+    return True
+
+
 class Store:
     """Минимальный асинхронный доступ к базе `workstation`.
 
@@ -38,7 +60,8 @@ class Store:
     их.
     """
 
-    def __init__(self, dsn: str, *, max_connections: int = 8) -> None:
+    def __init__(self, dsn: str, *, max_connections: int = 8,
+                 retry_after_seconds: float = 10.0) -> None:
         self._dsn = dsn
         self._max = max_connections
         self._free: list[Any] = []
@@ -46,6 +69,16 @@ class Store:
         self._opened = 0
         self.available = False
         self.last_error: str | None = None
+        # Предохранитель. База лежит — каждый запрос вставал на `connect_timeout`
+        # и держал в этом ожидании экран: опрос раз в секунду, пять экранов,
+        # и рабочее место превращалось в очередь из ждущих корутин. После
+        # отказа соединение не пробуется чаще раза в десять секунд.
+        self._retry_after = retry_after_seconds
+        self._closed_until = 0.0
+        # Семафор на число соединений: без него `_acquire` открывал их
+        # столько, сколько пришло запросов — и упирался в `max_connections`
+        # Postgres, а не в свой.
+        self._slots = asyncio.Semaphore(max_connections)
 
     # ------------------------------------------------------------ соединения
 
@@ -54,7 +87,16 @@ class Store:
         from psycopg.rows import dict_row
 
         return await psycopg.AsyncConnection.connect(
-            self._dsn, row_factory=dict_row, autocommit=True, connect_timeout=5)
+            # Две секунды, а не пять: экран опрашивает очередь раз в
+            # секунду, и ждать соединения дольше самого цикла нельзя.
+            self._dsn, row_factory=dict_row, autocommit=True, connect_timeout=2)
+
+    async def _connect_soon(self) -> None:
+        """Пропускает попытку соединения, пока предохранитель не остыл."""
+        if time.monotonic() < self._closed_until:
+            raise StoreUnavailable(
+                f"база рабочего места недоступна; следующая попытка через "
+                f"{self._closed_until - time.monotonic():.0f} с")
 
     async def _acquire(self) -> Any:
         async with self._lock:
@@ -63,15 +105,21 @@ class Store:
                 if not connection.closed:
                     return connection
                 self._opened -= 1
+        await self._connect_soon()
+        await self._slots.acquire()
+        async with self._lock:
             self._opened += 1
         try:
             return await self._connect()
         except Exception:
             async with self._lock:
                 self._opened -= 1
+            self._slots.release()
+            self._closed_until = time.monotonic() + self._retry_after
             raise
 
     async def _release(self, connection: Any, *, broken: bool = False) -> None:
+        self._slots.release()
         async with self._lock:
             if broken or connection.closed or len(self._free) >= self._max:
                 self._opened -= 1
@@ -108,16 +156,32 @@ class Store:
                     result = None
             self.available = True
             self.last_error = None
+            self._closed_until = 0.0
             await self._release(connection)
             return result
-        except Exception as error:  # noqa: BLE001 — база упала, смена продолжается
+        except StoreUnavailable as error:
+            # Предохранитель: соединение даже не пробовалось. Ждать
+            # `connect_timeout` на каждом запросе значит держать экран в
+            # очереди из ждущих корутин.
             self.available = False
+            self.last_error = str(error)
+            STORE_ERRORS.labels(operation=operation).inc()
+            return None
+        except Exception as error:  # noqa: BLE001 — база упала, смена продолжается
+            # Разница между «соединение сломано» и «данные плохие»
+            # принципиальна: в первом случае соединение выбрасывается, во
+            # втором остаётся в пуле. Выбрасывать его на каждой опечатке в
+            # параметрах значит пересоздавать пул на ровном месте.
+            broken = _is_connection_broken(error)
+            if broken:
+                self.available = False
+                self._closed_until = time.monotonic() + self._retry_after
             self.last_error = f"{type(error).__name__}: {error}"
             STORE_ERRORS.labels(operation=operation).inc()
             logger.warning("запись в базу рабочего места не удалась (%s): %s",
                            operation, self.last_error)
             if connection is not None:
-                await self._release(connection, broken=True)
+                await self._release(connection, broken=broken)
             return None
 
     async def ping(self) -> bool:
@@ -127,14 +191,21 @@ class Store:
     # ------------------------------------------------------------ сессии подбора
 
     async def open_session(self, *, actor_id: str, station_id: str | None,
-                           picklist_barcode: str) -> str:
+                           picklist_barcode: str) -> str | None:
+        """Заводит сессию подбора. `None` — база не приняла запись.
+
+        Раньше возвращался идентификатор в любом случае: сессии в базе нет, а
+        сборщик работает с её номером — и все последующие сканы уходят в
+        никуда, не сказав об этом ни слова.
+        """
         session_id = uid()
         await self.execute(
             "INSERT INTO workstation_pick_session (id, actor_id, station_id, state, "
-            "picklist_barcode) VALUES (%s, %s, %s, 'picking', %s)",
+            "picklist_barcode) VALUES (%s, %s, %s, 'picking', %s) "
+            "RETURNING id",
             (session_id, actor_id, station_id, picklist_barcode),
-            operation="open_session")
-        return session_id
+            fetch="one", operation="open_session")
+        return session_id if self.available else None
 
     async def add_lines(self, session_id: str, tasks: Iterable[Task]) -> int:
         """Строки листа. Повтор по (сессия, задание) ничего не добавляет.

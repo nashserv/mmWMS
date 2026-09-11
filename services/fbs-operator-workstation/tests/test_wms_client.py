@@ -189,3 +189,43 @@ def test_storage_lookup_is_sorted_by_route_order(wms: FakeWms):
     ]})
     rows = run(wms.client().storage_lookup(seller_external_id="seller-1", barcode="b"))
     assert [row.cell_address for row in rows] == ["A-01", "C-03"]
+
+
+# ------------------------------------------- отказ по существу и сбой сервиса
+
+def test_invalid_params_is_a_refusal_not_an_outage(wms: FakeWms):
+    """`-32602` — отказ, адресованный человеку, а не сбой сервиса.
+
+    Раньше он превращался в `WmsUnavailable`: экран показывал «wms
+    недоступен», и сборщик ждал починки сервиса, который работал. В отказе при
+    этом словами написано, что не так.
+    """
+    wms.on_error("/tasks/a/scan", code=-32602,
+                 message="команда 'scan' не выполняется из состояния 'packed'")
+    client = wms.client()
+
+    with pytest.raises(WmsRejected) as refused:
+        run(client.call("/tasks/a/scan", {"barcode": "4600000000011"}))
+
+    assert "не выполняется из состояния" in str(refused.value), (
+        "текст отказа потерян — человеку нечего показать")
+
+
+def test_a_real_outage_is_still_an_outage(wms: FakeWms):
+    """Парная проверка: внутренний сбой остаётся сбоем сервиса."""
+    wms.on_error("/tasks/a/scan", code=-32603,
+                 message="внутренняя ошибка, request_id=0123456789ab")
+    client = wms.client()
+
+    with pytest.raises(WmsUnavailable):
+        run(client.call("/tasks/a/scan", {"barcode": "4600000000011"}))
+
+
+def test_a_task_wms_does_not_know_reads_as_absent(wms: FakeWms):
+    """«Задания нет» — законный ответ, а не сбой.
+
+    Задание могли отменить, пока мы про него спрашивали. Экран обязан убрать
+    его, а не оставить ждать возвращения сервиса.
+    """
+    wms.on_error("/tasks/ghost", code=-32602, message="задание ghost не найдено")
+    assert run(wms.client().task("ghost")) is None

@@ -52,11 +52,31 @@ class WmsUnavailable(RuntimeError):
     """
 
 
+# Код JSON-RPC «неверные параметры». Отказ по существу, адресованный
+# человеку: у wms он означает и «товар не найден», и «команда из неправильного
+# состояния», и «задания нет».
+JSONRPC_INVALID_PARAMS = -32602
+
+# По каким словам в отказе понятно, что задания просто нет.
+_NOT_FOUND_HINTS = ("не найден", "не существует", "нет задания")
+
+
+def _looks_like_not_found(message: str) -> bool:
+    lowered = message.lower()
+    return any(hint in lowered for hint in _NOT_FOUND_HINTS)
+
+
 class WmsRejected(RuntimeError):
     """Операция отклонена самим wms — с кодом в result (приложение C)."""
 
-    def __init__(self, route: str, code: str | None, result: dict[str, Any]) -> None:
-        super().__init__(f"{route}: {code or 'отказ без кода'}")
+    def __init__(self, route: str, code: str | None, result: dict[str, Any],
+                 message: str | None = None) -> None:
+        # Текст отказа сохраняется и показывается человеку как есть: у `wms`
+        # он написан словами и объясняет, что именно не так. Раньше в строке
+        # оставался только код, а при `-32602` кода нет вовсе — экран получал
+        # «отказ без кода» и показывал это сборщику.
+        self.message = message or str(result.get("message") or "") or None
+        super().__init__(f"{route}: {self.message or code or 'отказ без кода'}")
         self.route = route
         self.code = code
         self.result = result
@@ -242,8 +262,18 @@ class WmsClient:
             metrics.WMS_CALLS.labels(route=label, outcome="bad_json").inc()
             raise WmsUnavailable(f"{label}: конверт JSON-RPC не объект")
         if envelope.get("error"):
-            error = envelope["error"]
-            message = error.get("message") if isinstance(error, dict) else str(error)
+            error = envelope["error"] if isinstance(envelope["error"], dict) else {}
+            message = str(error.get("message") or envelope["error"])
+            code = error.get("code")
+            # `-32602` — «неверные параметры»: это отказ ПО СУЩЕСТВУ, а не
+            # сбой сервиса. Раньше он превращался в `WmsUnavailable`, экран
+            # показывал «wms недоступен», а сборщик ждал починки сервиса,
+            # который работал: отказ был ему адресован, и в нём словами
+            # написано, что не так.
+            if code == JSONRPC_INVALID_PARAMS:
+                metrics.WMS_CALLS.labels(route=label, outcome="rejected").inc()
+                raise WmsRejected(label, None, {"message": message},
+                                  message=message)
             metrics.WMS_CALLS.labels(route=label, outcome="jsonrpc_error").inc()
             raise WmsUnavailable(f"{label}: {message}")
         result = envelope.get("result")
@@ -355,7 +385,17 @@ class WmsClient:
         перечитывает задание и принимает его, если оно уже `picked` с тем же
         штрихкодом (правило приложения C).
         """
-        result = await self.call(f"/tasks/{task_id}", {}, attempts=2, metric_route="/tasks/{id}")
+        try:
+            result = await self.call(f"/tasks/{task_id}", {},
+                                     attempts=2, metric_route="/tasks/{id}")
+        except WmsRejected as refused:
+            # «Задания нет» — законный ответ, а не сбой: задание могли
+            # отменить, пока мы про него спрашивали. Отличается от
+            # `WmsUnavailable` тем, что задание после этого убирают с экрана,
+            # а не оставляют ждать возвращения сервиса.
+            if _looks_like_not_found(str(refused)):
+                return None
+            raise
         if not result or not result.get("task_id"):
             return None
         return task_from_contract(result, previous=previous)

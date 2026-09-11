@@ -35,6 +35,14 @@ class FakeWms:
     def on(self, route: str, handler: Callable[[dict[str, Any]], Any]) -> None:
         self.handlers[route] = handler
 
+    def on_error(self, route: str, *, code: int, message: str) -> None:
+        """Отказ конвертом JSON-RPC — так их и отдаёт настоящий wms."""
+        def handler(_params: dict[str, Any]) -> httpx.Response:
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": 1,
+                "error": {"code": code, "message": message}})
+        self.handlers[route] = handler
+
     def transport(self) -> httpx.MockTransport:
         def handle(request: httpx.Request) -> httpx.Response:
             if self.fail_with is not None:
