@@ -243,3 +243,101 @@ def test_an_accrued_event_is_never_replayed(
     assert again["outcome"] == "duplicate", (
         f"начисленное событие переиграно ({again}): клиенту выставится дважды")
     assert len(rows(database, "SELECT id FROM billing_accrual")) == 1
+
+
+def test_a_closed_period_does_not_take_new_accruals(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Счёт за закрытый месяц уже у клиента — дописать в него нельзя.
+
+    В базе была бы одна сумма, в счёте другая, и сходились бы они только до
+    первого вопроса. Событие остаётся видимым с причиной PERIOD_CLOSED.
+    """
+    from app.admin import Admin
+
+    Admin(database, wms=None).close_period("2026-09", closed_by="владелец")  # type: ignore[arg-type]
+
+    result = BillingService(database).ingest(
+        event("wms.packing.completed.v1", {"seller_id": "seller-1"},
+              occurred_at="2026-09-10T10:00:00+00:00"))
+
+    assert result["outcome"] == "unbilled"
+    assert result["reason"] == "PERIOD_CLOSED", (
+        f"начисление дописано в закрытый период: {result}")
+    assert not rows(database, "SELECT id FROM billing_accrual")
+    visible = rows(database, "SELECT reason FROM billing_unbilled")
+    assert visible and visible[0]["reason"] == "PERIOD_CLOSED", (
+        "событие исчезло без следа: разбирать нечего")
+
+
+def test_a_night_shift_event_belongs_to_the_moscow_day(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Дата начисления — по складу, а не по UTC.
+
+    Событие в 02:00 по Москве 1 сентября — это 23:00 31 августа по UTC. По
+    UTC оно уезжало в ЧУЖОЙ МЕСЯЦ: сентябрьский счёт недосчитывал ночную
+    смену первого числа, а августовский — уже выставленный — получал
+    начисление задним числом.
+    """
+    BillingService(database).ingest(
+        event("wms.packing.completed.v1", {"seller_id": "seller-1"},
+              # 1 сентября, 02:00 по Москве.
+              occurred_at="2026-08-31T23:00:00+00:00"))
+
+    accrual = rows(database, "SELECT occurred_on, period FROM billing_accrual")[0]
+    assert str(accrual["occurred_on"]) == "2026-09-01", (
+        f"дата начисления {accrual['occurred_on']}: ночная смена уехала в "
+        f"чужой день")
+    assert accrual["period"] == "2026-09", (
+        f"период {accrual['period']}: начисление попало в чужой месяц")
+
+
+def test_a_cabinet_that_arrives_late_still_gets_its_event_billed(
+        database: Database) -> None:
+    """Кабинет пришёл событием задним числом — начисление всё равно проходит.
+
+    Закрепление «с сегодня» оставляло событие вне периода действия
+    закрепления, и оно уходило в unbilled с «партнёр не найден» — то самое
+    событие, ради которого кабинет и заводили.
+    """
+    import os
+
+    from app.admin import Admin
+
+    with database.transaction() as cursor:
+        cursor.execute("INSERT INTO partner (id, name) VALUES (%s, 'Зардал')",
+                       ("11111111-1111-4111-8111-111111111111",))
+        cursor.execute(
+            "INSERT INTO billing_tariff (id, code, service, name, unit, is_default) "
+            "VALUES (%s, 'packing-default', 'packing', 'Упаковка', 'шт', true)",
+            ("22222222-2222-4222-8222-222222222222",))
+        cursor.execute(
+            "INSERT INTO billing_tariff_version (id, tariff_id, effective_from, approved, "
+            "approved_by, approved_at, partner_fee) "
+            "VALUES (%s, %s, DATE '2026-01-01', true, 'владелец', now(), 15.00)",
+            ("33333333-3333-4333-8333-333333333333",
+             "22222222-2222-4222-8222-222222222222"))
+        cursor.execute(
+            "INSERT INTO billing_tariff_tier (id, version_id, up_to, unit_price) "
+            "VALUES (%s, %s, NULL, 30.00)",
+            ("44444444-4444-4444-8444-444444444444",
+             "33333333-3333-4333-8333-333333333333"))
+        cursor.execute(
+            "INSERT INTO billing_billable_event (event_type, service, quantity_path, comment) "
+            "VALUES ('wms.packing.completed.v1', 'packing', NULL, 'тест')")
+
+    os.environ["BILLING_AUTO_ONBOARD_UNKNOWN_CABINET"] = "true"
+    os.environ["BILLING_DEFAULT_PARTNER"] = "11111111-1111-4111-8111-111111111111"
+    try:
+        result = BillingService(database).ingest(
+            event("wms.packing.completed.v1", {"seller_id": "seller-опоздавший"},
+                  occurred_at="2026-09-01T10:00:00+00:00"))
+    finally:
+        os.environ.pop("BILLING_AUTO_ONBOARD_UNKNOWN_CABINET", None)
+        os.environ.pop("BILLING_DEFAULT_PARTNER", None)
+
+    assert result["outcome"] == "accrued", (
+        f"событие задним числом не дошло до счёта: {result}")
+    assignment = rows(database, "SELECT from_date FROM cabinet_assignment")[0]
+    assert str(assignment["from_date"]) <= "2026-09-01", (
+        f"закрепление начинается с {assignment['from_date']}, а событие от "
+        f"2026-09-01: оно окажется вне периода закрепления")

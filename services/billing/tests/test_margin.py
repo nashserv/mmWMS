@@ -93,3 +93,40 @@ def test_a_direct_expense_lands_on_one_cabinet(
     assert str(allocation["cabinet_id"]) == other
     assert allocation["amount"] == Decimal("1200.00")
     assert allocation["basis"] == "direct"
+
+
+def test_a_cabinet_that_only_eats_the_shift_is_still_in_the_report(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Кабинет с расходами и без выручки — тот, ради которого отчёт и нужен.
+
+    Себестоимость была завязана на период ВЫРУЧКИ: нет выручки — нет и строки
+    расходов, и кабинет исчезал из отчёта целиком. Отчёт показывал, какой
+    клиент прибылен, и молчал о том, какой съедает смену.
+    """
+    expense_id = str(uuid.uuid4())
+    with database.transaction() as cursor:
+        # Ни одного начисления: клиент в этом месяце ничего не отгружал.
+        cursor.execute(
+            "INSERT INTO billing_fixed_expense (id, period, category, amount, "
+            "                                   allocation_rule, comment) "
+            "VALUES (%s, '2026-09', 'rent', 100000.00, 'by_operations', 'аренда склада')",
+            (expense_id,))
+        cursor.execute(
+            "INSERT INTO billing_expense_allocation (id, expense_id, cabinet_id, period, "
+            "                                        amount, basis, basis_value, basis_total) "
+            "VALUES (%s, %s, %s, '2026-09', 1000.00, 'операции', 1, 100)",
+            (str(uuid.uuid4()), expense_id, stand["cabinet"]))
+
+    report = rows(database,
+                  "SELECT cabinet_id, period, gross_revenue, allocated_cost, margin "
+                  "  FROM billing_margin_by_cabinet WHERE period = '2026-09'")
+
+    assert report, (
+        "кабинет с расходами и без выручки исчез из отчёта: именно он съедает "
+        "смену, и именно о нём отчёт молчал")
+    mine = [row for row in report if str(row["cabinet_id"]) == stand["cabinet"]]
+    assert mine, f"нашего кабинета нет среди {[str(r['cabinet_id']) for r in report]}"
+    assert Decimal(mine[0]["gross_revenue"]) == Decimal("0.00")
+    assert Decimal(mine[0]["allocated_cost"]) == Decimal("1000.00")
+    assert Decimal(mine[0]["margin"]) == Decimal("-1000.00"), (
+        "маржа кабинета без выручки не отрицательная — расход потерян")

@@ -30,6 +30,7 @@ import httpx
 from prometheus_client import start_http_server
 
 from .config import app_environment, database_url, events_exchange, tenant_id
+from .domain import today
 from .db import Database
 from .metrics import WORKER_PROCESSED
 from .service import BillingService
@@ -76,7 +77,7 @@ class StorageLoop:
                 return
 
     def once(self) -> None:
-        today = date.today()
+        today = today()
         for offset in range(1, STORAGE_BACKFILL_DAYS + 1):
             day = today - timedelta(days=offset)
             results = self._service.accrue_storage(day, box_places, tenant=tenant_id())

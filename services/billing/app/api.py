@@ -20,10 +20,10 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import metrics
 from . import repositories as repo
-from .admin import Admin, OnboardingError
+from .admin import Admin, InvoiceConflict, OnboardingError
 from .config import app_environment, database_url, trusted_hosts
 from .db import Database
-from .domain import Service
+from .domain import Service, today
 from . import auth
 from .principal import (Forbidden, Principal, Principals, Unauthorized, require_partner,
                         require_write, summary, visible_cabinet_ids)
@@ -128,7 +128,7 @@ async def partner_cabinets(partner_id: str, request: Request,
                            on: str | None = None) -> JSONResponse:
     with database.cursor() as cursor:
         require_partner(cursor, caller(request), partner_id)
-    return ok({"cabinets": admin.partner_cabinets(partner_id, on=as_date(on, date.today()))})
+    return ok({"cabinets": admin.partner_cabinets(partner_id, on=as_date(on, today()))})
 
 
 @router.post("/partners/{partner_id}/markups")
@@ -139,7 +139,7 @@ async def set_markup(partner_id: str, request: Request) -> JSONResponse:
     try:
         layer = admin.set_markup(
             partner_id, str(body.get("service")), as_money(body.get("markup", 0)),
-            as_date(body.get("from_date"), date.today()), cabinet_id=body.get("cabinet_id"))
+            as_date(body.get("from_date"), today()), cabinet_id=body.get("cabinet_id"))
     except ValueError as error:
         return ok({"error": str(error)}, 400)
     return ok({"price_layer": layer}, 201)
@@ -173,7 +173,7 @@ async def assign_cabinet(cabinet_id: str, request: Request) -> JSONResponse:
     try:
         assignment = admin.assign_cabinet(
             cabinet_id, str(body.get("partner_id")), str(body.get("role", "account_manager")),
-            as_date(body.get("from_date"), date.today()), comment=body.get("comment"))
+            as_date(body.get("from_date"), today()), comment=body.get("comment"))
     except repo.AssignmentConflict as error:
         return ok({"error": str(error)}, 409)
     except ValueError as error:
@@ -198,7 +198,7 @@ async def onboard(request: Request) -> JSONResponse:
             secret_ref=body.get("secret_ref"),
             tariffs=body.get("tariffs") or {},
             opening_stock=body.get("opening_stock") or [],
-            from_date=as_date(body.get("from_date"), date.today()))
+            from_date=as_date(body.get("from_date"), today()))
     except KeyError as error:
         return ok({"error": f"не хватает поля {error}"}, 400)
     except repo.AssignmentConflict as error:
@@ -237,7 +237,7 @@ async def add_version(tariff_id: str, request: Request) -> JSONResponse:
     body = await body_of(request)
     try:
         version = admin.add_version(
-            tariff_id, as_date(body.get("effective_from"), date.today()),
+            tariff_id, as_date(body.get("effective_from"), today()),
             body.get("tiers") or [], partner_fee=as_money(body.get("partner_fee", 0)),
             accumulation=str(body.get("accumulation") or "per_event"))
     except (OnboardingError, ValueError, KeyError) as error:
@@ -375,8 +375,8 @@ async def shift(request: Request, day: str | None = None) -> JSONResponse:
     who = caller(request)
     if not (who.unrestricted or "warehouse_head" in who.roles):
         raise Forbidden("выработку смены видит начальник склада или администратор")
-    return ok({"day": as_date(day, date.today()).isoformat(),
-               "rows": billing.shift_output(as_date(day, date.today()))})
+    return ok({"day": as_date(day, today()).isoformat(),
+               "rows": billing.shift_output(as_date(day, today()))})
 
 
 # ------------------------------------------------------ периоды, счета, расходы
@@ -421,6 +421,9 @@ async def issue_invoice(request: Request) -> JSONResponse:
         invoice = admin.issue_invoice(str(body["cabinet_id"]), str(body["period"]),
                                       str(body.get("number") or
                                           f"{body['period']}-{str(body['cabinet_id'])[:8]}"))
+    except InvoiceConflict as error:
+        # 409, а не 400: данные верные, а состояние счёта не то.
+        return ok({"error": str(error)}, 409)
     except (KeyError, OnboardingError) as error:
         return ok({"error": str(error)}, 400)
     return ok({"invoice": invoice}, 201)
@@ -455,6 +458,8 @@ async def pay_invoice(invoice_id: str, request: Request) -> JSONResponse:
     require_write(caller(request))
     try:
         return ok({"invoice": admin.pay_invoice(invoice_id)})
+    except InvoiceConflict as error:
+        return ok({"error": str(error)}, 409)
     except OnboardingError as error:
         return ok({"error": str(error)}, 404)
 

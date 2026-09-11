@@ -5,9 +5,11 @@
 """
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -52,8 +54,31 @@ class EnvelopeError(ValueError):
     """Конверт не соответствует разделу 2.4 мастера."""
 
 
+# Зона склада. Все даты — периоды, дни выработки, границы месяцев —
+# считаются в ней.
+#
+# `occurred_at.date()` брал дату в UTC: событие в 02:00 по Москве
+# 1 сентября — это 23:00 31 августа по UTC, и начисление уезжало в ЧУЖОЙ
+# МЕСЯЦ. Счёт за сентябрь недосчитывал ночную смену первого числа, а
+# августовский счёт, уже выставленный, получал начисление задним числом.
+# Склад в Москве, смены в Москве, счета в Москве.
+WAREHOUSE_ZONE = ZoneInfo(os.getenv("BILLING_TIMEZONE", "Europe/Moscow"))
+
+
 def now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def local_date(moment: datetime) -> date:
+    """Дата события в зоне склада."""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(WAREHOUSE_ZONE).date()
+
+
+def today() -> date:
+    """Сегодня — по складу, а не по UTC."""
+    return local_date(now())
 
 
 def uid() -> str:
@@ -75,7 +100,12 @@ class Envelope:
 
     @property
     def occurred_on(self) -> date:
-        return self.occurred_at.date()
+        """Дата события в зоне склада, а не в UTC.
+
+        Событие в 02:00 по Москве 1 сентября — это 23:00 31 августа по UTC.
+        По UTC оно уезжало в чужой месяц.
+        """
+        return local_date(self.occurred_at)
 
     @staticmethod
     def parse(body: Any) -> "Envelope":

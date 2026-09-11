@@ -128,6 +128,9 @@ def test_the_partner_is_not_paid_before_the_client_pays(
     assert rows(database, "SELECT partner_payout_state FROM billing_accrual")[0][
         "partner_payout_state"] == "pending"
 
+    # Счёт выставляется за ЗАКРЫТЫЙ период: в открытый ещё приходят события,
+    # и счёт по нему недосчитал бы клиенту всё, что случится после.
+    admin.close_period("2026-09", closed_by="владелец")
     invoice = admin.issue_invoice(stand["cabinet"], "2026-09", "INV-2026-09-1")
     assert invoice["total_amount"] == Decimal("45.00")
     assert invoice["partner_total"] == Decimal("15.00")

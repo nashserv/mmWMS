@@ -306,6 +306,17 @@ def partner_chain(cursor: Cursor, cabinet_id: str, service: str,
 
 # ------------------------------------------------------------------- тарифы
 
+def period_is_closed(cursor: Cursor, period: str) -> bool:
+    """Закрыт ли расчётный период.
+
+    Закрытый период значит выставленный счёт: дописать в него начисление —
+    это разойтись с бумагой, которая уже лежит у клиента.
+    """
+    cursor.execute("SELECT state FROM billing_period WHERE period = %s", (period,))
+    row = cursor.fetchone()
+    return bool(row) and row["state"] == "closed"
+
+
 def billable_event(cursor: Cursor, event_type: str) -> dict[str, Any] | None:
     cursor.execute("SELECT * FROM billing_billable_event WHERE event_type = %s", (event_type,))
     return cursor.fetchone()

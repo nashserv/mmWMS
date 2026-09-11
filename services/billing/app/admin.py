@@ -17,7 +17,7 @@ from typing import Any, Sequence
 
 from . import repositories as repo
 from .db import Database
-from .domain import PartnerRole, Service
+from .domain import PartnerRole, Service, today
 from .money import money
 from .wms_client import WmsClient, WmsUnavailable
 
@@ -26,6 +26,14 @@ from .wms_client import WmsClient, WmsUnavailable
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 # Ссылка на секрет: схема провайдера, а не значение.
 _SECRET_REF_RE = re.compile(r"^(vault|secret|env|stand-fake-secret)[:/-]")
+
+
+class InvoiceConflict(RuntimeError):
+    """Со счётом в этом состоянии так делать нельзя.
+
+    Отдельный тип, а не `OnboardingError`: маршрут отвечает на него 409, и
+    клиент отличает «нельзя сейчас» от «неверные данные».
+    """
 
 
 class OnboardingError(RuntimeError):
@@ -78,7 +86,7 @@ class Admin:
 
     def partner_cabinets(self, partner_id: str, *, on: date | None = None) -> list[dict[str, Any]]:
         """Клиенты партнёра — своя ветка целиком (файл 04, «Роли и права»)."""
-        moment = on or date.today()
+        moment = on or today()
         with self.db.cursor() as cursor:
             branch = repo.subtree_ids(cursor, partner_id)
             cursor.execute(
@@ -201,7 +209,7 @@ class Admin:
         упавший на стороне склада, оставляет клиента заведённым в биллинге и
         сообщает, что именно повторить, — а не откатывает половину молча.
         """
-        start = from_date or date.today()
+        start = from_date or today()
         secret = check_secret_ref(secret_ref) if wb_account_external_id else None
 
         with self.db.transaction() as cursor:
@@ -340,15 +348,48 @@ class Admin:
             cursor.execute(
                 "INSERT INTO billing_period (period) VALUES (%s) ON CONFLICT DO NOTHING",
                 (period,))
+            # Счёт выставляется только за ЗАКРЫТЫЙ период.
+            #
+            # В открытый период события ещё приходят: счёт, выставленный по
+            # нему, недосчитывает клиенту всё, что случилось после. Заметить
+            # это можно только сложив начисления руками — а счёт уже у клиента.
+            cursor.execute("SELECT state FROM billing_period WHERE period = %s FOR UPDATE",
+                           (period,))
+            state = (cursor.fetchone() or {}).get("state")
+            if state != "closed":
+                raise OnboardingError(
+                    f"период {period} ещё открыт: события продолжают приходить, "
+                    f"и счёт по нему недосчитает клиенту всё, что случится после. "
+                    f"Сначала закройте период")
+
+            # Перевыставление — только из `issued`. Оплаченный счёт
+            # перевыставлением превращался обратно в выставленный: оплата
+            # исчезала, а вознаграждение партнёра оставалось payable.
+            cursor.execute(
+                "SELECT id, state FROM billing_invoice "
+                " WHERE cabinet_id = %s AND period = %s FOR UPDATE",
+                (cabinet_id, period))
+            existing = cursor.fetchone()
+            if existing is not None and existing["state"] not in ("issued", "draft"):
+                raise InvoiceConflict(
+                    f"счёт за {period} в состоянии {existing['state']!r}: "
+                    f"перевыставить можно только выставленный")
+
             cursor.execute(
                 """
                 INSERT INTO billing_invoice (id, cabinet_id, period, number, state, issued_at)
                      VALUES (%s, %s, %s, %s, 'issued', now())
-                ON CONFLICT (cabinet_id, period) DO UPDATE SET number = EXCLUDED.number
+                ON CONFLICT (cabinet_id, period) DO UPDATE
+                    SET number = EXCLUDED.number, issued_at = now()
+                  WHERE billing_invoice.state IN ('issued', 'draft')
                   RETURNING *
                 """,
                 (repo.new_id(), cabinet_id, period, number))
-            invoice = dict(cursor.fetchone())
+            row = cursor.fetchone()
+            if row is None:
+                raise InvoiceConflict(
+                    f"счёт за {period} перевыставить нельзя: он уже не выставленный")
+            invoice = dict(row)
             cursor.execute(
                 "UPDATE billing_accrual SET invoice_id = %s "
                 " WHERE cabinet_id = %s AND period = %s AND invoice_id IS NULL",
@@ -376,13 +417,27 @@ class Admin:
         невыставленного или неоплаченного счёта.
         """
         with self.db.transaction() as cursor:
+            # Оплачивается только ВЫСТАВЛЕННЫЙ счёт. Без условия по состоянию
+            # повторная оплата переписывала `paid_at`, а `void` оживал
+            # оплаченным: вознаграждение партнёра уходило в payable по счёту,
+            # который аннулировали.
             cursor.execute(
                 "UPDATE billing_invoice SET state = 'paid', paid_at = now() "
-                " WHERE id = %s RETURNING *", (invoice_id,))
+                " WHERE id = %s AND state = 'issued' RETURNING *", (invoice_id,))
             row = cursor.fetchone()
-            if row is None:
+            if row is not None:
+                return dict(row)
+            cursor.execute("SELECT id, state, paid_at FROM billing_invoice WHERE id = %s",
+                           (invoice_id,))
+            current = cursor.fetchone()
+            if current is None:
                 raise OnboardingError(f"счёт {invoice_id} не найден")
-            return dict(row)
+            if current["state"] == "paid":
+                # Повтор оплаты — тот же ответ, а не второе признание выручки.
+                return dict(current)
+            raise InvoiceConflict(
+                f"счёт {invoice_id} в состоянии {current['state']!r}: "
+                f"оплатить можно только выставленный")
 
     def invoice(self, invoice_id: str) -> dict[str, Any]:
         """Счёт с расшифровкой: клиент видит 45 и понимает, из чего они."""
@@ -431,6 +486,15 @@ class Admin:
         и «на вас отнесено 4210 ₽» можно объяснить клиенту.
         """
         with self.db.transaction() as cursor:
+            # Разносить расходы по ЗАКРЫТОМУ периоду — переписывать маржу,
+            # по которой уже приняли решения. Разнесение идёт перед закрытием,
+            # а не после.
+            cursor.execute("SELECT state FROM billing_period WHERE period = %s", (period,))
+            state = (cursor.fetchone() or {}).get("state")
+            if state == "closed":
+                raise InvoiceConflict(
+                    f"период {period} закрыт: разнесение расходов переписало бы "
+                    f"маржу, по которой уже приняли решения")
             cursor.execute("SELECT * FROM billing_fixed_expense WHERE period = %s", (period,))
             expenses = list(cursor.fetchall())
             if not expenses:

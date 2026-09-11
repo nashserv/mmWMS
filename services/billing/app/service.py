@@ -19,7 +19,7 @@ from . import repositories as repo
 from .config import auto_onboard_unknown_cabinet, tenant_id
 from .db import Database
 from .domain import (Envelope, EnvelopeError, PartnerRole, PartnerShare, Service,
-                     UnbilledReason)
+                     UnbilledReason, today)
 from .metrics import (ACCRUALS, ACCRUED_AMOUNT, CABINETS_NEEDING_ONBOARDING,
                       SHIFT_OUTPUT_REJECTED, UNBILLED, WORKER_PROCESSED)
 from .money import charge as compute_charge
@@ -123,7 +123,7 @@ class BillingService:
             if not auto_onboard_unknown_cabinet():
                 return self._unbilled(cursor, envelope, UnbilledReason.CABINET_UNKNOWN,
                                       f"кабинет {seller} не заведён онбордингом")
-            cabinet = self._auto_onboard(cursor, seller)
+            cabinet = self._auto_onboard(cursor, seller, envelope.occurred_on)
 
         quantity = self._resolve_quantity(envelope, mapping["quantity_path"])
         if quantity is None or quantity <= 0:
@@ -140,6 +140,20 @@ class BillingService:
             # ждёт утверждения версии и переигрывается.
             return self._unbilled(cursor, envelope, UnbilledReason.TARIFF_NOT_APPROVED,
                                   f"версия тарифа {version['id']} не утверждена")
+
+        # Период закрыт — начисление в него не добавляется.
+        #
+        # Счёт за закрытый месяц уже выставлен и, возможно, оплачен. Тихо
+        # дописать в него начисление значит разойтись с бумагой, которая
+        # лежит у клиента: в базе одна сумма, в счёте другая, и сходятся они
+        # только до первого вопроса. Событие остаётся видимым с причиной
+        # PERIOD_CLOSED — разбирают его люди, решая, что делать с деньгами.
+        period = envelope.occurred_on.strftime("%Y-%m")
+        if repo.period_is_closed(cursor, period):
+            return self._unbilled(
+                cursor, envelope, UnbilledReason.PERIOD_CLOSED,
+                f"период {period} закрыт: счёт за него уже выставлен, и дописать "
+                f"в него начисление задним числом нельзя")
 
         return self._charge(
             cursor, cabinet=cabinet, service=service, quantity=quantity,
@@ -219,7 +233,8 @@ class BillingService:
             return shares
         return [PartnerShare(partner_id=owner_partner, markup=fee, price_layer_id=None)]
 
-    def _auto_onboard(self, cursor: Cursor, seller: str) -> dict[str, Any]:
+    def _auto_onboard(self, cursor: Cursor, seller: str,
+                      occurred_on: date | None = None) -> dict[str, Any]:
         """Кабинет приехал событием, а не онбордингом.
 
         Отказать — значит потерять выручку молча, ровно то, чем болен прод.
@@ -235,9 +250,18 @@ class BillingService:
                 "SELECT 1 FROM cabinet_assignment WHERE cabinet_id = %s AND to_date IS NULL",
                 (cabinet["id"],))
             if cursor.fetchone() is None:
+                # Закрепление начинается НЕ ПОЗЖЕ даты события.
+                #
+                # Кабинет приходит событием — иногда задним числом: разбирали
+                # мёртвые письма, переигрывали неоплаченное, догоняли очередь
+                # после простоя. Закрепление «с сегодня» оставляло событие
+                # ВНЕ периода действия закрепления, и оно уходило в unbilled
+                # с «партнёр не найден» — то самое событие, ради которого
+                # кабинет и заводили.
+                since = min(occurred_on or today(), today())
                 repo.assign_cabinet(
                     cursor, str(cabinet["id"]), partner_id,
-                    PartnerRole.ACCOUNT_MANAGER.value, date.today(),
+                    PartnerRole.ACCOUNT_MANAGER.value, since,
                     comment="закреплён автоматически: кабинет пришёл событием, "
                             "не онбордингом — подтвердить в админке")
         CABINETS_NEEDING_ONBOARDING.inc()
