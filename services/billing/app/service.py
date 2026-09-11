@@ -88,6 +88,11 @@ class BillingService:
             result = self._tariff(cursor, envelope)
             repo.finish_event(cursor, envelope.event_id, result["outcome"],
                               result.get("detail"))
+            if result["outcome"] == "accrued":
+                # Дошло до счёта — закрываем строку в отчёте «не дошло».
+                # Иначе переигранное событие остаётся в нём навсегда, и отчёт
+                # перестаёт значить что-либо.
+                repo.resolve_unbilled(cursor, envelope.event_id)
 
         WORKER_PROCESSED.labels(worker="inbox").inc()
         return result
@@ -160,8 +165,18 @@ class BillingService:
             correlation_id=correlation_id, cabinet=cabinet, service=service,
             tariff_version_id=str(version["id"]), charge=charge, partner_id=owner_partner,
             occurred_on=occurred_on, allocation_key=allocation_key)
-        repo.insert_commissions(cursor, str(accrual["id"]),
-                                split_markup(quantity, shares, charge.partner_amount))
+        commissions = split_markup(quantity, shares, charge.partner_amount)
+        # Проверка ЗДЕСЬ, а не только триггером. Триггер отложен до коммита и
+        # скажет «раскладка не сходится» посреди пачки событий — с именем
+        # начисления, но без того, что его породило. Здесь же видно и событие,
+        # и цепочку партнёров, по которой доли считались.
+        laid_out = sum(amount for _, amount in commissions)
+        if laid_out != charge.partner_amount:
+            raise ValueError(
+                f"раскладка комиссии {laid_out} не сходится с наценкой "
+                f"{charge.partner_amount} по событию {event_id} ({event_type}): "
+                f"долей {len(commissions)} на цепочку из {len(shares)} партнёров")
+        repo.insert_commissions(cursor, str(accrual["id"]), commissions)
 
         repo.emit(cursor, "billing.accrual.created.v1", tenant, {
             "accrual_id": str(accrual["id"]),

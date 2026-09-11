@@ -251,11 +251,22 @@ def partner_chain(cursor: Cursor, cabinet_id: str, service: str,
               FROM partner parent JOIN chain ON chain.parent_id = parent.id
              WHERE parent.active AND chain.depth < 32
         )
+        -- КАЖДЫЙ партнёр в цепочке ровно один раз.
+        --
+        -- `UNION` в рекурсивной части отбрасывает одинаковые строки, но не
+        -- одного партнёра на разной глубине. Старший, закреплённый на кабинете
+        -- НАПРЯМУЮ и одновременно родитель менеджера кабинетов, приходил
+        -- дважды: depth 0 и depth 1 — и его наценка складывалась сама с собой.
+        -- Клиент платил её в двойном размере, а сумма комиссий не сходилась с
+        -- долей партнёра в начислении.
+        , unique_chain AS (
+            SELECT id, min(depth) AS depth FROM chain GROUP BY id
+        )
         SELECT chain.id AS partner_id,
                chain.depth,
                COALESCE(override.markup, base.markup, 0) AS markup,
                COALESCE(override.id, base.id) AS price_layer_id
-          FROM chain
+          FROM unique_chain AS chain
           LEFT JOIN LATERAL (
               SELECT pl.id, pl.markup FROM price_layer pl
                WHERE pl.partner_id = chain.id AND pl.service = %(service)s
@@ -344,17 +355,29 @@ def tiers(cursor: Cursor, version_id: str) -> list[Tier]:
 def claim_event(cursor: Cursor, event_id: str, event_type: str, tenant_id: str,
                 correlation_id: str | None, payload: dict[str, Any],
                 occurred_at: datetime) -> bool:
-    """Кладёт событие в inbox. False — событие уже было (инвариант 5).
+    """Кладёт событие в inbox. False — событие уже НАЧИСЛЕНО (инвариант 5).
 
-    Повтор не переигрывается: at-least-once доставка шины иначе удвоит счёт
-    клиенту, а это разговор, которого не должно быть.
+    Повтор начисленного не переигрывается: at-least-once доставка шины иначе
+    удвоит счёт клиенту, а это разговор, которого не должно быть.
+
+    Но событие, которое НЕ начислено — `unbilled` (тариф не утверждён, клиент
+    не заведён) или `failed`, — переигрывается и обязано переигрываться.
+    Иначе причину устраняют, а событие остаётся невыставленным навсегда:
+    ровно так неоплаченная работа копилась и оставалась неоплаченной.
     """
     cursor.execute(
         """
         INSERT INTO billing_inbox (event_id, event_type, tenant_id, correlation_id,
                                    payload, occurred_at, attempts)
              VALUES (%s, %s, %s, %s, %s, %s, 1)
-        ON CONFLICT (event_id) DO NOTHING
+        ON CONFLICT (event_id) DO UPDATE
+           SET attempts = billing_inbox.attempts + 1,
+               processed_at = NULL,
+               last_error = NULL,
+               payload = EXCLUDED.payload,
+               correlation_id = COALESCE(EXCLUDED.correlation_id,
+                                         billing_inbox.correlation_id)
+         WHERE billing_inbox.outcome IN ('unbilled', 'failed')
           RETURNING event_id
         """,
         (event_id, event_type, tenant_id, correlation_id, json.dumps(payload, ensure_ascii=False),
@@ -386,6 +409,18 @@ def record_unbilled(cursor: Cursor, event_id: str, event_type: str, reason: str,
         """,
         (new_id(), event_id, event_type, tenant_id, reason, detail,
          json.dumps(payload, ensure_ascii=False), occurred_at))
+
+
+def resolve_unbilled(cursor: Cursor, event_id: str) -> None:
+    """Событие дошло до счёта: строка в отчёте закрывается.
+
+    Без этого переигранное событие оставалось в отчёте «не дошло до счёта»
+    навсегда — и отчёт переставал значить что-либо: в нём вперемешку лежало
+    разобранное и неразобранное.
+    """
+    cursor.execute(
+        "UPDATE billing_unbilled SET resolved_at = now() "
+        " WHERE event_id = %s AND resolved_at IS NULL", (event_id,))
 
 
 # ----------------------------------------------------------------- начисления

@@ -177,3 +177,69 @@ def test_an_accrual_announces_itself_on_the_bus(
     assert outbox[0]["type"] == "billing.accrual.created.v1"
     assert outbox[0]["payload"]["net_amount"] == "30.00"
     assert outbox[0]["published_at"] is None
+
+
+def test_an_unbilled_event_is_replayed_once_the_tariff_is_approved(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Причину устранили — событие обязано дойти до счёта.
+
+    Раньше повтор любого события считался дублем доставки и отбрасывался:
+    тариф утверждали, справочник правили, а событие оставалось невыставленным
+    навсегда. Неоплаченная работа копилась и оставалась неоплаченной.
+    """
+    with database.transaction() as cursor:
+        cursor.execute("UPDATE billing_tariff_version SET approved = false, "
+                       "       approved_by = NULL, approved_at = NULL "
+                       " WHERE id = %s", (stand["version"],))
+
+    service = BillingService(database)
+    packed = event("wms.packing.completed.v1", {"seller_id": "seller-1"})
+    first = service.ingest(packed)
+
+    assert first["outcome"] == "unbilled", f"ожидали unbilled, получили {first}"
+    assert not rows(database, "SELECT id FROM billing_accrual")
+    open_rows = rows(database,
+                     "SELECT event_id, reason, resolved_at FROM billing_unbilled")
+    assert len(open_rows) == 1 and open_rows[0]["resolved_at"] is None
+
+    # Тариф утверждён — то, ради чего событие и оставляли видимым.
+    with database.transaction() as cursor:
+        cursor.execute("UPDATE billing_tariff_version SET approved = true, "
+                       "       approved_by = 'владелец', approved_at = now() "
+                       " WHERE id = %s", (stand["version"],))
+
+    again = service.ingest(packed)
+
+    assert again["outcome"] == "accrued", (
+        f"переигранное событие не дошло до счёта: {again}. "
+        f"Причину устранили, а работа осталась неоплаченной")
+    accruals = rows(database, "SELECT amount FROM billing_accrual")
+    assert len(accruals) == 1, f"начислений {len(accruals)}: счёт выставлен дважды"
+    assert Decimal(accruals[0]["amount"]) == Decimal("45.00")
+
+    closed = rows(database, "SELECT resolved_at FROM billing_unbilled")
+    assert closed[0]["resolved_at"] is not None, (
+        "строка осталась в отчёте «не дошло до счёта» после того, как дошла — "
+        "в отчёте вперемешку разобранное и неразобранное")
+
+    attempts = rows(database, "SELECT attempts, outcome FROM billing_inbox")
+    assert int(attempts[0]["attempts"]) == 2, "попытки не считаются"
+    assert attempts[0]["outcome"] == "accrued"
+
+
+def test_an_accrued_event_is_never_replayed(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Начисленное не переигрывается: это второй счёт клиенту.
+
+    Парная проверка: открыть переигрывание неначисленного легко так, что
+    вместе с ним откроется и переигрывание начисленного.
+    """
+    service = BillingService(database)
+    packed = event("wms.packing.completed.v1", {"seller_id": "seller-1"})
+    assert service.ingest(packed)["outcome"] == "accrued"
+
+    again = service.ingest(packed)
+
+    assert again["outcome"] == "duplicate", (
+        f"начисленное событие переиграно ({again}): клиенту выставится дважды")
+    assert len(rows(database, "SELECT id FROM billing_accrual")) == 1

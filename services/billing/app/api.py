@@ -276,6 +276,46 @@ async def ingest(request: Request) -> JSONResponse:
     return ok(billing.ingest(await body_of(request)))
 
 
+@router.post("/unbilled/{event_id}/replay")
+async def replay_unbilled(event_id: str, request: Request) -> JSONResponse:
+    """Переиграть событие, которое не дошло до счёта.
+
+    Тариф не был утверждён, клиент не был заведён, справочник поправили — и
+    событие надо провести заново. Раньше для этого слали его тело в
+    `POST /events` руками: тело брали из отчёта, правили на глаз, и в счёт
+    клиенту уходило то, что напечатал человек, а не то, что произошло на
+    складе.
+
+    Здесь тело берётся ИЗ INBOX — ровно то, что пришло по шине. Переигрывается
+    только неначисленное: `accrued` этот маршрут не тронет.
+    """
+    require_write(caller(request))
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT event_id, event_type, tenant_id, correlation_id, payload, "
+            "       occurred_at, outcome, attempts "
+            "  FROM billing_inbox WHERE event_id = %s", (event_id,))
+        stored = cursor.fetchone()
+    if stored is None:
+        return ok({"error": f"события {event_id} нет в inbox: переигрывать нечего"}, 404)
+    if stored["outcome"] == "accrued":
+        # Начисленное не переигрывается никогда: это второй счёт клиенту.
+        return ok({"error": f"событие {event_id} уже начислено, повтор запрещён",
+                   "outcome": stored["outcome"]}, 409)
+
+    envelope = {
+        "event_id": str(stored["event_id"]),
+        "type": stored["event_type"],
+        "tenant_id": stored["tenant_id"],
+        "correlation_id": stored["correlation_id"],
+        "occurred_at": stored["occurred_at"].isoformat() if stored["occurred_at"] else None,
+        "payload": stored["payload"],
+    }
+    outcome = billing.ingest(envelope)
+    return ok({"event_id": event_id, "attempts": int(stored["attempts"]) + 1,
+               "previous_outcome": stored["outcome"], "result": outcome})
+
+
 @router.get("/accruals")
 async def accruals(request: Request, cabinet_id: str | None = None, period: str | None = None,
                    limit: int = 200) -> JSONResponse:

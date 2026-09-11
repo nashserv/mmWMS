@@ -215,3 +215,39 @@ def test_assigning_behind_a_future_assignment_is_refused(
     with pytest.raises(AssignmentConflict, match="задним числом"):
         admin.assign_cabinet(stand["cabinet"], stand["manager"], "account_manager",
                              date(2026, 10, 1))
+
+
+def test_a_senior_on_the_cabinet_and_above_the_manager_is_paid_once(
+        database: Database, stand: dict[str, Any]) -> None:
+    """Один партнёр в цепочке — одна наценка, сколько бы раз он в ней ни был.
+
+    Старший, закреплённый на кабинете НАПРЯМУЮ и одновременно родитель
+    менеджера кабинетов, приходил в цепочку дважды — depth 0 и depth 1, — и
+    его наценка складывалась сама с собой. Клиент платил её в двойном
+    размере, а сумма комиссий не сходилась с долей партнёра в начислении.
+    """
+    with database.transaction() as cursor:
+        # Старший закрепляется на том же кабинете вторым закреплением —
+        # обычное дело: он ведёт клиента вместе со своим менеджером.
+        cursor.execute(
+            "INSERT INTO cabinet_assignment (id, cabinet_id, partner_id, role, from_date) "
+            "VALUES (%s, %s, %s, 'senior_manager', DATE '2026-01-01')",
+            (str(uuid.uuid4()), stand["cabinet"], stand["senior"]))
+
+    BillingService(database).ingest(
+        event("wms.packing.completed.v1", {"seller_id": "seller-1"}))
+
+    accruals = rows(database,
+                    "SELECT amount, partner_amount, net_amount FROM billing_accrual")
+    assert len(accruals) == 1
+    assert Decimal(accruals[0]["amount"]) == Decimal("45.00"), (
+        f"клиенту выставлено {accruals[0]['amount']} вместо 45.00: наценка "
+        f"старшего посчитана дважды")
+    assert Decimal(accruals[0]["partner_amount"]) == Decimal("15.00")
+
+    commissions = rows(database,
+                       "SELECT partner_id, amount FROM billing_commission ORDER BY amount")
+    assert sum(Decimal(row["amount"]) for row in commissions) == Decimal("15.00"), (
+        "сумма комиссий не сошлась с наценкой начисления")
+    assert len({str(row["partner_id"]) for row in commissions}) == len(commissions), (
+        "один партнёр получил две строки комиссии")
