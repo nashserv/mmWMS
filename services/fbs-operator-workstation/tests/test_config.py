@@ -45,8 +45,12 @@ def test_poll_interval_has_hard_limits(monkeypatch: pytest.MonkeyPatch):
 def test_service_token_is_required_outside_local(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("TRUSTED_HOSTS", "workstation")
-    monkeypatch.delenv("WMS_SERVICE_TOKEN", raising=False)
-    monkeypatch.delenv("WMS_SERVICE_TOKEN_FILE", raising=False)
+    # Убираются ОБА имени. `SERVICE_TOKEN` — общее для всех сервисов,
+    # `WMS_SERVICE_TOKEN` — прежнее: тест, чистящий только прежнее, проходил
+    # на стенде, где задано общее, и ничего не проверял.
+    for name in ("SERVICE_TOKEN", "SERVICE_TOKEN_FILE",
+                 "WMS_SERVICE_TOKEN", "WMS_SERVICE_TOKEN_FILE"):
+        monkeypatch.delenv(name, raising=False)
     with pytest.raises(RuntimeError):
         config.wms_service_token()
     monkeypatch.setenv("APP_ENV", "test")

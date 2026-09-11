@@ -1419,9 +1419,18 @@ def claim_tasks(cursor: Cursor, *, assignee: Any, limit: int, states: Sequence[s
     `claim = False` — только посмотреть: экран обновляется чаще, чем человек
     берёт работу, и занимать задание при каждом обновлении нельзя.
     """
+    # При `claim = false` с названным исполнителем отдаются И свободные
+    # задания, И те, что уже в руках у ЭТОГО человека.
+    #
+    # Условие `assignee IS NULL` действовало всегда, и проекция рабочего места
+    # теряла всё, что сборщик взял: задание исчезало с экрана в момент, когда
+    # человек его взял, и появлялось обратно, только когда он его отдал.
+    # Занять чужое всё равно нельзя — при `claim = true` условие прежнее.
+    ownership = ("t.assignee IS NULL" if claim else
+                 "(t.assignee IS NULL OR t.assignee = %(assignee)s)")
     selection = (
         "SELECT t.id FROM wms_task t JOIN owner o ON o.id = t.owner_id "
-        " WHERE t.state = ANY(%(states)s) AND t.assignee IS NULL "
+        f" WHERE t.state = ANY(%(states)s) AND {ownership} "
         "   AND (%(owners)s::text[] IS NULL OR o.seller_external_id = ANY(%(owners)s)) "
         " ORDER BY t.deadline NULLS LAST, t.created_at "
         " LIMIT %(limit)s FOR UPDATE OF t SKIP LOCKED")

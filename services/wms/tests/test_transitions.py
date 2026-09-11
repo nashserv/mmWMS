@@ -308,3 +308,65 @@ def test_a_claimed_task_comes_back_with_its_lease(
         "задание за сборщиком, и нечем понять, что лизинг истёк")
     assert item["task"]["assignee"], "в ответе никто не взял задание"
     assert item["task"]["claim_expires_at"] == item["leased_until"]
+
+
+def test_reading_the_queue_shows_what_is_already_in_hands(
+        pool: ConnectionPool, client: dict) -> None:
+    """`claim: false` с исполнителем отдаёт и свободное, и его собственное.
+
+    Условие «исполнителя нет» действовало всегда, и проекция рабочего места
+    теряла всё, что сборщик взял: задание исчезало с экрана ровно в тот
+    момент, когда человек его взял, и появлялось обратно, только когда отдавал.
+    """
+    from app.tasks import assignee_id
+
+    mine, theirs = reserve(pool, client), reserve(pool, client)
+    tasks = TaskOperations(pool, WmsService(pool))
+    tasks.pull({"assignee": "picker-1", "claim": True, "limit": 1,
+                "owner_external_ids": [client["seller"]]})
+    tasks.pull({"assignee": "picker-2", "claim": True, "limit": 1,
+                "owner_external_ids": [client["seller"]]})
+
+    taken = {row["id"]: row["assignee"] for row in rows(
+        pool, "SELECT id, assignee FROM wms_task WHERE id = ANY(%s)",
+        ([uuid.UUID(mine), uuid.UUID(theirs)],))}
+    assert all(taken.values()), "сцена не собрана: задания никто не взял"
+
+    screen = tasks.pull({"claim": False, "limit": 50, "assignee": "picker-1",
+                         "owner_external_ids": [client["seller"]]})
+    shown = {item["task"]["task_id"] for item in screen["tasks"]}
+    ours = next(task_id for task_id, holder in taken.items()
+                if holder == assignee_id("picker-1"))
+    others = next(task_id for task_id, holder in taken.items()
+                  if holder != assignee_id("picker-1"))
+
+    assert str(ours) in shown, (
+        "задание в руках у этого сборщика пропало с его экрана — он стоит с "
+        "коробкой, а экран говорит «работы нет»")
+    assert str(others) not in shown, "на экране появилось чужое занятое задание"
+
+    # Чтение ничего не занимает: инвариант выдачи не ослаблен.
+    after = rows(pool, "SELECT assignee FROM wms_task WHERE id = %s", (ours,))[0]
+    assert after["assignee"] == assignee_id("picker-1"), "чтение перезаняло задание"
+
+
+def test_reading_the_queue_may_ask_for_states_the_handout_refuses(
+        pool: ConnectionPool, client: dict) -> None:
+    """Экран показывает и собранное, и уехавшее — выдавать их нельзя.
+
+    Парная проверка к белому списку: запрет на выдачу не должен превращаться в
+    запрет смотреть.
+    """
+    task_id = reserve(pool, client)
+    force_state(pool, task_id, TaskState.SHIPPED.value)
+    tasks = TaskOperations(pool, WmsService(pool))
+
+    screen = tasks.pull({"claim": False, "limit": 50,
+                         "states": ["reserved", "packed", "shipped"],
+                         "owner_external_ids": [client["seller"]]})
+    assert any(item["task"]["task_id"] == task_id for item in screen["tasks"]), (
+        "уехавшее задание не видно на экране — работа, которая сделана, "
+        "пропала из виду")
+
+    with pytest.raises(ValueError, match="не выдаются сборщику"):
+        tasks.pull({"assignee": "picker-9", "claim": True, "states": ["shipped"]})

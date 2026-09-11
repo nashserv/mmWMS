@@ -44,6 +44,14 @@ MISSING_GRACE_SECONDS = 3.0
 MISSING_RECHECK_SECONDS = 20.0
 VERIFY_PER_POLL = 25
 
+# Сколько уехавшее задание висит на экране, прежде чем уйти.
+#
+# `shipped` и `in_supply` — работа, которая уже сделана: смотреть на неё
+# полезно час-другой, а к следующей смене она превращается в стену из чужих
+# заказов, в которой не найти своё. Терминальные состояния уходят раньше, по
+# `_verify_missing`; эти двое терминальными не являются и висели вечно.
+STALE_SHIPPED_SECONDS = 6 * 3600.0
+
 
 class Poller:
     """Цикл опроса. Один на сервис, а не один на экран.
@@ -54,11 +62,17 @@ class Poller:
     """
 
     def __init__(self, client: WmsClient, projection: Projection, *,
-                 interval_seconds: float = 1.0, limit: int = 200) -> None:
+                 interval_seconds: float = 1.0, limit: int = 200,
+                 store: Any = None) -> None:
         self._client = client
         self._projection = projection
         self._interval = interval_seconds
         self._limit = limit
+        # База рабочего места: по ней видно, у кого сейчас открыта сессия
+        # подбора. Нужна затем, чтобы спросить wms про задания В РУКАХ — общий
+        # опрос отдаёт только свободные.
+        self._store = store
+        self._restored = False
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
@@ -151,9 +165,17 @@ class Poller:
         finally:
             metrics.POLL_DURATION.observe(time.perf_counter() - started)
 
+        # Второй опрос — по каждому, у кого открыта сессия подбора. Общий
+        # опрос отдаёт только свободные задания: всё, что сборщик взял,
+        # исчезало с экрана ровно в момент, когда он его взял.
+        in_hands = await self._tasks_in_hands()
+        if in_hands:
+            batch.tasks.extend(in_hands)
+
         self._restamp(batch.tasks)
         fresh = self._projection.apply(
             batch.tasks, available_total=batch.available_total, served_at=batch.served_at)
+        self._projection.drop_stale_shipped(STALE_SHIPPED_SECONDS)
         await self._verify_missing()
 
         self._detect_claim_violation(batch)
@@ -166,6 +188,84 @@ class Poller:
         if fresh:
             logger.info("новых заданий на экране: %d", len(fresh))
         return batch
+
+    async def _tasks_in_hands(self) -> list[Any]:
+        """Задания, которые держат сборщики с открытыми сессиями.
+
+        Спрашиваются поимённо по каждому актору: `claim: false` с заполненным
+        `assignee` отдаёт И свободные, И задания этого исполнителя (контракт
+        1.3.0). Без второго опроса проекция теряла всё, что в руках.
+
+        База рабочего места может лежать (этап 3.3): тогда список сессий
+        пуст, и экран показывает хотя бы свободную очередь.
+        """
+        if self._store is None:
+            return []
+        try:
+            sessions = await self._store.open_sessions()
+        except Exception:  # noqa: BLE001 — опрос не падает из-за базы экрана
+            logger.warning("список открытых сессий недоступен: задания в руках "
+                           "не попадут на экран этим опросом", exc_info=False)
+            return []
+        actors = {str(row["actor_id"]) for row in sessions if row.get("actor_id")}
+        if not actors:
+            return []
+        collected: list[Any] = []
+        seen: set[str] = set()
+        for actor in sorted(actors):
+            try:
+                batch = await self._client.tasks_pull(
+                    limit=self._limit, claim=False, assignee=actor,
+                    states=SCREEN_STATES,
+                    previous={task.task_id: task for task in self._projection.all()})
+            except WmsUnavailable:
+                # Свободную очередь мы уже получили; ради одного актора опрос
+                # не роняем.
+                continue
+            for task in batch.tasks:
+                if task.assignee and task.task_id not in seen:
+                    seen.add(task.task_id)
+                    collected.append(task)
+        return collected
+
+    async def restore_open_sessions(self) -> int:
+        """Перечитать задания открытых сессий при старте.
+
+        Рабочее место перезапустили посреди смены: проекция пуста, а у пяти
+        сборщиков на руках по обходу. Без этого экран показывает «работы нет»
+        человеку, который стоит с коробкой.
+        """
+        if self._store is None or self._restored:
+            return 0
+        self._restored = True
+        try:
+            sessions = await self._store.open_sessions()
+        except Exception:  # noqa: BLE001
+            logger.warning("сессии подбора при старте не перечитаны", exc_info=False)
+            self._restored = False
+            return 0
+        restored = 0
+        for row in sessions:
+            try:
+                lines = await self._store.session_lines(str(row["id"]))
+            except Exception:  # noqa: BLE001
+                continue
+            for line in lines:
+                task_id = str(line["task_id"])
+                if self._projection.get(task_id) is not None:
+                    continue
+                try:
+                    task = await self._client.task(task_id)
+                except WmsUnavailable:
+                    continue
+                if task is None or task.state in TERMINAL_STATES:
+                    continue
+                self._projection.upsert(task)
+                restored += 1
+        if restored:
+            logger.info("при старте возвращено на экран заданий из открытых сессий: %d",
+                        restored)
+        return restored
 
     async def _verify_missing(self) -> None:
         """Перепроверить задания, переставшие приходить в ответе.

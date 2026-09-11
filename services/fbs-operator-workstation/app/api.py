@@ -656,13 +656,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.store = Store(config.database_url())
     state.poller = Poller(state.client, state.projection,
                           interval_seconds=config.poll_interval_seconds(),
-                          limit=config.poll_limit())
+                          limit=config.poll_limit(), store=state.store)
     state.picking = PickingService(state.client, state.projection, state.store, state.poller)
     state.printing = PrintService(state.client, state.hub, state.store, state.projection)
     state.receiving = ReceivingService(state.client)
     state.supervisor = SupervisorService(state.projection, state.store, state.receiving)
 
     await state.store.ping()
+    # Задания открытых сессий возвращаются на экран ДО первого опроса.
+    # Рабочее место перезапустили посреди смены: у пяти сборщиков на руках по
+    # обходу, а экран показывал бы им «работы нет».
+    await state.poller.restore_open_sessions()
     state.poller.start()
 
     bus_url = config.rabbitmq_url()

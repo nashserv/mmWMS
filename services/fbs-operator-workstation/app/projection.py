@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import time
 import threading
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -20,6 +21,10 @@ from .domain import PICKABLE_STATES, ScreenStatus, Task, TaskState
 # Состояния, которые рабочее место держит на экране. Терминальные
 # (`cancelled`, `handed`, `accepted`) не держит: экран показывает работу, а не
 # архив.
+# Состояния, которые стареют: работа сделана, и её видно ещё несколько часов.
+STALE_AFTER_SHIPPING: frozenset[str] = frozenset({
+    TaskState.IN_SUPPLY.value, TaskState.SHIPPED.value})
+
 SCREEN_STATES: tuple[str, ...] = (
     TaskState.NEW.value,
     TaskState.RESERVED.value,
@@ -157,6 +162,36 @@ class Projection:
             self._missing_since.pop(task_id, None)
             self._verified_at.pop(task_id, None)
         self._refresh_gauges()
+
+    def drop_stale_shipped(self, older_than_seconds: float) -> int:
+        """Убирает с экрана уехавшее, которому пора в архив.
+
+        `shipped` и `in_supply` — работа, которая уже сделана. Смотреть на неё
+        полезно час-другой, а к следующей смене она превращается в стену из
+        чужих заказов, в которой не найти своё. Терминальные состояния уходят
+        раньше, по перепроверке; эти двое терминальными не являются и висели
+        вечно.
+
+        Считается по `updated_at` задания, а не по времени появления на
+        экране: перезапуск рабочего места не должен продлевать жизнь стене.
+        """
+        cutoff = time.time() - max(0.0, older_than_seconds)
+        dropped: list[str] = []
+        with self._lock:
+            for task_id, task in list(self._tasks.items()):
+                if task.state not in STALE_AFTER_SHIPPING:
+                    continue
+                moment = _parse_ts(task.updated_at) or _parse_ts(task.created_at)
+                if moment is not None and moment.timestamp() < cutoff:
+                    dropped.append(task_id)
+            for task_id in dropped:
+                self._tasks.pop(task_id, None)
+                self._first_seen.pop(task_id, None)
+                self._missing_since.pop(task_id, None)
+                self._verified_at.pop(task_id, None)
+        if dropped:
+            self._refresh_gauges()
+        return len(dropped)
 
     def _observe_delay(self, task: Task, seen_now: float) -> None:
         """Задержка «задание создано в wms → задание на экране».

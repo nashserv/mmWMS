@@ -74,7 +74,7 @@ class TaskOperations:
         # Белый список, а не «что прислали». Выдача — это «иди и собери»:
         # задание уже уехавшее, отменённое или ждущее разбора выдавать
         # сборщику нельзя, а `states: ["shipped"]` в запросе выдавало.
-        states = _pullable(params.get("states"))
+        states = _pullable(params.get("states"), claim=claim)
         owners = params.get("owner_external_ids") or None
         extended = params.get("include_extended", True)
 
@@ -393,16 +393,33 @@ class TaskOperations:
 PULLABLE_STATES = frozenset({TaskState.RESERVED.value, TaskState.PICKING.value})
 
 
-def _pullable(requested: Any) -> list[str]:
-    """Отсекает состояния, из которых выдавать задание нельзя."""
+KNOWN_STATES = frozenset(state.value for state in TaskState)
+
+
+def _pullable(requested: Any, *, claim: bool) -> list[str]:
+    """Какие состояния запрашивать.
+
+    При `claim = true` — белый список: выдать сборщику уехавшее, отменённое
+    или остановленное сверкой задание нельзя, а `states: ["shipped"]` в запросе
+    выдавало.
+
+    При `claim = false` это чтение очереди, а не выдача: экран рабочего места
+    показывает и собранное, и уехавшее. Ограничивать чтение теми же
+    состояниями значит запретить экрану показывать работу, которая уже
+    сделана.
+    """
     if not requested:
         return [TaskState.RESERVED.value]
     asked = [str(value).strip() for value in requested if str(value).strip()]
-    allowed = [value for value in asked if value in PULLABLE_STATES]
+    permitted = PULLABLE_STATES if claim else KNOWN_STATES
+    allowed = [value for value in asked if value in permitted]
     if not allowed:
         raise ValueError(
             f"состояния {sorted(set(asked))} не выдаются сборщику: "
-            f"выдать можно только {sorted(PULLABLE_STATES)}")
+            f"выдать можно только {sorted(PULLABLE_STATES)}"
+            if claim else
+            f"состояния {sorted(set(asked))} не существуют: "
+            f"известны {sorted(KNOWN_STATES)}")
     return allowed
 
 
