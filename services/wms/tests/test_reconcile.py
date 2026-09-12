@@ -582,3 +582,31 @@ def test_the_missing_gauge_returns_to_zero_when_there_is_nothing_to_check(
     assert gauge._value.get() == 0, (
         f"счётчик пропавших остался {gauge._value.get()} при пустой очереди сверки: "
         f"алерт будет гореть вечно")
+
+
+def test_the_gauge_forgets_a_cabinet_that_no_longer_exists(pool) -> None:
+    """Датчик пропавших заданий не помнит удалённый кабинет.
+
+    Обнуление тут не помогает: обход идёт по таблице кабинетов, а удалённого в
+    ней нет — обнулять некому, и ряд застревает на последнем значении навсегда.
+    Алерт `WbOrdersMissing` горит по заданиям, которых нет, в кабинете,
+    которого нет.
+
+    Ровно так на стенде остались висеть `full-run-wb-1 = 4` и
+    `full-run-load-wb-1 = 67` от кабинетов, которые уборка снесла ещё до
+    прошлого прогона.
+    """
+    from app.metrics import WB_ORDERS_MISSING
+    from app.workers.wb_reconcile import WbReconcileWorker
+
+    gone = f"кабинет-которого-нет-{uuid.uuid4()}"
+    WB_ORDERS_MISSING.labels(account=gone).set(67)
+    assert any(labels[0] == gone for labels in WB_ORDERS_MISSING._metrics), (
+        "подготовка не удалась: ряд не заведён")
+
+    worker = WbReconcileWorker(pool, tasks=object(), publish_stock=lambda *a, **k: None)
+    worker._clear_settled_accounts()
+
+    assert not any(labels[0] == gone for labels in WB_ORDERS_MISSING._metrics), (
+        "ряд удалённого кабинета остался — алерт будет гореть по заданиям, "
+        "которых нет, в кабинете, которого нет")

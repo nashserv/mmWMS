@@ -316,6 +316,13 @@ class WbReconcileWorker:
         задания закрыты, — и обнулять счётчик оказывается некому. Поэтому
         обход идёт по ВСЕМ кабинетам, а не по тем, что попались этому
         процессу: перезапущенный воркер иначе не обнулил бы ничего.
+
+        А кабинета, которого БОЛЬШЕ НЕТ, обнулить нельзя вовсе: обход по
+        таблице его не видит, и ряд датчика застревает на последнем значении
+        навсегда. Обнуления тут мало — ряд надо УДАЛИТЬ: ноль по несуществующему
+        кабинету это тоже утверждение, и оно неверно. Именно так на стенде
+        остались висеть `full-run-wb-1 = 4` и `full-run-load-wb-1 = 67` от
+        кабинетов, которые уборка снесла ещё до прошлого прогона.
         """
         with self._pool.connection() as connection:
             with single(connection) as cursor:
@@ -327,9 +334,30 @@ class WbReconcileWorker:
                     "                                      'diverged')) AS busy "
                     "  FROM wb_account a")
                 rows = cursor.fetchall()
+        alive = {str(row["external_id"]) for row in rows}
         for row in rows:
             if not row["busy"]:
                 WB_ORDERS_MISSING.labels(account=str(row["external_id"])).set(0)
+        self._forget_gone_accounts(alive)
+
+    @staticmethod
+    def _forget_gone_accounts(alive: set[str]) -> None:
+        """Убрать ряды датчика по кабинетам, которых больше нет.
+
+        `prometheus_client` хранит ряд по набору меток до конца жизни процесса.
+        Кабинет удалили — ряд остался, и алерт `WbOrdersMissing` горит по
+        заданиям, которых нет, в кабинете, которого нет.
+        """
+        try:
+            existing = {labels[0] for labels in
+                        list(WB_ORDERS_MISSING._metrics.keys())}  # noqa: SLF001
+        except Exception:  # noqa: BLE001 — внутренности клиента не контракт
+            return
+        for account in existing - alive:
+            try:
+                WB_ORDERS_MISSING.remove(account)
+            except KeyError:
+                pass
 
     def _refresh_gauge(self) -> None:
         with self._pool.connection() as connection:
