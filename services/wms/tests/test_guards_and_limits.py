@@ -282,3 +282,70 @@ def test_an_inactive_client_gets_a_task_for_a_human_not_a_silent_refusal(
     assert task["state"] == "manual_review"
     assert task["manual_review_code"] == "OWNER_INACTIVE"
     assert seller in task["manual_review_reason"]
+
+
+# --- остаток не выдумывается сам собой --------------------------------------
+#
+# Решение владельца 13.09.2026: расхождений быть не должно вовсе. Клапан
+# «собрать без остатка» остаётся правом владельца по конкретному клиенту, но
+# перестаёт быть умолчанием: умолчание — это то, что происходит, когда никто
+# ничего не решал, и «придумать остаток» не имеет права быть таким.
+
+def test_a_new_client_does_not_get_permission_to_invent_stock(pool) -> None:
+    """Клиент, заведённый без указаний, собирать поверх учёта не может.
+
+    До 13.09.2026 умолчание было `true`, и каждый новый клиент молча получал
+    поведение боевого контура — то самое, из-за которого остаток стал 92
+    единицами на 21 продавца.
+    """
+    seller = unique("seller")
+    CatalogOperations(pool).upsert_owner({
+        "seller_external_id": seller, "name": "Клиент без указаний"})
+
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute(
+                "SELECT allow_ledger_short FROM owner WHERE seller_external_id = %s",
+                (seller,))
+            row = cursor.fetchone()
+
+    assert row["allow_ledger_short"] is False, (
+        "новый клиент заведён с разрешением собирать поверх недостающего "
+        "учётного остатка — книга разойдётся с полкой, и никто не решал, что так можно")
+
+
+def test_a_task_without_stock_stands_in_short_and_does_not_vanish(pool) -> None:
+    """Товара по учёту нет — задание встаёт видимым, а не исчезает.
+
+    Тихих отмен в боевом контуре 2645, и у ВСЕХ `manual_review_reason = NULL`:
+    задание пропадало, и спросить у системы, почему, было нельзя. `short` —
+    это состояние, которое видно на экране и считается в метрике.
+    """
+    seller, account = unique("seller"), unique("wb")
+    barcode = f"46{uuid.uuid4().int % 10**11:011d}"
+    catalog = CatalogOperations(pool)
+    catalog.upsert_owner({"seller_external_id": seller, "name": "Клиент без запаса"})
+    catalog.upsert_wb_account({
+        "op": "upsert", "external_id": account, "seller_external_id": seller,
+        "display_name": "Кабинет", "secret_ref": f"vault://mmx/test/{account}",
+        "mode": "live", "status": "ACTIVE", "wb_warehouse_id": 1})
+    catalog.ensure_product({"seller_external_id": seller, "barcode": barcode})
+
+    outcome = WmsService(pool).reserve({
+        "idempotency_key": f"short-{uuid.uuid4()}",
+        "seller_external_id": seller, "wb_account_external_id": account,
+        "wb_order_id": uuid.uuid4().int % 10**9, "sku": barcode, "barcode": barcode,
+        "quantity": 3, "correlation_id": f"short-{uuid.uuid4()}"})
+
+    assert outcome.status == "rejected"
+    assert outcome.error_code == "INSUFFICIENT_STOCK"
+    assert not outcome.ledger_short, (
+        "резерв дописан поверх недостающего остатка у клиента, которому этого "
+        "не разрешали")
+
+    with pool.connection() as connection:
+        with single(connection) as cursor:
+            cursor.execute("SELECT state FROM wms_task WHERE id = %s", (outcome.task_id,))
+            assert cursor.fetchone()["state"] == "short", (
+                "задание не встало в short — значит оно исчезло, и спросить "
+                "у системы почему будет нельзя")

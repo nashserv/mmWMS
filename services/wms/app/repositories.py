@@ -49,11 +49,20 @@ def upsert_owner(cursor: Cursor, seller_external_id: str, *, name: str | None = 
     COALESCE на каждом поле: приёмка зовёт этот же путь, когда видит продавца
     впервые (приложение C), и передаёт только имя с ИНН. Затирать ими флаг
     клапана или активность нельзя.
+
+    `allow_ledger_short` по умолчанию FALSE, и это решение владельца от
+    13.09.2026: расхождений быть не должно вовсе. Значение обязано совпадать с
+    умолчанием колонки (миграция 011) — здесь оно повторено потому, что
+    `COALESCE` перебивает умолчание схемы: сменить его в одной только таблице
+    было бы правкой, которая ничего не меняет. Проверяется тестом
+    `test_a_new_client_does_not_get_permission_to_invent_stock`: он смотрит на
+    заведённого клиента, а не на текст SQL, и поймает расхождение любой из
+    двух сторон.
     """
     cursor.execute(
         "INSERT INTO owner (id, seller_external_id, name, inn, active, allow_ledger_short) "
         "VALUES (%(id)s, %(external)s, %(name)s, %(inn)s, "
-        "        COALESCE(%(active)s, true), COALESCE(%(short)s, true)) "
+        "        COALESCE(%(active)s, true), COALESCE(%(short)s, false)) "
         "ON CONFLICT (seller_external_id) DO UPDATE SET "
         "    name = COALESCE(%(name)s, owner.name), "
         "    inn = COALESCE(%(inn)s, owner.inn), "
